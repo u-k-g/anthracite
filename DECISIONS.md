@@ -10,8 +10,12 @@ This document is the concise source of truth for the design.
 
 - Base FreeCAD commit:
   `145529fe741292ff0b3977a01195bf0247425794`.
+- FreeCAD is materialized as a disposable checkout in `build/src`; it is not
+  vendored or tracked as a Git submodule.
 - Every Anthracite change is stored as an explicit `.patch` file.
 - Patches are applied in order from `patches/series`.
+- GNU Quilt is used to create and refresh the patches against the materialized
+  source tree. See `WORKFLOW.md` for the complete development loop.
 - Moving to a newer FreeCAD revision is deliberate: reapply the series, resolve
   conflicts, build, and test.
 - New functionality stays concentrated in `src/Mod/Anthracite`, with small

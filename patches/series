@@ -1,0 +1,3 @@
+# Anthracite patches, in the order applied to FreeCAD.
+#
+# Add patches with `just patch-new <name>` so Quilt updates this file.
