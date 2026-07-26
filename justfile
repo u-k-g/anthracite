@@ -12,20 +12,30 @@ profile_dir := root / "build/profile"
 default:
     @just --list
 
-# Launch the development build with a writable, persistent Anthracite profile.
-run: _require-source
+# Configure the pinned FreeCAD source for a debug development build.
+configure: _require-source
+    cd "{{ source_dir }}" && pixi run configure-debug
+
+# Build the complete FreeCAD application and every configured workbench.
+build: _require-source
+    #!/usr/bin/env bash
+    set -euo pipefail
+    build_directory="{{ source_dir }}/build/debug"
+    cmake="{{ source_dir }}/.pixi/envs/default/bin/cmake"
+    if [[ ! -f "$build_directory/CMakeCache.txt" || ! -x "$cmake" ]]; then
+        printf '%s\n' "Anthracite is not configured; run \`just configure\` first." >&2
+        exit 1
+    fi
+    "$cmake" --build "$build_directory" --parallel "${JOBS:-10}"
+
+# Build and launch full FreeCAD with a writable, persistent Anthracite profile.
+run: build
     #!/usr/bin/env bash
     set -euo pipefail
     executable="{{ source_dir }}/build/debug/bin/FreeCAD"
     if [[ ! -x "$executable" ]]; then
-        printf '%s\n' "Anthracite is not built; run the debug build command from README.md first." >&2
+        printf '%s\n' "The complete Anthracite build did not produce FreeCAD." >&2
         exit 1
-    fi
-    stylesheet_icon="{{ source_dir }}/build/debug/share/Gui/Stylesheets/overlay/icons/mode.svg"
-    if [[ ! -f "$stylesheet_icon" ]]; then
-        "{{ source_dir }}/.pixi/envs/default/bin/cmake" \
-            --build "{{ source_dir }}/build/debug" \
-            --target Stylesheets_data
     fi
     mkdir -p "{{ profile_dir }}"
     export FREECAD_USER_HOME="{{ profile_dir }}"
@@ -37,7 +47,7 @@ doctor:
     #!/usr/bin/env bash
     set -euo pipefail
     failed=0
-    for command_name in git just quilt; do
+    for command_name in git just pixi quilt; do
         if command -v "$command_name" >/dev/null 2>&1; then
             printf '%-8s %s\n' "$command_name" "$(command -v "$command_name")"
         else

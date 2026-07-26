@@ -13,3 +13,4 @@
 0010-show-context-window-usage.patch
 0011-observe-freecad-selection-context.patch
 0012-add-opencode-provider.patch
+0013-clean-sidebar-shutdown.patch

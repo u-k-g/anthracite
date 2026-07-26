@@ -121,19 +121,19 @@ Make changes in `build/src`, then refresh the patch. Do not leave implementation
 source tree. FreeCAD version bumps are deliberate: change the pin, repair every patch in order,
 then build and test.
 
-With FreeCAD materialized and the patches applied, configure and build the current slice with
-FreeCAD's Pixi environment:
+With FreeCAD materialized and the patches applied, configure and build the complete application:
 
 ```sh
-pixi run configure-debug
-pixi run cmake --build build/debug --target AnthraciteGui FreeCAD Stylesheets_data -j 10
+just configure
+just build
 ```
 
-Launch with `just run`. The launcher uses a writable, persistent FreeCAD profile under
-`build/profile`; this also avoids read-only or incompatible system FreeCAD profiles while leaving
-Codex and OpenCode authentication and configuration untouched. Open the Anthracite dock, choose
-Codex or OpenCode in the composer, and use **Configure…** only if Anthracite cannot discover the
-existing executable.
+Launch with `just run`; it first performs an incremental full build so a partial developer target
+cannot open a workbenchless FreeCAD. The launcher uses a writable, persistent FreeCAD profile under
+`build/profile`; this avoids read-only or incompatible system FreeCAD profiles while leaving Codex
+and OpenCode authentication and configuration untouched. Open the Anthracite dock, choose Codex or
+OpenCode in the composer, and use **Configure…** only if Anthracite cannot discover the existing
+executable.
 
 </details>
 
