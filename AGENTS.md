@@ -66,11 +66,13 @@ just validate
 - The UI is QML-first, with Qt Quick where useful. It must be a normal FreeCAD
   dock/sidebar: movable, resizable, closable, floatable, and restorable.
 - The native 3D viewport and ordinary FreeCAD interactions remain first class.
-- Integrate the user's existing Codex installation and preserve its
-  authentication, configuration, models, skills, and normal tools. Do not
+- Integrate the user's existing Codex and OpenCode installations and preserve
+  their authentication, configuration, models, skills, and normal tools. Do not
   build a new general-purpose agent harness. Keep provider work behind the
-  normalized runtime adapter; OpenCode is next and Claude Code is not near-term.
-  Never duplicate the CAD executor or QML surface per provider.
+  normalized runtime adapter; Claude Code is not near-term. Never duplicate the
+  CAD executor or QML surface per provider.
+- Only one provider and active FreeCAD document context run at a time. Do not
+  add T3 Code's project registry, worktrees, or simultaneous project sessions.
 - Expose one CAD-specific model tool:
   `freecad(<ordinary FreeCAD Python source>)`.
 - Python is the model's compositional action language. Prefer FreeCAD document
@@ -128,7 +130,7 @@ The first vertical slice is:
 
 ```text
 prompt in a dockable QML sidebar
-  → existing Codex session
+  → existing Codex or OpenCode installation
   → one freeform FreeCAD Python tool call
   → GUI-thread transaction and recompute
   → structured CAD change observation

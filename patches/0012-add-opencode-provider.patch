@@ -1,0 +1,1782 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -13,6 +13,7 @@
+ #include <QJsonDocument>
+ #include <QJsonArray>
+ #include <QJsonObject>
++#include <QProcessEnvironment>
+ #include <QStandardPaths>
+ #include <QThread>
+ #include <QUuid>
+@@ -63,6 +64,7 @@ AgentBridge::AgentBridge(SidebarControll
+     connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
+     connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
+     connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
++    connect(sidebar, &SidebarController::providerSelected, this, &AgentBridge::selectProvider);
+     connect(sidebar, &SidebarController::newThreadRequested, this, &AgentBridge::newThread);
+     connect(sidebar, &SidebarController::threadSelected, this, &AgentBridge::selectThread);
+     connect(sidebar, &SidebarController::draftEdited, this, &AgentBridge::draftEdited);
+@@ -93,8 +95,9 @@ AgentBridge::AgentBridge(SidebarControll
+         [this](const App::Document& document) { documentDeleted(document); }
+     );
+ 
++    sidebar->restoreProvider(providerKind());
+     QTimer::singleShot(0, this, [this]() {
+-        if (!codexPath().isEmpty() && QFileInfo::exists(runtimePath())) {
++        if (!providerPath().isEmpty() && QFileInfo::exists(runtimePath())) {
+             ensureRuntime();
+         }
+     });
+@@ -130,18 +133,22 @@ void AgentBridge::stop()
+ 
+ void AgentBridge::chooseProvider()
+ {
++    const QString provider = providerKind();
++    const QString displayName =
++        provider == QLatin1String("opencode") ? QStringLiteral("OpenCode") : QStringLiteral("Codex");
+     const QString selected = QFileDialog::getOpenFileName(
+         QApplication::activeWindow(),
+-        tr("Choose the Codex executable"),
+-        codexPath()
++        tr("Choose the %1 executable").arg(displayName),
++        providerPath()
+     );
+     if (selected.isEmpty()) {
+         return;
+     }
+ 
+     auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
+-    preferences->SetASCII("CodexBinary", selected.toUtf8().constData());
+-    sidebar->appendActivity(tr("Codex executable set to %1").arg(selected));
++    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    preferences->SetASCII(key, selected.toUtf8().constData());
++    sidebar->appendActivity(tr("%1 executable set to %2").arg(displayName, selected));
+ 
+     if (runtime.state() != QProcess::NotRunning) {
+         stopping = true;
+@@ -153,6 +160,21 @@ void AgentBridge::chooseProvider()
+     ensureRuntime();
+ }
+ 
++void AgentBridge::selectProvider(const QString& provider)
++{
++    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    preferences->SetASCII("Provider", provider.toUtf8().constData());
++    selectedLocalThreadId.clear();
++    createNewThread = false;
++    sidebar->appendActivity(
++        tr("Using %1").arg(
++            provider == QLatin1String("opencode") ? QStringLiteral("OpenCode")
++                                                   : QStringLiteral("Codex")
++        )
++    );
++    performSessionRestart(QString(), false);
++}
++
+ void AgentBridge::newThread()
+ {
+     restartSession(QString(), true);
+@@ -206,8 +228,8 @@ void AgentBridge::processStarted()
+         {
+             "provider",
+             QJsonObject {
+-                {"kind", "codex"},
+-                {"binary", codexPath()},
++                {"kind", providerKind()},
++                {"binary", providerPath()},
+             },
+         },
+         {"cwd", workingDirectory()},
+@@ -280,9 +302,15 @@ void AgentBridge::ensureRuntime()
+         return;
+     }
+ 
+-    const QString provider = codexPath();
++    const QString provider = providerPath();
+     if (provider.isEmpty() || !QFileInfo::exists(provider)) {
+-        fail(tr("Codex was not found. Use Configure… to select your existing Codex executable."));
++        const QString displayName = providerKind() == QLatin1String("opencode")
++            ? QStringLiteral("OpenCode")
++            : QStringLiteral("Codex");
++        fail(
++            tr("%1 was not found. Use Configure… to select your existing executable.")
++                .arg(displayName)
++        );
+         return;
+     }
+ 
+@@ -292,7 +320,12 @@ void AgentBridge::ensureRuntime()
+         return;
+     }
+ 
+-    sidebar->appendActivity(tr("Starting Codex"));
++    sidebar->appendActivity(
++        tr("Starting %1").arg(
++            providerKind() == QLatin1String("opencode") ? QStringLiteral("OpenCode")
++                                                        : QStringLiteral("Codex")
++        )
++    );
+     runtime.setProgram(executable);
+     runtime.setWorkingDirectory(workingDirectory());
+     runtime.start();
+@@ -423,7 +456,13 @@ void AgentBridge::handleMessage(const QJ
+     }
+     else if (type == QLatin1String("runtime.ready")) {
+         runtimeReady = true;
+-        sidebar->appendActivity(tr("Codex connected"));
++        sidebar->appendActivity(
++            tr("%1 connected").arg(
++                payload.value("provider").toString() == QLatin1String("opencode")
++                    ? QStringLiteral("OpenCode")
++                    : QStringLiteral("Codex")
++            )
++        );
+         sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
+         persistDraft();
+         if (!queuedPrompt.isEmpty()) {
+@@ -609,14 +648,70 @@ QString AgentBridge::runtimePath() const
+         .filePath(QStringLiteral("Mod/Anthracite/anthracite-runtime"));
+ }
+ 
+-QString AgentBridge::codexPath() const
++QString AgentBridge::providerKind() const
+ {
+     const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
+-    const QString configured = QString::fromStdString(preferences->GetASCII("CodexBinary", ""));
++    const QString configured = QString::fromStdString(preferences->GetASCII("Provider", "codex"));
++    return configured == QLatin1String("opencode") ? configured : QStringLiteral("codex");
++}
++
++QString AgentBridge::providerPath() const
++{
++    return findProviderExecutable(providerKind());
++}
++
++QString AgentBridge::findProviderExecutable(const QString& provider) const
++{
++    const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    const QString configured = QString::fromStdString(preferences->GetASCII(key, ""));
+     if (!configured.isEmpty()) {
+         return configured;
+     }
+-    return QStandardPaths::findExecutable(QStringLiteral("codex"));
++    const QString executable = QStandardPaths::findExecutable(provider);
++    if (!executable.isEmpty()) {
++        return executable;
++    }
++
++    const QString home = QDir::homePath();
++    const QStringList candidates =
++        provider == QLatin1String("opencode")
++        ? QStringList {
++              QDir(home).filePath(QStringLiteral(".opencode/bin/opencode")),
++              QStringLiteral("/opt/homebrew/bin/opencode"),
++              QStringLiteral("/usr/local/bin/opencode"),
++          }
++        : QStringList {
++              QDir(home).filePath(QStringLiteral(".local/bin/codex")),
++              QStringLiteral("/opt/homebrew/bin/codex"),
++              QStringLiteral("/usr/local/bin/codex"),
++          };
++    for (const QString& candidate : candidates) {
++        if (QFileInfo(candidate).isExecutable()) {
++            return candidate;
++        }
++    }
++
++    QProcess shell;
++#ifdef Q_OS_WIN
++    shell.start(QStringLiteral("cmd.exe"), {QStringLiteral("/C"), QStringLiteral("where"), provider});
++#else
++    const QString shellProgram = QProcessEnvironment::systemEnvironment().value(
++        QStringLiteral("SHELL"),
++        QStringLiteral("/bin/sh")
++    );
++    shell.start(
++        shellProgram,
++        {QStringLiteral("-lc"), QStringLiteral("command -v %1").arg(provider)}
++    );
++#endif
++    if (shell.waitForFinished(2000) && shell.exitCode() == 0) {
++        const QString resolved = QString::fromUtf8(shell.readAllStandardOutput()).trimmed();
++        if (QFileInfo(resolved).isExecutable()) {
++            return resolved;
++        }
++    }
++    return {};
+ }
+ 
+ QString AgentBridge::workingDirectory() const
+@@ -700,9 +795,9 @@ void AgentBridge::synchronizeDocumentCon
+     pendingRestartSaveId = 0;
+     pendingDraft.clear();
+     sidebar->documentContextChanged();
+-    const QString providerPath = codexPath();
++    const QString currentProviderPath = providerPath();
+     if (runtime.state() == QProcess::NotRunning
+-        && (providerPath.isEmpty() || !QFileInfo::exists(providerPath)
++        && (currentProviderPath.isEmpty() || !QFileInfo::exists(currentProviderPath)
+             || !QFileInfo::exists(runtimePath()))) {
+         runtimeDocumentIdentity = currentIdentity;
+         selectedLocalThreadId.clear();
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -35,6 +35,7 @@ private Q_SLOTS:
+     void submit(const QString& prompt);
+     void stop();
+     void chooseProvider();
++    void selectProvider(const QString& provider);
+     void newThread();
+     void selectThread(const QString& threadId);
+     void draftEdited(const QString& body);
+@@ -58,7 +59,9 @@ private:
+     void runFreeCADTool(const QJsonObject& payload);
+     QString executePython(const QString& source, bool& success);
+     QString runtimePath() const;
+-    QString codexPath() const;
++    QString providerKind() const;
++    QString providerPath() const;
++    QString findProviderExecutable(const QString& provider) const;
+     QString workingDirectory() const;
+     QString databasePath() const;
+     QJsonObject documentContext();
+--- a/src/Mod/Anthracite/Gui/CMakeLists.txt
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -51,6 +51,7 @@ add_custom_command(
+         ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/opencode.rs
+     COMMENT "Building Anthracite agent runtime"
+     VERBATIM
+ )
+--- a/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
++++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+@@ -490,11 +490,26 @@ Pane {
+                 RowLayout {
+                     Layout.fillWidth: true
+ 
+-                    Label {
+-                        text: qsTr("Codex")
+-                        color: systemPalette.windowText
+-                        opacity: 0.65
+-                        font.pixelSize: 11
++                    ComboBox {
++                        id: providerPicker
++                        objectName: "AnthraciteProviderPicker"
++                        Layout.preferredWidth: Math.max(105, implicitWidth)
++                        model: anthraciteController.providers
++                        textRole: "name"
++                        enabled: !anthraciteController.busy
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].id === anthraciteController.selectedProvider) {
++                                    return index
++                                }
++                            }
++                            return 0
++                        }
++
++                        onActivated: function(index) {
++                            anthraciteController.selectProvider(model[index].id)
++                        }
+                     }
+ 
+                     ToolButton {
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -170,6 +170,25 @@ bool SidebarController::usageVisible() c
+     return !currentUsageLabel.isEmpty();
+ }
+ 
++QVariantList SidebarController::providers() const
++{
++    return {
++        QVariantMap {
++            {QStringLiteral("id"), QStringLiteral("codex")},
++            {QStringLiteral("name"), QStringLiteral("Codex")},
++        },
++        QVariantMap {
++            {QStringLiteral("id"), QStringLiteral("opencode")},
++            {QStringLiteral("name"), QStringLiteral("OpenCode")},
++        },
++    };
++}
++
++QString SidebarController::selectedProvider() const
++{
++    return currentProvider;
++}
++
+ void SidebarController::submit(const QString& prompt)
+ {
+     const QString text = prompt.trimmed();
+@@ -203,6 +222,17 @@ void SidebarController::chooseProvider()
+     Q_EMIT chooseProviderRequested();
+ }
+ 
++void SidebarController::selectProvider(const QString& provider)
++{
++    if (turnBusy || (provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
++        || provider == currentProvider) {
++        return;
++    }
++    currentProvider = provider;
++    Q_EMIT providerChanged();
++    Q_EMIT providerSelected(provider);
++}
++
+ void SidebarController::newThread()
+ {
+     if (!turnBusy) {
+@@ -378,6 +408,16 @@ void SidebarController::clearInteraction
+     Q_EMIT interactionChanged();
+ }
+ 
++void SidebarController::restoreProvider(const QString& provider)
++{
++    const QString normalized = provider == QLatin1String("opencode") ? provider
++                                                                     : QStringLiteral("codex");
++    if (currentProvider != normalized) {
++        currentProvider = normalized;
++        Q_EMIT providerChanged();
++    }
++}
++
+ void SidebarController::completeTurn()
+ {
+     clearInteraction();
+--- a/src/Mod/Anthracite/Gui/Sidebar.h
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -41,6 +41,8 @@ class SidebarController: public QObject
+     Q_PROPERTY(QString usageDetail READ usageDetail NOTIFY usageChanged)
+     Q_PROPERTY(double usageFraction READ usageFraction NOTIFY usageChanged)
+     Q_PROPERTY(bool usageVisible READ usageVisible NOTIFY usageChanged)
++    Q_PROPERTY(QVariantList providers READ providers CONSTANT)
++    Q_PROPERTY(QString selectedProvider READ selectedProvider NOTIFY providerChanged)
+ 
+ public:
+     explicit SidebarController(QObject* parent = nullptr);
+@@ -67,10 +69,13 @@ public:
+     QString usageDetail() const;
+     double usageFraction() const;
+     bool usageVisible() const;
++    QVariantList providers() const;
++    QString selectedProvider() const;
+ 
+     Q_INVOKABLE void submit(const QString& prompt);
+     Q_INVOKABLE void stop();
+     Q_INVOKABLE void chooseProvider();
++    Q_INVOKABLE void selectProvider(const QString& provider);
+     Q_INVOKABLE void newThread();
+     Q_INVOKABLE void selectThread(const QString& threadId);
+     Q_INVOKABLE void setDraft(const QString& body);
+@@ -106,11 +111,13 @@ public:
+     void updateUsage(const QVariantMap& usage);
+     void clearUsage();
+     void documentContextChanged();
++    void restoreProvider(const QString& provider);
+ 
+ Q_SIGNALS:
+     void promptSubmitted(const QString& prompt);
+     void stopRequested();
+     void chooseProviderRequested();
++    void providerSelected(const QString& provider);
+     void newThreadRequested();
+     void threadSelected(const QString& threadId);
+     void draftEdited(const QString& body);
+@@ -124,6 +131,7 @@ Q_SIGNALS:
+     void draftChanged();
+     void modelsChanged();
+     void usageChanged();
++    void providerChanged();
+ 
+ private:
+     void setStatus(QString status);
+@@ -150,6 +158,7 @@ private:
+     double currentUsageFraction = 0.0;
+     bool pendingAllowSession = false;
+     bool turnBusy = false;
++    QString currentProvider = QStringLiteral("codex");
+ };
+ 
+ class Sidebar: public QWidget
+--- a/src/Mod/Anthracite/Runtime/Cargo.lock
++++ b/src/Mod/Anthracite/Runtime/Cargo.lock
+@@ -74,6 +74,7 @@ dependencies = [
+  "tempfile",
+  "tokio",
+  "turso",
++ "ureq",
+  "uuid",
+ ]
+ 
+@@ -287,6 +288,35 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "cookie"
++version = "0.18.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
++dependencies = [
++ "percent-encoding",
++ "time",
++ "version_check",
++]
++
++[[package]]
++name = "cookie_store"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
++dependencies = [
++ "cookie",
++ "document-features",
++ "idna",
++ "indexmap",
++ "log",
++ "serde",
++ "serde_derive",
++ "serde_json",
++ "time",
++ "url",
++]
++
++[[package]]
+ name = "core-foundation-sys"
+ version = "0.8.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -392,6 +422,15 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "document-features"
++version = "0.2.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
++dependencies = [
++ "litrs",
++]
++
++[[package]]
+ name = "either"
+ version = "1.17.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -418,6 +457,12 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
++[[package]]
+ name = "errno"
+ version = "0.3.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -580,6 +625,12 @@ source = "registry+https://github.com/ru
+ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+ 
+ [[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
++
++[[package]]
+ name = "heck"
+ version = "0.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -617,6 +668,12 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "httparse"
++version = "1.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
++
++[[package]]
+ name = "iana-time-zone"
+ version = "0.1.65"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -744,6 +801,16 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "indexmap"
++version = "2.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
++dependencies = [
++ "equivalent",
++ "hashbrown",
++]
++
++[[package]]
+ name = "inout"
+ version = "0.1.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -894,6 +961,12 @@ source = "registry+https://github.com/ru
+ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+ 
+ [[package]]
++name = "litrs"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
++
++[[package]]
+ name = "lock_api"
+ version = "0.4.14"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1929,6 +2002,34 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "ureq"
++version = "3.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
++dependencies = [
++ "base64",
++ "cookie_store",
++ "log",
++ "percent-encoding",
++ "serde",
++ "serde_json",
++ "ureq-proto",
++ "utf8-zero",
++]
++
++[[package]]
++name = "ureq-proto"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
++dependencies = [
++ "base64",
++ "http",
++ "httparse",
++ "log",
++]
++
++[[package]]
+ name = "url"
+ version = "2.5.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1941,6 +2042,12 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "utf8-zero"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
++
++[[package]]
+ name = "utf8_iter"
+ version = "1.0.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+--- a/src/Mod/Anthracite/Runtime/Cargo.toml
++++ b/src/Mod/Anthracite/Runtime/Cargo.toml
+@@ -11,6 +11,7 @@ serde_json = "1.0"
+ sha2 = "0.10"
+ tokio = { version = "1.0", features = ["rt"] }
+ turso = { version = "=0.4.4", default-features = false }
++ureq = { version = "3.3", default-features = false, features = ["json"] }
+ uuid = { version = "1.0", features = ["v4"] }
+ 
+ [dev-dependencies]
+--- a/src/Mod/Anthracite/Runtime/src/main.rs
++++ b/src/Mod/Anthracite/Runtime/src/main.rs
+@@ -143,6 +143,19 @@ fn handle_host_message(
+ }
+ 
+ fn main() {
++    let arguments = std::env::args().collect::<Vec<_>>();
++    if arguments.get(1).map(String::as_str) == Some("--mcp-proxy") {
++        let result = match (arguments.get(2), arguments.get(3)) {
++            (Some(address), Some(token)) => process::run_mcp_proxy(address, token),
++            _ => Err("Usage: anthracite-runtime --mcp-proxy ADDRESS TOKEN".to_string()),
++        };
++        if let Err(error) = result {
++            eprintln!("{error}");
++            std::process::exit(1);
++        }
++        return;
++    }
++
+     let (sender, receiver) = mpsc::channel();
+     process::spawn_host_reader(sender.clone());
+ 
+@@ -173,6 +186,13 @@ fn main() {
+                 protocol::emit_error("Provider process closed its output.");
+                 provider = None;
+             }
++            IoEvent::McpMessage { message, response } => {
++                if let Some(provider) = &mut provider
++                    && let Err(error) = provider.handle_mcp_message(message, response)
++                {
++                    protocol::emit_error(error);
++                }
++            }
+         }
+     }
+ }
+--- a/src/Mod/Anthracite/Runtime/src/process.rs
++++ b/src/Mod/Anthracite/Runtime/src/process.rs
+@@ -2,6 +2,7 @@
+ 
+ use serde_json::Value;
+ use std::io::{BufRead, BufReader, Write};
++use std::net::{TcpListener, TcpStream};
+ use std::process::{Child, ChildStdin, Command, Stdio};
+ use std::sync::{Arc, Mutex, mpsc};
+ use std::thread;
+@@ -12,6 +13,10 @@ pub enum IoEvent {
+     ProviderLine(String),
+     ProviderError(String),
+     ProviderClosed,
++    McpMessage {
++        message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    },
+ }
+ 
+ pub fn spawn_host_reader(sender: mpsc::Sender<IoEvent>) {
+@@ -124,3 +129,235 @@ impl Drop for LineProcess {
+         let _ = self.child.wait();
+     }
+ }
++
++pub struct ChildProcess {
++    child: Child,
++}
++
++impl ChildProcess {
++    pub fn start(
++        binary: &str,
++        arguments: &[&str],
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++    ) -> Result<Self, String> {
++        let mut child = Command::new(binary)
++            .args(arguments)
++            .current_dir(cwd)
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .map_err(|error| format!("Could not start provider at {binary}: {error}"))?;
++        let output = child
++            .stdout
++            .take()
++            .ok_or_else(|| "Provider did not expose standard output.".to_string())?;
++        let errors = child
++            .stderr
++            .take()
++            .ok_or_else(|| "Provider did not expose standard error.".to_string())?;
++        spawn_line_reader(
++            output,
++            sender.clone(),
++            IoEvent::ProviderError,
++            Some(IoEvent::ProviderClosed),
++        );
++        spawn_line_reader(errors, sender.clone(), IoEvent::ProviderError, None);
++        Ok(Self { child })
++    }
++}
++
++impl Drop for ChildProcess {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++pub struct McpBridge {
++    address: String,
++    token: String,
++}
++
++impl McpBridge {
++    pub fn start(sender: &mpsc::Sender<IoEvent>) -> Result<Self, String> {
++        let listener = TcpListener::bind("127.0.0.1:0")
++            .map_err(|error| format!("Could not bind the Anthracite MCP bridge: {error}"))?;
++        let address = listener
++            .local_addr()
++            .map_err(|error| format!("Could not inspect the Anthracite MCP bridge: {error}"))?
++            .to_string();
++        let token = uuid::Uuid::new_v4().to_string();
++        let expected_token = token.clone();
++        let sender = sender.clone();
++        thread::spawn(move || {
++            for stream in listener.incoming() {
++                let Ok(stream) = stream else {
++                    break;
++                };
++                let sender = sender.clone();
++                let expected_token = expected_token.clone();
++                thread::spawn(move || {
++                    if let Err(error) = serve_mcp_connection(stream, &expected_token, &sender) {
++                        let _ = sender.send(IoEvent::ProviderError(format!(
++                            "Anthracite MCP bridge: {error}"
++                        )));
++                    }
++                });
++            }
++        });
++        Ok(Self { address, token })
++    }
++
++    pub fn proxy_arguments(&self) -> Vec<String> {
++        vec![
++            "--mcp-proxy".to_string(),
++            self.address.clone(),
++            self.token.clone(),
++        ]
++    }
++}
++
++fn serve_mcp_connection(
++    stream: TcpStream,
++    expected_token: &str,
++    sender: &mpsc::Sender<IoEvent>,
++) -> Result<(), String> {
++    let reader_stream = stream
++        .try_clone()
++        .map_err(|error| format!("could not clone connection: {error}"))?;
++    let mut reader = BufReader::new(reader_stream);
++    let mut writer = stream;
++    let mut authentication = String::new();
++    reader
++        .read_line(&mut authentication)
++        .map_err(|error| format!("could not read authentication: {error}"))?;
++    if authentication.trim_end() != expected_token {
++        return Err("proxy authentication failed".to_string());
++    }
++
++    for line in reader.lines() {
++        let line = line.map_err(|error| format!("could not read proxy message: {error}"))?;
++        let message: Value = serde_json::from_str(&line)
++            .map_err(|error| format!("proxy sent invalid JSON: {error}"))?;
++        if let Some(value) = basic_mcp_response(&message) {
++            serde_json::to_writer(&mut writer, &value)
++                .map_err(|error| format!("could not encode MCP response: {error}"))?;
++            writer
++                .write_all(b"\n")
++                .and_then(|()| writer.flush())
++                .map_err(|error| format!("could not write MCP response: {error}"))?;
++            continue;
++        }
++        let response = message.get("id").map(|_| {
++            let (response_sender, response_receiver) = mpsc::channel();
++            (response_sender, response_receiver)
++        });
++        sender
++            .send(IoEvent::McpMessage {
++                message,
++                response: response.as_ref().map(|(sender, _)| sender.clone()),
++            })
++            .map_err(|_| "runtime closed while handling MCP message".to_string())?;
++        if let Some((_, receiver)) = response {
++            let value = receiver
++                .recv()
++                .map_err(|_| "runtime closed before responding to MCP".to_string())?;
++            serde_json::to_writer(&mut writer, &value)
++                .map_err(|error| format!("could not encode MCP response: {error}"))?;
++            writer
++                .write_all(b"\n")
++                .and_then(|()| writer.flush())
++                .map_err(|error| format!("could not write MCP response: {error}"))?;
++        }
++    }
++    Ok(())
++}
++
++fn basic_mcp_response(message: &Value) -> Option<Value> {
++    let id = message.get("id")?.clone();
++    match message.get("method").and_then(Value::as_str).unwrap_or("") {
++        "initialize" => Some(serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "result": {
++                "protocolVersion": message
++                    .pointer("/params/protocolVersion")
++                    .and_then(Value::as_str)
++                    .unwrap_or("2025-06-18"),
++                "capabilities": {"tools": {}},
++                "serverInfo": {
++                    "name": "anthracite",
++                    "version": env!("CARGO_PKG_VERSION")
++                }
++            }
++        })),
++        "ping" => Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})),
++        "tools/list" => Some(serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "result": {
++                "tools": [{
++                    "name": "freecad",
++                    "description": concat!(
++                        "Execute ordinary Python inside the active FreeCAD GUI. ",
++                        "App/FreeCAD, Gui, doc, and cad are prebound. The complete ",
++                        "source runs as one transaction, recomputes and validates, ",
++                        "then returns a structured CAD observation."
++                    ),
++                    "inputSchema": {
++                        "type": "object",
++                        "properties": {
++                            "code": {
++                                "type": "string",
++                                "description": "Complete ordinary FreeCAD Python source."
++                            }
++                        },
++                        "required": ["code"],
++                        "additionalProperties": false
++                    }
++                }]
++            }
++        })),
++        _ => None,
++    }
++}
++
++pub fn run_mcp_proxy(address: &str, token: &str) -> Result<(), String> {
++    let stream = TcpStream::connect(address)
++        .map_err(|error| format!("Could not connect to Anthracite MCP bridge: {error}"))?;
++    let mut writer = stream
++        .try_clone()
++        .map_err(|error| format!("Could not clone Anthracite MCP connection: {error}"))?;
++    writer
++        .write_all(format!("{token}\n").as_bytes())
++        .and_then(|()| writer.flush())
++        .map_err(|error| format!("Could not authenticate Anthracite MCP proxy: {error}"))?;
++
++    let output_thread = thread::spawn(move || -> Result<(), String> {
++        let stdout = std::io::stdout();
++        let mut output = stdout.lock();
++        for line in BufReader::new(stream).lines() {
++            let line = line.map_err(|error| format!("Could not read MCP response: {error}"))?;
++            output
++                .write_all(line.as_bytes())
++                .and_then(|()| output.write_all(b"\n"))
++                .and_then(|()| output.flush())
++                .map_err(|error| format!("Could not write MCP response: {error}"))?;
++        }
++        Ok(())
++    });
++
++    for line in std::io::stdin().lock().lines() {
++        let line = line.map_err(|error| format!("Could not read MCP request: {error}"))?;
++        writer
++            .write_all(line.as_bytes())
++            .and_then(|()| writer.write_all(b"\n"))
++            .and_then(|()| writer.flush())
++            .map_err(|error| format!("Could not forward MCP request: {error}"))?;
++    }
++    output_thread
++        .join()
++        .map_err(|_| "Anthracite MCP output thread panicked.".to_string())?
++}
+--- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+ mod codex;
++mod opencode;
+ 
+ use crate::process::IoEvent;
+ use crate::store::Store;
+@@ -22,6 +23,20 @@ pub trait ProviderAdapter {
+     fn save_model_selection(&mut self, model: &str, effort: &str);
+     fn interrupt(&mut self) -> Result<(), String>;
+     fn handle_message(&mut self, message: Value) -> Result<(), String>;
++    fn handle_mcp_message(
++        &mut self,
++        _message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    ) -> Result<(), String> {
++        if let Some(response) = response {
++            let _ = response.send(serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": Value::Null,
++                "error": {"code": -32601, "message": "Provider does not expose MCP."}
++            }));
++        }
++        Ok(())
++    }
+ }
+ 
+ pub fn start(
+@@ -35,6 +50,9 @@ pub fn start(
+         "codex" => Ok(Box::new(codex::CodexAdapter::start(
+             binary, cwd, sender, store,
+         )?)),
++        "opencode" => Ok(Box::new(opencode::OpenCodeAdapter::start(
++            binary, cwd, sender, store,
++        )?)),
+         _ => Err(format!("Unsupported provider adapter: {kind}")),
+     }
+ }
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
+@@ -0,0 +1,840 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use super::ProviderAdapter;
++use crate::process::{ChildProcess, IoEvent, McpBridge};
++use crate::protocol::Emitter;
++use crate::store::Store;
++use serde_json::{Value, json};
++use std::collections::HashMap;
++use std::io::{BufRead, BufReader};
++use std::net::TcpListener;
++use std::sync::mpsc;
++use std::thread;
++use std::time::{Duration, Instant};
++
++struct PendingTool {
++    jsonrpc_id: Value,
++    response: mpsc::Sender<Value>,
++}
++
++pub struct OpenCodeAdapter {
++    _process: ChildProcess,
++    base_url: String,
++    session_id: String,
++    active_turn: bool,
++    next_tool_id: u64,
++    pending_tools: HashMap<String, PendingTool>,
++    pending_questions: HashMap<String, Vec<String>>,
++    message_roles: HashMap<String, String>,
++    part_kinds: HashMap<String, String>,
++    emitted_text: HashMap<String, String>,
++    emitter: Emitter,
++}
++
++impl OpenCodeAdapter {
++    pub fn start(
++        binary: &str,
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++        store: Store,
++    ) -> Result<Self, String> {
++        let port = available_port()?;
++        let port_text = port.to_string();
++        let process = ChildProcess::start(
++            binary,
++            &[
++                "serve",
++                "--hostname",
++                "127.0.0.1",
++                "--port",
++                &port_text,
++                "--print-logs",
++            ],
++            cwd,
++            sender,
++        )?;
++        let base_url = format!("http://127.0.0.1:{port}");
++        wait_until_ready(&base_url)?;
++
++        let bridge = McpBridge::start(sender)?;
++        let executable = std::env::current_exe()
++            .map_err(|error| format!("Could not locate the Anthracite runtime: {error}"))?;
++        let mut command = vec![executable.to_string_lossy().to_string()];
++        command.extend(bridge.proxy_arguments());
++        post_json(
++            &base_url,
++            "/mcp",
++            &json!({
++                "name": "anthracite",
++                "config": {
++                    "type": "local",
++                    "command": command,
++                    "cwd": cwd,
++                    "enabled": true,
++                    "timeout": 120000
++                }
++            }),
++        )?;
++
++        let emitter = Emitter::new(store);
++        let resume_id = emitter.provider_thread_id()?;
++        let session = match resume_id {
++            Some(id) => match get_json(&base_url, &format!("/session/{id}")) {
++                Ok(session) if session.get("id").and_then(Value::as_str) == Some(id.as_str()) => {
++                    session
++                }
++                Ok(_) | Err(_) => create_session(&base_url)?,
++            },
++            None => create_session(&base_url)?,
++        };
++        let session_id = session
++            .get("id")
++            .and_then(Value::as_str)
++            .ok_or_else(|| "OpenCode session response did not include an id.".to_string())?
++            .to_string();
++        emitter.set_provider_thread_id(&session_id);
++
++        spawn_event_reader(&base_url, sender);
++        let catalog = get_json(&base_url, "/provider")?;
++        emitter.emit(
++            "model.catalog",
++            json!({
++                "provider": "opencode",
++                "models": normalize_models(&catalog)
++            }),
++        );
++        emitter.emit(
++            "runtime.ready",
++            json!({
++                "provider": "opencode",
++                "threadId": session_id,
++                "capabilities": {
++                    "approvals": true,
++                    "userInput": true,
++                    "plans": false,
++                    "usage": true,
++                    "modelOverrides": true
++                }
++            }),
++        );
++
++        Ok(Self {
++            _process: process,
++            base_url,
++            session_id,
++            active_turn: false,
++            next_tool_id: 1,
++            pending_tools: HashMap::new(),
++            pending_questions: HashMap::new(),
++            message_roles: HashMap::new(),
++            part_kinds: HashMap::new(),
++            emitted_text: HashMap::new(),
++            emitter,
++        })
++    }
++
++    fn session_matches(&self, event: &Value) -> bool {
++        event
++            .pointer("/properties/sessionID")
++            .and_then(Value::as_str)
++            == Some(self.session_id.as_str())
++    }
++
++    fn tool_description() -> &'static str {
++        concat!(
++            "Execute ordinary Python inside the active FreeCAD GUI. ",
++            "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++            "cad.selection() describes selected objects, faces, and edges. ",
++            "The complete source runs as one transaction, recomputes and validates, ",
++            "then returns result/stdout plus created, changed, and deleted objects. ",
++            "Call cad.render() to attach a viewport image for visual verification."
++        )
++    }
++
++    fn developer_instructions() -> &'static str {
++        concat!(
++            "You are operating inside FreeCAD through Anthracite. ",
++            "Use the anthracite_freecad MCP tool for CAD inspection and every CAD mutation. ",
++            "It accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
++            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "Use cad.selection() for selected faces and edges. Treat subelement names as ",
++            "momentary references and re-inspect after topology-changing edits. ",
++            "A tool call is one undoable transaction: failures roll back automatically. ",
++            "Read the returned observation, fix errors, and verify the finished model. ",
++            "Use cad.render() when a viewport image would materially improve verification."
++        )
++    }
++
++    fn mcp_result(result: &str, success: bool, images: &Value) -> Value {
++        let mut content = vec![json!({"type": "text", "text": result})];
++        content.extend(
++            images
++                .as_array()
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str)
++                .filter_map(|image| image.strip_prefix("data:image/"))
++                .filter_map(|rest| {
++                    let (format, data) = rest.split_once(";base64,")?;
++                    Some(json!({
++                        "type": "image",
++                        "data": data,
++                        "mimeType": format!("image/{format}")
++                    }))
++                }),
++        );
++        json!({"content": content, "isError": !success})
++    }
++
++    fn emit_part_text(&mut self, part: &Value, kind: &str) {
++        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("");
++        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
++        if part_id.is_empty() || text.is_empty() {
++            return;
++        }
++        let previous = self
++            .emitted_text
++            .get(part_id)
++            .map(String::as_str)
++            .unwrap_or("");
++        let delta = if let Some(suffix) = text.strip_prefix(previous) {
++            suffix
++        } else if previous.starts_with(text) {
++            ""
++        } else {
++            text
++        };
++        self.emitted_text
++            .insert(part_id.to_string(), text.to_string());
++        if !delta.is_empty() {
++            self.emitter.emit(
++                "content.delta",
++                json!({
++                    "streamKind": if kind == "reasoning" {
++                        "reasoning_text"
++                    } else {
++                        "assistant_text"
++                    },
++                    "text": delta
++                }),
++            );
++        }
++    }
++
++    fn handle_part(&mut self, part: &Value) {
++        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("");
++        let message_id = part.get("messageID").and_then(Value::as_str).unwrap_or("");
++        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
++        if !part_id.is_empty() {
++            self.part_kinds
++                .insert(part_id.to_string(), kind.to_string());
++        }
++        if self.message_roles.get(message_id).map(String::as_str) != Some("assistant") {
++            return;
++        }
++        match part.get("type").and_then(Value::as_str) {
++            Some("text" | "reasoning") => self.emit_part_text(part, kind),
++            Some("tool") => {
++                let state = part
++                    .pointer("/state/status")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                let message_type = match state {
++                    "pending" => "item.started",
++                    "completed" | "error" => "item.completed",
++                    _ => "item.updated",
++                };
++                self.emitter.emit(
++                    message_type,
++                    json!({
++                        "itemId": part.get("callID"),
++                        "kind": "mcp_tool_call",
++                        "title": part.get("tool").and_then(Value::as_str).unwrap_or("Tool"),
++                        "detail": part.pointer("/state/title").or_else(|| part.pointer("/state/error"))
++                    }),
++                );
++            }
++            Some("step-finish") => {
++                let tokens = part.get("tokens").unwrap_or(&Value::Null);
++                self.emitter.emit(
++                    "usage.updated",
++                    json!({
++                        "usedTokens": tokens.get("total")
++                            .or_else(|| tokens.get("input")),
++                        "inputTokens": tokens.get("input"),
++                        "outputTokens": tokens.get("output"),
++                        "reasoningOutputTokens": tokens.get("reasoning")
++                    }),
++                );
++            }
++            _ => {}
++        }
++    }
++
++    fn error_text(error: &Value) -> String {
++        error
++            .pointer("/data/message")
++            .or_else(|| error.get("message"))
++            .and_then(Value::as_str)
++            .unwrap_or("OpenCode reported an unknown error.")
++            .to_string()
++    }
++}
++
++impl ProviderAdapter for OpenCodeAdapter {
++    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
++        if self.active_turn {
++            return Err("OpenCode is already running a turn.".to_string());
++        }
++        let mut body = json!({
++            "system": Self::developer_instructions(),
++            "parts": [{"type": "text", "text": prompt}]
++        });
++        if !model.is_empty() {
++            let (provider_id, model_id) = model
++                .split_once('/')
++                .ok_or_else(|| "OpenCode models must use provider/model format.".to_string())?;
++            body["model"] = json!({"providerID": provider_id, "modelID": model_id});
++        }
++        if !effort.is_empty() {
++            body["variant"] = json!(effort);
++        }
++        post_json(
++            &self.base_url,
++            &format!("/session/{}/prompt_async", self.session_id),
++            &body,
++        )?;
++        self.active_turn = true;
++        self.emitter
++            .record("content.user", &json!({"text": prompt}));
++        self.emitter.emit(
++            "turn.started",
++            json!({"turnId": self.session_id, "provider": "opencode"}),
++        );
++        self.emitter
++            .emit("session.state", json!({"state": "running"}));
++        Ok(())
++    }
++
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++        images: &Value,
++    ) -> Result<(), String> {
++        let request_id = request_id
++            .as_str()
++            .ok_or_else(|| "OpenCode tool request id was not a string.".to_string())?;
++        let pending = self
++            .pending_tools
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown OpenCode tool request: {request_id}"))?;
++        self.emitter.record(
++            "tool.result",
++            &json!({
++                "requestId": request_id,
++                "result": result,
++                "success": success,
++                "imageCount": images.as_array().map_or(0, Vec::len)
++            }),
++        );
++        pending
++            .response
++            .send(json!({
++                "jsonrpc": "2.0",
++                "id": pending.jsonrpc_id,
++                "result": Self::mcp_result(result, success, images)
++            }))
++            .map_err(|_| "OpenCode MCP connection closed before the tool completed.".to_string())
++    }
++
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String> {
++        let reply = match decision {
++            "approve" => "once",
++            "approve_session" => "always",
++            "decline" | "cancel" => "reject",
++            _ => return Err(format!("Unknown approval decision: {decision}")),
++        };
++        post_json(
++            &self.base_url,
++            &format!("/permission/{request_id}/reply"),
++            &json!({"reply": reply}),
++        )?;
++        self.emitter.emit(
++            "request.resolved",
++            json!({"requestId": request_id, "decision": decision}),
++        );
++        Ok(())
++    }
++
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String> {
++        let question_ids = self
++            .pending_questions
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown OpenCode user-input request: {request_id}"))?;
++        let answers = question_ids
++            .iter()
++            .map(|id| match answers.get(id) {
++                Some(Value::Array(values)) => values.clone(),
++                Some(Value::String(value)) => vec![json!(value)],
++                Some(value) => vec![json!(value.to_string())],
++                None => Vec::new(),
++            })
++            .collect::<Vec<_>>();
++        post_json(
++            &self.base_url,
++            &format!("/question/{request_id}/reply"),
++            &json!({"answers": answers}),
++        )?;
++        self.emitter.emit(
++            "user_input.resolved",
++            json!({"requestId": request_id, "answers": answers}),
++        );
++        Ok(())
++    }
++
++    fn save_draft(&mut self, body: &str, save_id: &Value) {
++        self.emitter.save_draft(body, save_id);
++    }
++
++    fn save_model_selection(&mut self, model: &str, effort: &str) {
++        self.emitter.save_model_selection(model, effort);
++    }
++
++    fn interrupt(&mut self) -> Result<(), String> {
++        post_json(
++            &self.base_url,
++            &format!("/session/{}/abort", self.session_id),
++            &json!({}),
++        )?;
++        self.active_turn = false;
++        Ok(())
++    }
++
++    fn handle_message(&mut self, message: Value) -> Result<(), String> {
++        if !self.session_matches(&message) {
++            return Ok(());
++        }
++        let properties = message.get("properties").unwrap_or(&Value::Null);
++        match message.get("type").and_then(Value::as_str).unwrap_or("") {
++            "message.updated" => {
++                if let (Some(message_id), Some(role)) = (
++                    properties.pointer("/info/id").and_then(Value::as_str),
++                    properties.pointer("/info/role").and_then(Value::as_str),
++                ) {
++                    self.message_roles
++                        .insert(message_id.to_string(), role.to_string());
++                }
++            }
++            "message.part.delta" => {
++                if properties.get("field").and_then(Value::as_str) == Some("text")
++                    && let Some(delta) = properties.get("delta").and_then(Value::as_str)
++                    && let Some(part_id) = properties.get("partID").and_then(Value::as_str)
++                    && properties
++                        .get("messageID")
++                        .and_then(Value::as_str)
++                        .and_then(|id| self.message_roles.get(id))
++                        .map(String::as_str)
++                        == Some("assistant")
++                {
++                    self.emitted_text
++                        .entry(part_id.to_string())
++                        .or_default()
++                        .push_str(delta);
++                    self.emitter.emit(
++                        "content.delta",
++                        json!({
++                            "streamKind": if self.part_kinds.get(part_id).map(String::as_str)
++                                == Some("reasoning") {
++                                "reasoning_text"
++                            } else {
++                                "assistant_text"
++                            },
++                            "text": delta
++                        }),
++                    );
++                }
++            }
++            "message.part.updated" => self.handle_part(&properties["part"]),
++            "permission.asked" => {
++                let request_id = properties.get("id").and_then(Value::as_str).unwrap_or("");
++                self.emitter.emit(
++                    "request.opened",
++                    json!({
++                        "requestId": request_id,
++                        "requestKind": format!(
++                            "{}_approval",
++                            properties.get("permission").and_then(Value::as_str).unwrap_or("permission")
++                        ),
++                        "title": "OpenCode permission",
++                        "detail": properties.get("patterns")
++                            .and_then(Value::as_array)
++                            .map(|patterns| patterns.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
++                            .unwrap_or_default(),
++                        "allowSession": true,
++                        "providerArgs": properties.get("metadata")
++                    }),
++                );
++            }
++            "question.asked" => {
++                let request_id = properties.get("id").and_then(Value::as_str).unwrap_or("");
++                let mut ids = Vec::new();
++                let questions = properties
++                    .get("questions")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                    .enumerate()
++                    .map(|(index, question)| {
++                        let id = format!("question-{index}");
++                        ids.push(id.clone());
++                        json!({
++                            "id": id,
++                            "header": question.get("header"),
++                            "question": question.get("question"),
++                            "options": question.get("options"),
++                            "multiSelect": question.get("multiple")
++                        })
++                    })
++                    .collect::<Vec<_>>();
++                self.pending_questions.insert(request_id.to_string(), ids);
++                self.emitter.emit(
++                    "user_input.requested",
++                    json!({"requestId": request_id, "questions": questions}),
++                );
++            }
++            "session.status" => {
++                if properties.pointer("/status/type").and_then(Value::as_str) == Some("idle")
++                    && self.active_turn
++                {
++                    self.active_turn = false;
++                    self.emitter
++                        .emit("turn.completed", json!({"status": "completed"}));
++                }
++            }
++            "session.idle" if self.active_turn => {
++                self.active_turn = false;
++                self.emitter
++                    .emit("turn.completed", json!({"status": "completed"}));
++            }
++            "session.error" => {
++                self.active_turn = false;
++                let text = Self::error_text(&properties["error"]);
++                self.emitter.emit(
++                    "runtime.error",
++                    json!({"class": "provider_error", "message": text}),
++                );
++                self.emitter
++                    .emit("turn.completed", json!({"status": "failed", "error": text}));
++            }
++            _ => {}
++        }
++        Ok(())
++    }
++
++    fn handle_mcp_message(
++        &mut self,
++        message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    ) -> Result<(), String> {
++        let Some(response) = response else {
++            return Ok(());
++        };
++        let id = message.get("id").cloned().unwrap_or(Value::Null);
++        match message.get("method").and_then(Value::as_str).unwrap_or("") {
++            "initialize" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "protocolVersion": "2025-06-18",
++                        "capabilities": {"tools": {}},
++                        "serverInfo": {
++                            "name": "anthracite",
++                            "version": env!("CARGO_PKG_VERSION")
++                        }
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "ping" => response
++                .send(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "tools/list" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "tools": [{
++                            "name": "freecad",
++                            "description": Self::tool_description(),
++                            "inputSchema": {
++                                "type": "object",
++                                "properties": {
++                                    "code": {
++                                        "type": "string",
++                                        "description": "Complete ordinary FreeCAD Python source."
++                                    }
++                                },
++                                "required": ["code"],
++                                "additionalProperties": false
++                            }
++                        }]
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "tools/call" => {
++                let code = message
++                    .pointer("/params/arguments/code")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                if message.pointer("/params/name").and_then(Value::as_str) != Some("freecad")
++                    || code.is_empty()
++                {
++                    return response
++                        .send(json!({
++                            "jsonrpc": "2.0",
++                            "id": id,
++                            "result": {
++                                "content": [{
++                                    "type": "text",
++                                    "text": "The freecad tool requires a non-empty code string."
++                                }],
++                                "isError": true
++                            }
++                        }))
++                        .map_err(|_| "OpenCode MCP connection closed.".to_string());
++                }
++                let request_id = format!("opencode-tool-{}", self.next_tool_id);
++                self.next_tool_id += 1;
++                self.pending_tools.insert(
++                    request_id.clone(),
++                    PendingTool {
++                        jsonrpc_id: id,
++                        response,
++                    },
++                );
++                self.emitter.emit(
++                    "tool.call",
++                    json!({
++                        "requestId": request_id,
++                        "tool": "freecad",
++                        "arguments": {"code": code}
++                    }),
++                );
++                Ok(())
++            }
++            method => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "error": {
++                        "code": -32601,
++                        "message": format!("Unsupported MCP method: {method}")
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++        }
++    }
++}
++
++fn available_port() -> Result<u16, String> {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .map_err(|error| format!("Could not reserve an OpenCode server port: {error}"))?;
++    listener
++        .local_addr()
++        .map(|address| address.port())
++        .map_err(|error| format!("Could not inspect the OpenCode server port: {error}"))
++}
++
++fn wait_until_ready(base_url: &str) -> Result<(), String> {
++    let started = Instant::now();
++    while started.elapsed() < Duration::from_secs(30) {
++        if get_json(base_url, "/global/health").is_ok() {
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(100));
++    }
++    Err("OpenCode server did not become ready within 30 seconds.".to_string())
++}
++
++fn create_session(base_url: &str) -> Result<Value, String> {
++    post_json(
++        base_url,
++        "/session",
++        &json!({"title": "Anthracite FreeCAD"}),
++    )
++}
++
++fn get_json(base_url: &str, path: &str) -> Result<Value, String> {
++    let mut response = ureq::get(format!("{base_url}{path}"))
++        .call()
++        .map_err(|error| format!("OpenCode GET {path} failed: {error}"))?;
++    response
++        .body_mut()
++        .read_json::<Value>()
++        .map_err(|error| format!("OpenCode GET {path} returned invalid JSON: {error}"))
++}
++
++fn post_json(base_url: &str, path: &str, body: &Value) -> Result<Value, String> {
++    let mut response = ureq::post(format!("{base_url}{path}"))
++        .send_json(body)
++        .map_err(|error| format!("OpenCode POST {path} failed: {error}"))?;
++    if response.status().as_u16() == 204 {
++        return Ok(Value::Null);
++    }
++    response
++        .body_mut()
++        .read_json::<Value>()
++        .map_err(|error| format!("OpenCode POST {path} returned invalid JSON: {error}"))
++}
++
++fn spawn_event_reader(base_url: &str, sender: &mpsc::Sender<IoEvent>) {
++    let base_url = base_url.to_string();
++    let sender = sender.clone();
++    thread::spawn(move || {
++        let result = ureq::get(format!("{base_url}/event"))
++            .header("Accept", "text/event-stream")
++            .call();
++        let Ok(response) = result else {
++            let _ = sender.send(IoEvent::ProviderError(
++                "Could not subscribe to OpenCode events.".to_string(),
++            ));
++            return;
++        };
++        for line in BufReader::new(response.into_parts().1.into_reader()).lines() {
++            let Ok(line) = line else {
++                break;
++            };
++            if let Some(data) = line.strip_prefix("data: ")
++                && sender
++                    .send(IoEvent::ProviderLine(data.to_string()))
++                    .is_err()
++            {
++                return;
++            }
++        }
++    });
++}
++
++fn normalize_models(catalog: &Value) -> Vec<Value> {
++    let connected = catalog
++        .get("connected")
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter_map(Value::as_str)
++        .collect::<Vec<_>>();
++    let mut models = catalog
++        .get("all")
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter(|provider| {
++            provider
++                .get("id")
++                .and_then(Value::as_str)
++                .is_some_and(|id| connected.contains(&id))
++        })
++        .flat_map(|provider| {
++            let provider_id = provider.get("id").and_then(Value::as_str).unwrap_or("");
++            let provider_name = provider
++                .get("name")
++                .and_then(Value::as_str)
++                .unwrap_or(provider_id);
++            provider
++                .get("models")
++                .and_then(Value::as_object)
++                .into_iter()
++                .flatten()
++                .map(move |(model_id, model)| {
++                    let variants = model
++                        .get("variants")
++                        .and_then(Value::as_object)
++                        .into_iter()
++                        .flatten()
++                        .map(|(id, _)| {
++                            json!({
++                                "id": id,
++                                "label": id,
++                                "description": ""
++                            })
++                        })
++                        .collect::<Vec<_>>();
++                    let slug = format!("{provider_id}/{model_id}");
++                    json!({
++                        "id": slug,
++                        "model": slug,
++                        "name": format!(
++                            "{} · {}",
++                            provider_name,
++                            model.get("name").and_then(Value::as_str).unwrap_or(model_id)
++                        ),
++                        "description": model.get("family"),
++                        "isDefault": false,
++                        "defaultEffort": "",
++                        "efforts": variants
++                    })
++                })
++                .collect::<Vec<_>>()
++        })
++        .collect::<Vec<_>>();
++    models.insert(
++        0,
++        json!({
++            "id": "opencode-default",
++            "model": "",
++            "name": "OpenCode default",
++            "description": "Use OpenCode's configured model selection.",
++            "isDefault": true,
++            "defaultEffort": "",
++            "efforts": []
++        }),
++    );
++    models
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalizes_only_connected_opencode_models() {
++        let models = normalize_models(&json!({
++            "connected": ["openai"],
++            "default": {"openai": "gpt-5"},
++            "all": [
++                {
++                    "id": "openai",
++                    "name": "OpenAI",
++                    "models": {
++                        "gpt-5": {
++                            "name": "GPT-5",
++                            "family": "gpt",
++                            "variants": {"high": {}}
++                        }
++                    }
++                },
++                {
++                    "id": "other",
++                    "name": "Other",
++                    "models": {"hidden": {"name": "Hidden"}}
++                }
++            ]
++        }));
++        assert_eq!(models.len(), 2);
++        assert_eq!(models[0]["model"], "");
++        assert_eq!(models[0]["isDefault"], true);
++        assert_eq!(models[1]["model"], "openai/gpt-5");
++        assert_eq!(models[1]["isDefault"], false);
++        assert_eq!(models[1]["efforts"][0]["id"], "high");
++    }
++
++    #[test]
++    fn builds_mcp_image_content() {
++        let result =
++            OpenCodeAdapter::mcp_result("ok", true, &json!(["data:image/png;base64,AAAA"]));
++        assert_eq!(result["content"][1]["mimeType"], "image/png");
++        assert_eq!(result["isError"], false);
++    }
++}
+--- a/src/Mod/Anthracite/TestAnthraciteGui.py
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -41,6 +41,8 @@ def run_smoke_test():
+         raise AssertionError("Anthracite QML does not expose the reasoning-effort picker.")
+     if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is None:
+         raise AssertionError("Anthracite QML does not expose context-window usage.")
++    if root.findChild(QtCore.QObject, "AnthraciteProviderPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the provider picker.")
+ 
+     render_document = App.newDocument("AnthraciteRender")
+     render_result = AnthraciteExecutor.execute(

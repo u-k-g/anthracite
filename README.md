@@ -24,7 +24,7 @@ interface.
 <details open>
 <summary><strong>status</strong></summary>
 
-The working vertical slice is implemented in eleven ordered patches:
+The working vertical slice is implemented in twelve ordered patches:
 
 - a persistent native FreeCAD dock with a QML chat timeline and composer
 - a transactional `freecad` Python executor with rollback, recompute, validation, structured
@@ -44,10 +44,14 @@ The working vertical slice is implemented in eleven ordered patches:
 - a normalized context-window usage meter in the composer
 - structured active-workbench and selected object/face/edge context, including geometry summaries
   for momentary topology references
+- live Codex and OpenCode adapters, a native provider switcher and a local MCP bridge that gives
+  OpenCode the same transactional `freecad` tool
 
-Codex is the complete provider adapter. OpenCode support and deeper workbench-specific observation
-quality remain follow-on work behind the same narrow runtime protocol. Claude Code is deliberately
-not near-term work.
+Codex and OpenCode use the user's existing installations, authentication, configuration, models,
+skills and normal tools. Anthracite starts their native server modes, normalizes their events and
+adds only its FreeCAD tool. It does not add T3 Code's project registry, worktrees or simultaneous
+project sessions: one provider operates on the one active FreeCAD document context. Claude Code is
+deliberately not near-term work.
 
 </details>
 
@@ -125,8 +129,8 @@ pixi run configure-debug
 pixi run cmake --build build/debug --target AnthraciteGui FreeCAD -j 10
 ```
 
-Launch the resulting `build/debug/bin/FreeCAD`, open the Anthracite dock, and use **Configure…** to
-select an existing Codex executable if it is not already on FreeCAD's `PATH`.
+Launch the resulting `build/debug/bin/FreeCAD`, open the Anthracite dock, choose Codex or OpenCode
+in the composer, and use **Configure…** only if Anthracite cannot discover the existing executable.
 
 </details>
 
@@ -147,15 +151,15 @@ select an existing Codex executable if it is not already on FreeCAD's `PATH`.
 
 ```text
 prompt in the dockable QML sidebar
-  → existing Codex session
+  → existing Codex or OpenCode installation
   → one freeform FreeCAD Python tool call
   → GUI-thread transaction, recompute and validation
   → structured CAD change observation
   → streamed result in the sidebar
 ```
 
-This path is implemented for Codex. A future provider can adapt to the same runtime event protocol
-without changing the FreeCAD executor or QML surface.
+Both providers adapt to the same runtime event protocol and share one FreeCAD executor and QML
+surface.
 
 </details>
 
