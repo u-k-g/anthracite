@@ -1,0 +1,2878 @@
+diff --git a/src/Mod/Anthracite/Gui/AgentBridge.cpp b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+new file mode 100644
+index 0000000000..4d575ae430
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -0,0 +1,841 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "AgentBridge.h"
++
++#include "Sidebar.h"
++
++#include <Python.h>
++
++#include <QApplication>
++#include <QDir>
++#include <QFileDialog>
++#include <QFileInfo>
++#include <QJsonDocument>
++#include <QJsonArray>
++#include <QJsonObject>
++#include <QProcessEnvironment>
++#include <QStandardPaths>
++#include <QThread>
++#include <QUuid>
++
++#include <App/Application.h>
++#include <App/Document.h>
++#include <Base/Console.h>
++
++
++using namespace AnthraciteGui;
++
++namespace
++{
++constexpr auto preferencePath = "User parameter:BaseApp/Preferences/Mod/Anthracite";
++
++QString pythonError()
++{
++    if (!PyErr_Occurred()) {
++        return QStringLiteral("Unknown embedded Python error.");
++    }
++
++    PyObject* type = nullptr;
++    PyObject* value = nullptr;
++    PyObject* traceback = nullptr;
++    PyErr_Fetch(&type, &value, &traceback);
++    PyErr_NormalizeException(&type, &value, &traceback);
++
++    QString result = QStringLiteral("Embedded Python error.");
++    if (value) {
++        PyObject* text = PyObject_Str(value);
++        if (text) {
++            result = QString::fromUtf8(PyUnicode_AsUTF8(text));
++            Py_DECREF(text);
++        }
++    }
++
++    Py_XDECREF(type);
++    Py_XDECREF(value);
++    Py_XDECREF(traceback);
++    return result;
++}
++}  // namespace
++
++AgentBridge::AgentBridge(SidebarController* controller, QObject* parent)
++    : QObject(parent)
++    , sidebar(controller)
++{
++    connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
++    connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
++    connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
++    connect(sidebar, &SidebarController::providerSelected, this, &AgentBridge::selectProvider);
++    connect(sidebar, &SidebarController::newThreadRequested, this, &AgentBridge::newThread);
++    connect(sidebar, &SidebarController::threadSelected, this, &AgentBridge::selectThread);
++    connect(sidebar, &SidebarController::draftEdited, this, &AgentBridge::draftEdited);
++    connect(sidebar, &SidebarController::modelSelectionEdited, this, &AgentBridge::modelSelectionEdited);
++    connect(sidebar, &SidebarController::approvalResponded, this, &AgentBridge::respondToApproval);
++    connect(sidebar, &SidebarController::userInputResponded, this, &AgentBridge::respondToUserInput);
++    connect(&runtime, &QProcess::started, this, &AgentBridge::processStarted);
++    connect(&runtime, &QProcess::readyReadStandardOutput, this, &AgentBridge::readStandardOutput);
++    connect(&runtime, &QProcess::readyReadStandardError, this, &AgentBridge::readStandardError);
++    connect(&runtime, &QProcess::errorOccurred, this, &AgentBridge::processError);
++    connect(
++        &runtime,
++        qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
++        this,
++        &AgentBridge::processFinished
++    );
++    draftTimer.setSingleShot(true);
++    draftTimer.setInterval(250);
++    connect(&draftTimer, &QTimer::timeout, this, &AgentBridge::persistDraft);
++
++    activeDocumentConnection = App::GetApplication().signalActiveDocument.connect(
++        [this](const App::Document&) { scheduleDocumentSync(); }
++    );
++    savedDocumentConnection = App::GetApplication().signalSaveDocument.connect(
++        [this](const App::Document&) { scheduleDocumentSync(); }
++    );
++    deletedDocumentConnection = App::GetApplication().signalDeleteDocument.connect(
++        [this](const App::Document& document) { documentDeleted(document); }
++    );
++
++    sidebar->restoreProvider(providerKind());
++    QTimer::singleShot(0, this, [this]() {
++        if (!providerPath().isEmpty() && QFileInfo::exists(runtimePath())) {
++            ensureRuntime();
++        }
++    });
++}
++
++AgentBridge::~AgentBridge()
++{
++    draftTimer.stop();
++    if (runtime.state() == QProcess::NotRunning) {
++        return;
++    }
++
++    send(QStringLiteral("session.shutdown"));
++    runtime.closeWriteChannel();
++    if (!runtime.waitForFinished(1500)) {
++        runtime.terminate();
++        if (!runtime.waitForFinished(1000)) {
++            runtime.kill();
++            runtime.waitForFinished(1000);
++        }
++    }
++}
++
++void AgentBridge::submit(const QString& prompt)
++{
++    queuedPrompt = prompt;
++    assistantMessageStarted = false;
++    stopping = false;
++
++    if (runtimeReady) {
++        QJsonObject payload {{"prompt", queuedPrompt}};
++        if (!selectedModel.isEmpty()) {
++            payload.insert(QStringLiteral("model"), selectedModel);
++        }
++        if (!selectedEffort.isEmpty()) {
++            payload.insert(QStringLiteral("effort"), selectedEffort);
++        }
++        send(QStringLiteral("turn.start"), payload);
++        queuedPrompt.clear();
++        return;
++    }
++
++    ensureRuntime();
++}
++
++void AgentBridge::stop()
++{
++    stopping = true;
++    send(QStringLiteral("turn.interrupt"));
++}
++
++void AgentBridge::chooseProvider()
++{
++    const QString provider = providerKind();
++    const QString displayName =
++        provider == QLatin1String("opencode") ? QStringLiteral("OpenCode") : QStringLiteral("Codex");
++    const QString selected = QFileDialog::getOpenFileName(
++        QApplication::activeWindow(),
++        tr("Choose the %1 executable").arg(displayName),
++        providerPath()
++    );
++    if (selected.isEmpty()) {
++        return;
++    }
++
++    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    preferences->SetASCII(key, selected.toUtf8().constData());
++    sidebar->appendActivity(tr("%1 executable set to %2").arg(displayName, selected));
++
++    if (runtime.state() != QProcess::NotRunning) {
++        stopping = true;
++        runtime.kill();
++        runtime.waitForFinished(1000);
++        stopping = false;
++    }
++    runtimeReady = false;
++    ensureRuntime();
++}
++
++void AgentBridge::selectProvider(const QString& provider)
++{
++    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    preferences->SetASCII("Provider", provider.toUtf8().constData());
++    selectedLocalThreadId.clear();
++    createNewThread = false;
++    sidebar->appendActivity(
++        tr("Using %1").arg(
++            provider == QLatin1String("opencode") ? QStringLiteral("OpenCode")
++                                                   : QStringLiteral("Codex")
++        )
++    );
++    performSessionRestart(QString(), false);
++}
++
++void AgentBridge::newThread()
++{
++    restartSession(QString(), true);
++}
++
++void AgentBridge::selectThread(const QString& threadId)
++{
++    restartSession(threadId, false);
++}
++
++void AgentBridge::draftEdited(const QString& body)
++{
++    pendingDraft = body;
++    draftDirty = true;
++    draftTimer.start();
++}
++
++void AgentBridge::modelSelectionEdited(const QString& model, const QString& effort)
++{
++    selectedModel = model;
++    selectedEffort = effort;
++    send(QStringLiteral("model.selection.save"), {{"model", selectedModel}, {"effort", selectedEffort}});
++}
++
++void AgentBridge::persistDraft()
++{
++    persistDraftNow();
++}
++
++void AgentBridge::respondToApproval(const QString& requestId, const QString& decision)
++{
++    send(QStringLiteral("request.resolve"), {{"requestId", requestId}, {"decision", decision}});
++}
++
++void AgentBridge::respondToUserInput(const QString& requestId, const QVariantMap& answers)
++{
++    send(
++        QStringLiteral("user_input.resolve"),
++        {
++            {"requestId", requestId},
++            {"answers", QJsonObject::fromVariantMap(answers)},
++        }
++    );
++}
++
++void AgentBridge::processStarted()
++{
++    sidebar->updateStatus(tr("Connecting"));
++    runtimeDocumentIdentity = documentIdentity();
++    QJsonObject session {
++        {
++            "provider",
++            QJsonObject {
++                {"kind", providerKind()},
++                {"binary", providerPath()},
++            },
++        },
++        {"cwd", workingDirectory()},
++        {"storagePath", databasePath()},
++        {"document", documentContext()},
++        {"createThread", createNewThread},
++    };
++    if (!selectedLocalThreadId.isEmpty()) {
++        session.insert(QStringLiteral("localThreadId"), selectedLocalThreadId);
++    }
++    send(QStringLiteral("session.start"), session);
++    createNewThread = false;
++}
++
++void AgentBridge::readStandardOutput()
++{
++    standardOutputBuffer += runtime.readAllStandardOutput();
++    while (true) {
++        const qsizetype newline = standardOutputBuffer.indexOf('\n');
++        if (newline < 0) {
++            break;
++        }
++
++        const QByteArray line = standardOutputBuffer.left(newline).trimmed();
++        standardOutputBuffer.remove(0, newline + 1);
++        if (line.isEmpty()) {
++            continue;
++        }
++
++        QJsonParseError error;
++        const auto document = QJsonDocument::fromJson(line, &error);
++        if (error.error != QJsonParseError::NoError || !document.isObject()) {
++            Base::Console().warning("Anthracite runtime returned invalid JSON: %s\n", line.constData());
++            continue;
++        }
++        handleMessage(document.object());
++    }
++}
++
++void AgentBridge::readStandardError()
++{
++    const QString text = QString::fromUtf8(runtime.readAllStandardError()).trimmed();
++    if (!text.isEmpty()) {
++        Base::Console().warning("Anthracite runtime: %s\n", text.toUtf8().constData());
++    }
++}
++
++void AgentBridge::processError(QProcess::ProcessError error)
++{
++    Q_UNUSED(error);
++    if (!stopping) {
++        fail(tr("Agent runtime failed: %1").arg(runtime.errorString()));
++    }
++}
++
++void AgentBridge::processFinished(int exitCode, QProcess::ExitStatus exitStatus)
++{
++    runtimeReady = false;
++    if (!stopping && sidebar->busy()) {
++        const QString reason = exitStatus == QProcess::CrashExit
++            ? tr("Agent runtime crashed.")
++            : tr("Agent runtime exited with code %1.").arg(exitCode);
++        fail(reason);
++    }
++}
++
++void AgentBridge::ensureRuntime()
++{
++    if (runtime.state() != QProcess::NotRunning) {
++        return;
++    }
++
++    const QString provider = providerPath();
++    if (provider.isEmpty() || !QFileInfo::exists(provider)) {
++        const QString displayName = providerKind() == QLatin1String("opencode")
++            ? QStringLiteral("OpenCode")
++            : QStringLiteral("Codex");
++        fail(
++            tr("%1 was not found. Use Configure… to select your existing executable.")
++                .arg(displayName)
++        );
++        return;
++    }
++
++    const QString executable = runtimePath();
++    if (!QFileInfo::exists(executable)) {
++        fail(tr("Anthracite runtime was not found at %1").arg(executable));
++        return;
++    }
++
++    sidebar->appendActivity(
++        tr("Starting %1").arg(
++            providerKind() == QLatin1String("opencode") ? QStringLiteral("OpenCode")
++                                                        : QStringLiteral("Codex")
++        )
++    );
++    runtime.setProgram(executable);
++    runtime.setWorkingDirectory(workingDirectory());
++    runtime.start();
++}
++
++void AgentBridge::restartSession(const QString& threadId, bool createThread)
++{
++    draftTimer.stop();
++    if (draftDirty && runtimeReady) {
++        restartPending = true;
++        pendingRestartThreadId = threadId;
++        pendingRestartCreateThread = createThread;
++        pendingRestartSaveId = persistDraftNow();
++        return;
++    }
++    performSessionRestart(threadId, createThread);
++}
++
++void AgentBridge::performSessionRestart(const QString& threadId, bool createThread)
++{
++    restartPending = false;
++    pendingRestartSaveId = 0;
++    selectedLocalThreadId = threadId;
++    createNewThread = createThread;
++    assistantMessageStarted = false;
++    documentRevision.reset();
++    standardOutputBuffer.clear();
++    sidebar->clearInteraction();
++    sidebar->clearUsage();
++    selectedModel.clear();
++    selectedEffort.clear();
++    sidebar->restoreModelSelection(QString(), QString());
++
++    if (runtime.state() != QProcess::NotRunning) {
++        stopping = true;
++        runtime.kill();
++        runtime.waitForFinished(1000);
++        stopping = false;
++    }
++    runtimeReady = false;
++    ensureRuntime();
++}
++
++qint64 AgentBridge::persistDraftNow()
++{
++    if (!draftDirty || !runtimeReady) {
++        return 0;
++    }
++    const qint64 saveId = nextDraftSaveId++;
++    send(QStringLiteral("draft.save"), {{"body", pendingDraft}, {"saveId", saveId}});
++    draftDirty = false;
++    return saveId;
++}
++
++void AgentBridge::send(const QString& type, const QJsonObject& payload)
++{
++    if (runtime.state() == QProcess::NotRunning) {
++        return;
++    }
++    const QJsonObject message {
++        {"protocolVersion", 1},
++        {"type", type},
++        {"payload", payload},
++    };
++    runtime.write(QJsonDocument(message).toJson(QJsonDocument::Compact));
++    runtime.write("\n");
++}
++
++void AgentBridge::handleMessage(const QJsonObject& message)
++{
++    const QString type = message.value("type").toString();
++    const QJsonObject payload = message.value("payload").toObject();
++    if (type == QLatin1String("thread.local.ready")) {
++        selectedLocalThreadId = payload.value("localThreadId").toString();
++    }
++    else if (type == QLatin1String("thread.list")) {
++        sidebar->updateThreads(
++            payload.value("currentThreadId").toString(),
++            payload.value("threads").toArray().toVariantList()
++        );
++    }
++    else if (type == QLatin1String("history.snapshot")) {
++        const QJsonArray events = payload.value("events").toArray();
++        sidebar->resetHistory();
++        assistantMessageStarted = false;
++        for (const auto& value : events) {
++            const QJsonObject event = value.toObject();
++            if (event.value("type").toString() == QLatin1String("content.user")) {
++                sidebar->appendUserMessage(event.value("payload").toObject().value("text").toString());
++                assistantMessageStarted = false;
++            }
++            else {
++                handleMessage(event);
++            }
++        }
++        if (events.isEmpty()) {
++            sidebar->showWelcome();
++        }
++        if (!queuedPrompt.isEmpty()) {
++            sidebar->appendUserMessage(queuedPrompt);
++        }
++    }
++    else if (type == QLatin1String("draft.loaded")) {
++        pendingDraft = payload.value("body").toString();
++        draftDirty = false;
++        sidebar->loadDraft(pendingDraft);
++    }
++    else if (type == QLatin1String("draft.saved")) {
++        const qint64 saveId = payload.value("saveId").toInteger();
++        if (restartPending && saveId == pendingRestartSaveId) {
++            performSessionRestart(pendingRestartThreadId, pendingRestartCreateThread);
++        }
++    }
++    else if (type == QLatin1String("model.selection")) {
++        selectedModel = payload.value("model").toString();
++        selectedEffort = payload.value("effort").toString();
++        sidebar->restoreModelSelection(selectedModel, selectedEffort);
++        selectedModel = sidebar->selectedModel();
++        selectedEffort = sidebar->selectedEffort();
++    }
++    else if (type == QLatin1String("model.catalog")) {
++        sidebar->updateModelCatalog(payload.value("models").toArray().toVariantList());
++        selectedModel = sidebar->selectedModel();
++        selectedEffort = sidebar->selectedEffort();
++    }
++    else if (type == QLatin1String("usage.updated")) {
++        sidebar->updateUsage(payload.toVariantMap());
++    }
++    else if (type == QLatin1String("runtime.ready")) {
++        runtimeReady = true;
++        sidebar->appendActivity(
++            tr("%1 connected").arg(
++                payload.value("provider").toString() == QLatin1String("opencode")
++                    ? QStringLiteral("OpenCode")
++                    : QStringLiteral("Codex")
++            )
++        );
++        sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
++        persistDraft();
++        if (!queuedPrompt.isEmpty()) {
++            QJsonObject turnPayload {{"prompt", queuedPrompt}};
++            if (!selectedModel.isEmpty()) {
++                turnPayload.insert(QStringLiteral("model"), selectedModel);
++            }
++            if (!selectedEffort.isEmpty()) {
++                turnPayload.insert(QStringLiteral("effort"), selectedEffort);
++            }
++            send(QStringLiteral("turn.start"), turnPayload);
++            queuedPrompt.clear();
++        }
++    }
++    else if (type == QLatin1String("content.delta")
++             && payload.value("streamKind").toString() == QLatin1String("assistant_text")) {
++        sidebar->updateStatus(tr("Responding"));
++        if (!assistantMessageStarted) {
++            sidebar->beginAssistantMessage();
++            assistantMessageStarted = true;
++        }
++        sidebar->appendAssistantDelta(payload.value("text").toString());
++    }
++    else if (type == QLatin1String("item.started")) {
++        const QString title = payload.value("title").toString();
++        const QString detail = payload.value("detail").toString();
++        sidebar->appendActivity(detail.isEmpty() ? title : tr("%1: %2").arg(title, detail));
++    }
++    else if (type == QLatin1String("tool.call")) {
++        runFreeCADTool(payload);
++    }
++    else if (type == QLatin1String("request.opened")) {
++        sidebar->showApproval(
++            payload.value("requestId").toString(),
++            payload.value("title").toString(tr("Approval needed")),
++            payload.value("detail").toString(),
++            payload.value("allowSession").toBool()
++        );
++    }
++    else if (type == QLatin1String("user_input.requested")) {
++        sidebar->showUserInput(
++            payload.value("requestId").toString(),
++            payload.value("questions").toArray().toVariantList()
++        );
++    }
++    else if (type == QLatin1String("plan.updated")) {
++        sidebar->updatePlan(
++            payload.value("explanation").toString(),
++            payload.value("steps").toArray().toVariantList()
++        );
++    }
++    else if (type == QLatin1String("runtime.warning")) {
++        sidebar->appendActivity(payload.value("message").toString());
++    }
++    else if (type == QLatin1String("turn.completed")) {
++        const QString status = payload.value("status").toString();
++        if (status == QLatin1String("failed")) {
++            fail(payload.value("error").toString(tr("The provider turn failed.")));
++        }
++        else {
++            sidebar->completeTurn();
++        }
++    }
++    else if (type == QLatin1String("runtime.error")) {
++        fail(payload.value("message").toString(tr("Unknown agent error.")));
++    }
++}
++
++void AgentBridge::runFreeCADTool(const QJsonObject& payload)
++{
++    Q_ASSERT(QThread::currentThread() == qApp->thread());
++    if (documentSyncPending || documentIdentity() != runtimeDocumentIdentity) {
++        send(
++            QStringLiteral("tool.result"),
++            {
++                {"requestId", payload.value("requestId")},
++                {
++                    "result",
++                    QStringLiteral(
++                        R"({"ok":false,"error":{"type":"DocumentContextChanged","message":"The active FreeCAD document changed before this call could run."}})"
++                    ),
++                },
++                {"success", false},
++            }
++        );
++        return;
++    }
++    sidebar->updateStatus(tr("Editing"));
++    sidebar->appendActivity(tr("Running FreeCAD Python"));
++
++    bool success = false;
++    QString result
++        = executePython(payload.value("arguments").toObject().value("code").toString(), success);
++    auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
++    QJsonArray images;
++    if (resultDocument.isObject()) {
++        auto resultObject = resultDocument.object();
++        images = resultObject.take(QStringLiteral("images")).toArray();
++        resultDocument.setObject(resultObject);
++        result = QString::fromUtf8(resultDocument.toJson(QJsonDocument::Compact));
++        if (resultObject.value("revision").isDouble()) {
++            documentRevision = resultObject.value("revision").toInt();
++        }
++        const auto observation = resultObject.value("observation").toObject();
++        const int created = observation.value("created").toArray().size();
++        const int changed = observation.value("changed").toArray().size();
++        const int deleted = observation.value("deleted").toArray().size();
++        sidebar->appendActivity(
++            tr("FreeCAD: %1 created, %2 changed, %3 deleted").arg(created).arg(changed).arg(deleted)
++        );
++        if (!images.isEmpty()) {
++            sidebar->appendActivity(tr("Attached %n viewport render(s)", nullptr, images.size()));
++        }
++    }
++
++    send(
++        QStringLiteral("tool.result"),
++        {
++            {"requestId", payload.value("requestId")},
++            {"result", result},
++            {"success", success},
++            {"images", images},
++        }
++    );
++}
++
++QString AgentBridge::executePython(const QString& source, bool& success)
++{
++    success = false;
++    const PyGILState_STATE state = PyGILState_Ensure();
++    PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
++    if (!module) {
++        const QString error = pythonError();
++        PyGILState_Release(state);
++        return QString::fromUtf8(
++            QJsonDocument(
++                QJsonObject {
++                    {"ok", false},
++                    {"error", QJsonObject {{"type", "ImportError"}, {"message", error}}},
++                }
++            )
++                .toJson(QJsonDocument::Compact)
++        );
++    }
++
++    const QByteArray encoded = source.toUtf8();
++    PyObject* result = documentRevision
++        ? PyObject_CallMethod(module, "execute_json", "si", encoded.constData(), *documentRevision)
++        : PyObject_CallMethod(module, "execute_json", "s", encoded.constData());
++    Py_DECREF(module);
++
++    if (!result) {
++        const QString error = pythonError();
++        PyGILState_Release(state);
++        return QString::fromUtf8(
++            QJsonDocument(
++                QJsonObject {
++                    {"ok", false},
++                    {"error", QJsonObject {{"type", "PythonError"}, {"message", error}}},
++                }
++            )
++                .toJson(QJsonDocument::Compact)
++        );
++    }
++
++    const char* encodedResult = PyUnicode_AsUTF8(result);
++    const QString text = encodedResult
++        ? QString::fromUtf8(encodedResult)
++        : QStringLiteral(
++              R"({"ok":false,"error":{"type":"EncodingError","message":"Executor returned non-text."}})"
++          );
++    Py_DECREF(result);
++    PyGILState_Release(state);
++
++    const auto document = QJsonDocument::fromJson(text.toUtf8());
++    success = document.isObject() && document.object().value("ok").toBool();
++    return text;
++}
++
++QString AgentBridge::runtimePath() const
++{
++    return QDir(QString::fromStdString(App::Application::getHomePath()))
++        .filePath(QStringLiteral("Mod/Anthracite/anthracite-runtime"));
++}
++
++QString AgentBridge::providerKind() const
++{
++    const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    const QString configured = QString::fromStdString(preferences->GetASCII("Provider", "codex"));
++    return configured == QLatin1String("opencode") ? configured : QStringLiteral("codex");
++}
++
++QString AgentBridge::providerPath() const
++{
++    return findProviderExecutable(providerKind());
++}
++
++QString AgentBridge::findProviderExecutable(const QString& provider) const
++{
++    const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
++    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    const QString configured = QString::fromStdString(preferences->GetASCII(key, ""));
++    if (!configured.isEmpty()) {
++        return configured;
++    }
++    const QString executable = QStandardPaths::findExecutable(provider);
++    if (!executable.isEmpty()) {
++        return executable;
++    }
++
++    const QString home = QDir::homePath();
++    const QStringList candidates =
++        provider == QLatin1String("opencode")
++        ? QStringList {
++              QDir(home).filePath(QStringLiteral(".opencode/bin/opencode")),
++              QStringLiteral("/opt/homebrew/bin/opencode"),
++              QStringLiteral("/usr/local/bin/opencode"),
++          }
++        : QStringList {
++              QDir(home).filePath(QStringLiteral(".local/bin/codex")),
++              QStringLiteral("/opt/homebrew/bin/codex"),
++              QStringLiteral("/usr/local/bin/codex"),
++          };
++    for (const QString& candidate : candidates) {
++        if (QFileInfo(candidate).isExecutable()) {
++            return candidate;
++        }
++    }
++
++    QProcess shell;
++#ifdef Q_OS_WIN
++    shell.start(QStringLiteral("cmd.exe"), {QStringLiteral("/C"), QStringLiteral("where"), provider});
++#else
++    const QString shellProgram = QProcessEnvironment::systemEnvironment().value(
++        QStringLiteral("SHELL"),
++        QStringLiteral("/bin/sh")
++    );
++    shell.start(
++        shellProgram,
++        {QStringLiteral("-lc"), QStringLiteral("command -v %1").arg(provider)}
++    );
++#endif
++    if (shell.waitForFinished(2000) && shell.exitCode() == 0) {
++        const QString resolved = QString::fromUtf8(shell.readAllStandardOutput()).trimmed();
++        if (QFileInfo(resolved).isExecutable()) {
++            return resolved;
++        }
++    }
++    return {};
++}
++
++QString AgentBridge::workingDirectory() const
++{
++    if (const auto* document = App::GetApplication().getActiveDocument()) {
++        const std::string fileName = document->getFileName();
++        if (!fileName.empty()) {
++            return QFileInfo(QString::fromStdString(fileName)).absolutePath();
++        }
++    }
++    return QDir::currentPath();
++}
++
++QString AgentBridge::databasePath() const
++{
++    return QDir(QString::fromStdString(App::Application::getUserAppDataDir()))
++        .filePath(QStringLiteral("Anthracite/anthracite.db"));
++}
++
++QJsonObject AgentBridge::documentContext()
++{
++    const auto* document = App::GetApplication().getActiveDocument();
++    const QString name = document ? QString::fromUtf8(document->getName()) : QStringLiteral("none");
++    const QString contextKey = document ? QStringLiteral("document:%1").arg(name)
++                                        : QStringLiteral("no-document");
++    QString sessionKey = documentSessionKeys.value(contextKey);
++    if (sessionKey.isEmpty()) {
++        sessionKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
++        documentSessionKeys.insert(contextKey, sessionKey);
++    }
++
++    if (!document) {
++        return {
++            {"displayName", tr("Unsaved FreeCAD document")},
++            {"sessionKey", sessionKey},
++        };
++    }
++
++    const QString fileName = QString::fromStdString(document->getFileName());
++    return {
++        {"path", fileName},
++        {"displayName", fileName.isEmpty() ? name : QFileInfo(fileName).fileName()},
++        {"sessionKey", sessionKey},
++    };
++}
++
++QString AgentBridge::documentIdentity() const
++{
++    if (const auto* document = App::GetApplication().getActiveDocument()) {
++        return QStringLiteral("%1\n%2").arg(
++            QString::fromUtf8(document->getName()),
++            QString::fromStdString(document->getFileName())
++        );
++    }
++    return QStringLiteral("<no-active-document>");
++}
++
++void AgentBridge::scheduleDocumentSync()
++{
++    if (documentSyncPending) {
++        return;
++    }
++    documentSyncPending = true;
++    QTimer::singleShot(0, this, [this]() {
++        documentSyncPending = false;
++        synchronizeDocumentContext();
++    });
++}
++
++void AgentBridge::synchronizeDocumentContext()
++{
++    const QString currentIdentity = documentIdentity();
++    if (currentIdentity == runtimeDocumentIdentity) {
++        return;
++    }
++
++    queuedPrompt.clear();
++    draftTimer.stop();
++    draftDirty = false;
++    restartPending = false;
++    pendingRestartSaveId = 0;
++    pendingDraft.clear();
++    sidebar->documentContextChanged();
++    const QString currentProviderPath = providerPath();
++    if (runtime.state() == QProcess::NotRunning
++        && (currentProviderPath.isEmpty() || !QFileInfo::exists(currentProviderPath)
++            || !QFileInfo::exists(runtimePath()))) {
++        runtimeDocumentIdentity = currentIdentity;
++        selectedLocalThreadId.clear();
++        runtimeReady = false;
++        sidebar->updateStatus(tr("Ready"));
++        return;
++    }
++    performSessionRestart(QString(), false);
++}
++
++void AgentBridge::documentDeleted(const App::Document& document)
++{
++    documentSessionKeys.remove(
++        QStringLiteral("document:%1").arg(QString::fromUtf8(document.getName()))
++    );
++    scheduleDocumentSync();
++}
++
++void AgentBridge::fail(const QString& message)
++{
++    queuedPrompt.clear();
++    sidebar->failTurn(message);
++}
+diff --git a/src/Mod/Anthracite/Gui/AgentBridge.h b/src/Mod/Anthracite/Gui/AgentBridge.h
+new file mode 100644
+index 0000000000..28ea4052c3
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
++#define ANTHRACITEGUI_AGENTBRIDGE_H
++
++#include <QJsonValue>
++#include <QJsonObject>
++#include <QHash>
++#include <QObject>
++#include <QProcess>
++#include <QTimer>
++#include <QVariantMap>
++
++#include <optional>
++
++#include <boost/signals2/connection.hpp>
++
++namespace App
++{
++class Document;
++}
++
++namespace AnthraciteGui
++{
++class SidebarController;
++
++class AgentBridge: public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit AgentBridge(SidebarController* controller, QObject* parent = nullptr);
++    ~AgentBridge() override;
++
++private Q_SLOTS:
++    void submit(const QString& prompt);
++    void stop();
++    void chooseProvider();
++    void selectProvider(const QString& provider);
++    void newThread();
++    void selectThread(const QString& threadId);
++    void draftEdited(const QString& body);
++    void modelSelectionEdited(const QString& model, const QString& effort);
++    void persistDraft();
++    void respondToApproval(const QString& requestId, const QString& decision);
++    void respondToUserInput(const QString& requestId, const QVariantMap& answers);
++    void processStarted();
++    void readStandardOutput();
++    void readStandardError();
++    void processError(QProcess::ProcessError error);
++    void processFinished(int exitCode, QProcess::ExitStatus exitStatus);
++
++private:
++    void ensureRuntime();
++    void restartSession(const QString& threadId, bool createThread);
++    void performSessionRestart(const QString& threadId, bool createThread);
++    qint64 persistDraftNow();
++    void send(const QString& type, const QJsonObject& payload = {});
++    void handleMessage(const QJsonObject& message);
++    void runFreeCADTool(const QJsonObject& payload);
++    QString executePython(const QString& source, bool& success);
++    QString runtimePath() const;
++    QString providerKind() const;
++    QString providerPath() const;
++    QString findProviderExecutable(const QString& provider) const;
++    QString workingDirectory() const;
++    QString databasePath() const;
++    QJsonObject documentContext();
++    QString documentIdentity() const;
++    void scheduleDocumentSync();
++    void synchronizeDocumentContext();
++    void documentDeleted(const App::Document& document);
++    void fail(const QString& message);
++
++    SidebarController* sidebar;
++    QProcess runtime;
++    QByteArray standardOutputBuffer;
++    QString queuedPrompt;
++    bool runtimeReady = false;
++    bool assistantMessageStarted = false;
++    bool stopping = false;
++    bool createNewThread = false;
++    bool draftDirty = false;
++    bool restartPending = false;
++    QHash<QString, QString> documentSessionKeys;
++    QString selectedLocalThreadId;
++    QString pendingDraft;
++    QString selectedModel;
++    QString selectedEffort;
++    QString pendingRestartThreadId;
++    bool pendingRestartCreateThread = false;
++    qint64 nextDraftSaveId = 1;
++    qint64 pendingRestartSaveId = 0;
++    QTimer draftTimer;
++    QString runtimeDocumentIdentity;
++    bool documentSyncPending = false;
++    boost::signals2::scoped_connection activeDocumentConnection;
++    boost::signals2::scoped_connection savedDocumentConnection;
++    boost::signals2::scoped_connection deletedDocumentConnection;
++    std::optional<int> documentRevision;
++};
++}  // namespace AnthraciteGui
++
++#endif  // ANTHRACITEGUI_AGENTBRIDGE_H
+diff --git a/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
+new file mode 100644
+index 0000000000..adb099163d
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include <QResource>
++#include <QTimer>
++
++#include <App/Application.h>
++#include <Base/Console.h>
++#include <Base/Interpreter.h>
++#include <Base/PyObjectBase.h>
++#include <Gui/Application.h>
++
++#include "Sidebar.h"
++
++
++void CreateAnthraciteCommands();
++
++void initAnthraciteResources()
++{
++    Q_INIT_RESOURCE(Anthracite);
++}
++
++namespace AnthraciteGui
++{
++class Module: public Py::ExtensionModule<Module>
++{
++public:
++    Module()
++        : Py::ExtensionModule<Module>("AnthraciteGui")
++    {
++        initialize("Native GUI integration for Anthracite.");
++    }
++};
++
++PyObject* initModule()
++{
++    return Base::Interpreter().addModule(new Module);
++}
++}  // namespace AnthraciteGui
++
++PyMOD_INIT_FUNC(AnthraciteGui)
++{
++    if (!Gui::Application::Instance) {
++        PyErr_SetString(PyExc_ImportError, "Cannot load AnthraciteGui in console mode.");
++        PyMOD_Return(nullptr);
++    }
++
++    initAnthraciteResources();
++    PyObject* module = AnthraciteGui::initModule();
++    CreateAnthraciteCommands();
++    AnthraciteGui::ensureSidebar();
++
++    auto preferences = App::GetApplication().GetParameterGroupByPath(
++        "User parameter:BaseApp/Preferences/Mod/Anthracite"
++    );
++    if (!preferences->GetBool("SidebarInitialized", false)) {
++        preferences->SetBool("SidebarInitialized", true);
++        QTimer::singleShot(0, []() { AnthraciteGui::showSidebar(); });
++    }
++
++    Base::Console().log("Loading GUI of Anthracite module... done\n");
++    PyMOD_Return(module);
++}
+diff --git a/src/Mod/Anthracite/Gui/CMakeLists.txt b/src/Mod/Anthracite/Gui/CMakeLists.txt
+new file mode 100644
+index 0000000000..5c5a9a5c3a
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -0,0 +1,107 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++find_package(
++    Qt${FREECAD_QT_MAJOR_VERSION}
++    REQUIRED
++    COMPONENTS Qml Quick QuickWidgets
++)
++
++find_program(CARGO_EXECUTABLE cargo REQUIRED)
++find_package(ZLIB REQUIRED)
++
++set(AnthraciteRuntime_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime)
++set(AnthraciteRuntime_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/runtime-target)
++set(AnthraciteRuntime_BUILD_BINARY
++    ${AnthraciteRuntime_TARGET_DIR}/release/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
++)
++set(AnthraciteRuntime_BINARY
++    ${CMAKE_BINARY_DIR}/Mod/Anthracite/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
++)
++get_filename_component(AnthraciteRuntime_LIBRARY_DIR ${ZLIB_LIBRARY} DIRECTORY)
++set(AnthraciteRuntime_CARGO_ENV)
++if(UNIX)
++    # Let Cargo's native dependencies use the platform toolchain at build
++    # time. At runtime, also search FreeCAD's packaged native libraries.
++    set(
++        AnthraciteRuntime_CARGO_ENV
++        "RUSTFLAGS=-C link-arg=-Wl,-rpath,${AnthraciteRuntime_LIBRARY_DIR}"
++    )
++endif()
++
++add_custom_command(
++    OUTPUT ${AnthraciteRuntime_BINARY}
++    COMMAND
++        ${CMAKE_COMMAND} -E env
++        ${AnthraciteRuntime_CARGO_ENV}
++        ${CARGO_EXECUTABLE} build
++        --locked
++        --release
++        --manifest-path ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
++        --target-dir ${AnthraciteRuntime_TARGET_DIR}
++    COMMAND
++        ${CMAKE_COMMAND} -E copy_if_different
++        ${AnthraciteRuntime_BUILD_BINARY}
++        ${AnthraciteRuntime_BINARY}
++    DEPENDS
++        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.lock
++        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
++        ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/opencode.rs
++    COMMENT "Building Anthracite agent runtime"
++    VERBATIM
++)
++
++add_custom_target(AnthraciteRuntime ALL DEPENDS ${AnthraciteRuntime_BINARY})
++
++qt_add_resources(
++    AnthraciteGui_QRC
++    Resources/Anthracite.qrc
++)
++
++set(AnthraciteGui_SRCS
++    ${AnthraciteGui_QRC}
++    AgentBridge.cpp
++    AgentBridge.h
++    AppAnthraciteGui.cpp
++    Command.cpp
++    ConversationModel.cpp
++    ConversationModel.h
++    Sidebar.cpp
++    Sidebar.h
++)
++
++add_library(AnthraciteGui SHARED ${AnthraciteGui_SRCS})
++add_dependencies(AnthraciteGui AnthraciteRuntime)
++
++target_include_directories(
++    AnthraciteGui
++    PRIVATE
++    ${CMAKE_BINARY_DIR}
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_BINARY_DIR}/src
++    ${CMAKE_CURRENT_BINARY_DIR}
++)
++
++target_link_libraries(
++    AnthraciteGui
++    PRIVATE
++    FreeCADGui
++    Qt${FREECAD_QT_MAJOR_VERSION}::Qml
++    Qt${FREECAD_QT_MAJOR_VERSION}::Quick
++    Qt${FREECAD_QT_MAJOR_VERSION}::QuickWidgets
++)
++
++if(FREECAD_WARN_ERROR)
++    target_compile_warn_error(AnthraciteGui)
++endif()
++
++SET_BIN_DIR(AnthraciteGui AnthraciteGui /Mod/Anthracite)
++SET_PYTHON_PREFIX_SUFFIX(AnthraciteGui)
++
++install(TARGETS AnthraciteGui DESTINATION ${CMAKE_INSTALL_LIBDIR})
++install(PROGRAMS ${AnthraciteRuntime_BINARY} DESTINATION Mod/Anthracite)
+diff --git a/src/Mod/Anthracite/Gui/Command.cpp b/src/Mod/Anthracite/Gui/Command.cpp
+new file mode 100644
+index 0000000000..5a08d5c267
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Command.cpp
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include <Gui/Application.h>
++#include <Gui/Command.h>
++
++#include "Sidebar.h"
++
++
++DEF_STD_CMD_A(AnthraciteCmdToggleSidebar)
++
++AnthraciteCmdToggleSidebar::AnthraciteCmdToggleSidebar()
++    : Command("Anthracite_ToggleSidebar")
++{
++    sGroup = "Anthracite";
++    sMenuText = QT_TR_NOOP("&Anthracite");
++    sToolTipText = QT_TR_NOOP("Show the Anthracite agent sidebar");
++    sStatusTip = QT_TR_NOOP("Show the Anthracite agent sidebar");
++    sWhatsThis = "Anthracite_ToggleSidebar";
++}
++
++void AnthraciteCmdToggleSidebar::activated(int message)
++{
++    Q_UNUSED(message);
++    AnthraciteGui::showSidebar();
++}
++
++bool AnthraciteCmdToggleSidebar::isActive()
++{
++    return true;
++}
++
++void CreateAnthraciteCommands()
++{
++    auto& commands = Gui::Application::Instance->commandManager();
++    auto* command = new AnthraciteCmdToggleSidebar();
++    command->initAction();
++    commands.addCommand(command);
++}
+diff --git a/src/Mod/Anthracite/Gui/ConversationModel.cpp b/src/Mod/Anthracite/Gui/ConversationModel.cpp
+new file mode 100644
+index 0000000000..006863a0d9
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "ConversationModel.h"
++
++#include <utility>
++
++
++using namespace AnthraciteGui;
++
++ConversationModel::ConversationModel(QObject* parent)
++    : QAbstractListModel(parent)
++{}
++
++int ConversationModel::rowCount(const QModelIndex& parent) const
++{
++    return parent.isValid() ? 0 : static_cast<int>(messages.size());
++}
++
++QVariant ConversationModel::data(const QModelIndex& index, int role) const
++{
++    if (!index.isValid() || index.row() < 0 || index.row() >= static_cast<int>(messages.size())) {
++        return {};
++    }
++
++    const auto& message = messages.at(static_cast<std::size_t>(index.row()));
++    switch (role) {
++        case AuthorRole:
++            return message.author;
++        case BodyRole:
++            return message.body;
++        case KindRole:
++            return message.kind;
++        default:
++            return {};
++    }
++}
++
++QHash<int, QByteArray> ConversationModel::roleNames() const
++{
++    return {
++        {AuthorRole, "author"},
++        {BodyRole, "body"},
++        {KindRole, "kind"},
++    };
++}
++
++void ConversationModel::append(QString author, QString body, QString kind)
++{
++    const int row = static_cast<int>(messages.size());
++    beginInsertRows({}, row, row);
++    messages.push_back({std::move(author), std::move(body), std::move(kind)});
++    endInsertRows();
++}
++
++void ConversationModel::clear()
++{
++    beginResetModel();
++    messages.clear();
++    assistantRow = -1;
++    planRow = -1;
++    endResetModel();
++}
++
++void ConversationModel::beginTurn()
++{
++    assistantRow = -1;
++    planRow = -1;
++}
++
++void ConversationModel::beginAssistantMessage()
++{
++    if (assistantRow >= 0) {
++        return;
++    }
++    assistantRow = static_cast<int>(messages.size());
++    append(QStringLiteral("Anthracite"), {}, QStringLiteral("assistant"));
++}
++
++void ConversationModel::appendAssistantDelta(const QString& delta)
++{
++    if (assistantRow < 0) {
++        beginAssistantMessage();
++    }
++
++    messages.at(static_cast<std::size_t>(assistantRow)).body += delta;
++    Q_EMIT dataChanged(index(assistantRow), index(assistantRow), {BodyRole});
++}
++
++void ConversationModel::upsertPlan(const QString& body)
++{
++    if (planRow < 0) {
++        planRow = static_cast<int>(messages.size());
++        append(QStringLiteral("Plan"), body, QStringLiteral("plan"));
++        return;
++    }
++
++    messages.at(static_cast<std::size_t>(planRow)).body = body;
++    Q_EMIT dataChanged(index(planRow), index(planRow), {BodyRole});
++}
+diff --git a/src/Mod/Anthracite/Gui/ConversationModel.h b/src/Mod/Anthracite/Gui/ConversationModel.h
+new file mode 100644
+index 0000000000..ddee1acec6
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/ConversationModel.h
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
++#define ANTHRACITEGUI_CONVERSATIONMODEL_H
++
++#include <QAbstractListModel>
++#include <QString>
++#include <vector>
++
++
++namespace AnthraciteGui
++{
++class ConversationModel: public QAbstractListModel
++{
++    Q_OBJECT
++
++public:
++    enum Role
++    {
++        AuthorRole = Qt::UserRole + 1,
++        BodyRole,
++        KindRole
++    };
++
++    explicit ConversationModel(QObject* parent = nullptr);
++
++    int rowCount(const QModelIndex& parent = QModelIndex()) const override;
++    QVariant data(const QModelIndex& index, int role) const override;
++    QHash<int, QByteArray> roleNames() const override;
++
++    void append(QString author, QString body, QString kind);
++    void clear();
++    void beginTurn();
++    void beginAssistantMessage();
++    void appendAssistantDelta(const QString& delta);
++    void upsertPlan(const QString& body);
++
++private:
++    struct Message
++    {
++        QString author;
++        QString body;
++        QString kind;
++    };
++
++    std::vector<Message> messages;
++    int assistantRow = -1;
++    int planRow = -1;
++};
++}  // namespace AnthraciteGui
++
++#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
+diff --git a/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
+new file mode 100644
+index 0000000000..322a1fb985
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
+@@ -0,0 +1,6 @@
++<!DOCTYPE RCC>
++<RCC version="1.0">
++    <qresource prefix="/Anthracite">
++        <file>qml/Main.qml</file>
++    </qresource>
++</RCC>
+diff --git a/src/Mod/Anthracite/Gui/Resources/qml/Main.qml b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+new file mode 100644
+index 0000000000..efd0a159f1
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+@@ -0,0 +1,551 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++import QtQuick.Layouts 1.15
++
++Pane {
++    id: root
++
++    padding: 0
++
++    SystemPalette {
++        id: systemPalette
++        colorGroup: SystemPalette.Active
++    }
++
++    background: Rectangle {
++        color: systemPalette.window
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++        spacing: 0
++
++        Rectangle {
++            Layout.fillWidth: true
++            Layout.preferredHeight: 78
++            color: systemPalette.window
++
++            ColumnLayout {
++                anchors.fill: parent
++                anchors.leftMargin: 14
++                anchors.rightMargin: 14
++                anchors.topMargin: 8
++                anchors.bottomMargin: 8
++                spacing: 4
++
++                RowLayout {
++                    Layout.fillWidth: true
++
++                    Label {
++                        text: qsTr("Anthracite")
++                        font.pixelSize: 16
++                        font.weight: Font.DemiBold
++                        color: systemPalette.windowText
++                    }
++
++                    Item {
++                        Layout.fillWidth: true
++                    }
++
++                    Rectangle {
++                        implicitWidth: statusLabel.implicitWidth + 16
++                        implicitHeight: 24
++                        radius: 12
++                        color: anthraciteController.busy
++                               ? Qt.rgba(0.30, 0.52, 0.95, 0.18)
++                               : Qt.rgba(0.50, 0.50, 0.50, 0.14)
++
++                        Label {
++                            id: statusLabel
++                            anchors.centerIn: parent
++                            text: anthraciteController.status
++                            font.pixelSize: 11
++                            color: systemPalette.windowText
++                        }
++                    }
++                }
++
++                RowLayout {
++                    Layout.fillWidth: true
++
++                    ComboBox {
++                        id: threadPicker
++                        objectName: "AnthraciteThreadPicker"
++                        Layout.fillWidth: true
++                        model: anthraciteController.threads
++                        textRole: "title"
++                        enabled: !anthraciteController.busy && count > 0
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].id === anthraciteController.currentThreadId) {
++                                    return index
++                                }
++                            }
++                            return count > 0 ? 0 : -1
++                        }
++
++                        onActivated: function(index) {
++                            anthraciteController.selectThread(model[index].id)
++                        }
++                    }
++
++                    ToolButton {
++                        id: newThreadButton
++                        objectName: "AnthraciteNewThread"
++                        text: "+"
++                        enabled: !anthraciteController.busy
++                        ToolTip.visible: hovered
++                        ToolTip.text: qsTr("New conversation")
++                        onClicked: anthraciteController.newThread()
++                    }
++                }
++            }
++
++            Rectangle {
++                anchors.bottom: parent.bottom
++                width: parent.width
++                height: 1
++                color: systemPalette.mid
++                opacity: 0.45
++            }
++        }
++
++        ListView {
++            id: timeline
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++            Layout.margins: 10
++            spacing: 9
++            clip: true
++            model: anthraciteController.messages
++
++            onCountChanged: positionViewAtEnd()
++
++            delegate: Item {
++                property bool activityExpanded: false
++                property bool isActivity: kind === "activity"
++
++                width: timeline.width
++                height: bubble.implicitHeight
++
++                Rectangle {
++                    id: bubble
++                    width: parent.width
++                    implicitHeight: messageColumn.implicitHeight + (isActivity ? 12 : 18)
++                    radius: 8
++                    color: kind === "user"
++                           ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
++                             : kind === "error"
++                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
++                             : kind === "plan"
++                               ? Qt.rgba(0.38, 0.63, 0.42, 0.14)
++                             : kind === "activity"
++                               ? Qt.rgba(0.50, 0.50, 0.50, 0.10)
++                               : Qt.rgba(0.50, 0.50, 0.50, 0.07)
++
++                    Column {
++                        id: messageColumn
++                        anchors.left: parent.left
++                        anchors.right: parent.right
++                        anchors.top: parent.top
++                        anchors.margins: isActivity ? 6 : 9
++                        spacing: 5
++
++                        Label {
++                            visible: !isActivity
++                            text: author
++                            font.pixelSize: 11
++                            font.weight: Font.DemiBold
++                            color: systemPalette.windowText
++                            opacity: 0.72
++                        }
++
++                        Label {
++                            width: parent.width
++                            text: isActivity ? (activityExpanded ? "⌄  " : "›  ") + body : body
++                            wrapMode: Text.Wrap
++                            maximumLineCount: isActivity && !activityExpanded ? 1 : 1000
++                            elide: isActivity && !activityExpanded ? Text.ElideRight : Text.ElideNone
++                            textFormat: Text.PlainText
++                            color: systemPalette.windowText
++                            opacity: isActivity ? 0.78 : 1.0
++                        }
++                    }
++
++                    MouseArea {
++                        anchors.fill: parent
++                        visible: isActivity
++                        cursorShape: Qt.PointingHandCursor
++                        onClicked: activityExpanded = !activityExpanded
++                    }
++                }
++            }
++
++            ScrollBar.vertical: ScrollBar {}
++        }
++
++        Rectangle {
++            id: interactionCard
++            objectName: "AnthraciteInteractionCard"
++            visible: anthraciteController.interactionPending
++            Layout.fillWidth: true
++            Layout.leftMargin: 10
++            Layout.rightMargin: 10
++            Layout.bottomMargin: 8
++            Layout.preferredHeight: Math.min(320, interactionContent.implicitHeight + 22)
++            radius: 8
++            color: Qt.rgba(0.78, 0.57, 0.18, 0.13)
++            border.color: Qt.rgba(0.78, 0.57, 0.18, 0.48)
++
++            ScrollView {
++                id: interactionScroll
++                anchors.fill: parent
++                anchors.margins: 10
++                clip: true
++
++                ColumnLayout {
++                    id: interactionContent
++                    width: interactionScroll.availableWidth
++                    spacing: 9
++
++                    Label {
++                        Layout.fillWidth: true
++                        text: anthraciteController.interactionTitle
++                        font.weight: Font.DemiBold
++                        color: systemPalette.windowText
++                    }
++
++                    Label {
++                        visible: text.length > 0
++                        Layout.fillWidth: true
++                        text: anthraciteController.interactionDetail
++                        wrapMode: Text.Wrap
++                        color: systemPalette.windowText
++                    }
++
++                    RowLayout {
++                        visible: anthraciteController.interactionKind === "approval"
++                        Layout.fillWidth: true
++
++                        Button {
++                            text: qsTr("Decline")
++                            onClicked: anthraciteController.respondToApproval("decline")
++                        }
++
++                        Item {
++                            Layout.fillWidth: true
++                        }
++
++                        Button {
++                            text: qsTr("Approve once")
++                            highlighted: true
++                            onClicked: anthraciteController.respondToApproval("approve")
++                        }
++
++                        Button {
++                            visible: anthraciteController.interactionAllowSession
++                            text: qsTr("Approve session")
++                            onClicked: anthraciteController.respondToApproval("approve_session")
++                        }
++                    }
++
++                    ColumnLayout {
++                        id: requestedInput
++                        objectName: "AnthraciteRequestedInput"
++                        visible: anthraciteController.interactionKind === "user_input"
++                        Layout.fillWidth: true
++                        spacing: 12
++
++                        Repeater {
++                            model: anthraciteController.interactionQuestions
++
++                            delegate: ColumnLayout {
++                                property var questionData: modelData
++                                Layout.fillWidth: true
++                                spacing: 5
++
++                                Label {
++                                    Layout.fillWidth: true
++                                    text: questionData.header || ""
++                                    font.pixelSize: 11
++                                    font.weight: Font.DemiBold
++                                    color: systemPalette.windowText
++                                    opacity: 0.72
++                                }
++
++                                Label {
++                                    Layout.fillWidth: true
++                                    text: questionData.question || ""
++                                    wrapMode: Text.Wrap
++                                    color: systemPalette.windowText
++                                }
++
++                                Repeater {
++                                    model: questionData.options || []
++
++                                    delegate: Button {
++                                        property var optionData: modelData
++                                        Layout.fillWidth: true
++                                        text: optionData.label || ""
++                                        checkable: true
++                                        checked: anthraciteController.inputAnswer(
++                                                     questionData.id) === text
++                                        onClicked: anthraciteController.setInputAnswer(
++                                                       questionData.id, text)
++
++                                        ToolTip.visible: hovered
++                                                             && (optionData.description || "").length > 0
++                                        ToolTip.text: optionData.description || ""
++                                    }
++                                }
++
++                                TextField {
++                                    Layout.fillWidth: true
++                                    placeholderText: qsTr("Or type another answer…")
++                                    echoMode: questionData.isSecret
++                                              ? TextInput.Password
++                                              : TextInput.Normal
++                                    onTextEdited: anthraciteController.setInputAnswer(
++                                                      questionData.id, text)
++                                }
++                            }
++                        }
++
++                        RowLayout {
++                            Layout.fillWidth: true
++
++                            Item {
++                                Layout.fillWidth: true
++                            }
++
++                            Button {
++                                text: qsTr("Answer")
++                                highlighted: true
++                                enabled: anthraciteController.inputComplete
++                                onClicked: anthraciteController.submitInputAnswers()
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        Rectangle {
++            Layout.fillWidth: true
++            Layout.preferredHeight: composerLayout.implicitHeight + 20
++            color: systemPalette.window
++
++            Rectangle {
++                width: parent.width
++                height: 1
++                color: systemPalette.mid
++                opacity: 0.45
++            }
++
++            ColumnLayout {
++                id: composerLayout
++                anchors.left: parent.left
++                anchors.right: parent.right
++                anchors.bottom: parent.bottom
++                anchors.margins: 10
++                spacing: 8
++
++                TextArea {
++                    id: composer
++                    objectName: "AnthraciteComposer"
++                    Layout.fillWidth: true
++                    Layout.preferredHeight: Math.max(70, Math.min(140, implicitHeight))
++                    placeholderText: qsTr("Describe what you want to make or change…")
++                    wrapMode: TextEdit.Wrap
++                    enabled: !anthraciteController.busy
++                    onTextChanged: anthraciteController.setDraft(text)
++
++                    Keys.onPressed: function(event) {
++                        if ((event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))
++                                && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
++                            send()
++                            event.accepted = true
++                        }
++                    }
++                }
++
++                Connections {
++                    target: anthraciteController
++
++                    function onDraftChanged() {
++                        if (composer.text !== anthraciteController.draft) {
++                            composer.text = anthraciteController.draft
++                        }
++                    }
++                }
++
++                RowLayout {
++                    id: modelControls
++                    objectName: "AnthraciteModelControls"
++                    visible: anthraciteController.modelControlsAvailable
++                             || anthraciteController.usageVisible
++                    Layout.fillWidth: true
++
++                    ComboBox {
++                        id: modelPicker
++                        objectName: "AnthraciteModelPicker"
++                        visible: anthraciteController.modelControlsAvailable
++                        Layout.fillWidth: true
++                        model: anthraciteController.models
++                        textRole: "name"
++                        enabled: !anthraciteController.busy
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].model === anthraciteController.selectedModel) {
++                                    return index
++                                }
++                            }
++                            return count > 0 ? 0 : -1
++                        }
++
++                        onActivated: function(index) {
++                            anthraciteController.selectModel(model[index].model)
++                        }
++
++                        ToolTip.visible: hovered && currentIndex >= 0
++                                             && (model[currentIndex].description || "").length > 0
++                        ToolTip.text: currentIndex >= 0
++                                      ? model[currentIndex].description || ""
++                                      : ""
++                    }
++
++                    ComboBox {
++                        id: effortPicker
++                        objectName: "AnthraciteEffortPicker"
++                        visible: anthraciteController.modelControlsAvailable
++                        Layout.preferredWidth: Math.max(105, implicitWidth)
++                        model: anthraciteController.reasoningEfforts
++                        textRole: "label"
++                        enabled: !anthraciteController.busy && count > 0
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].id === anthraciteController.selectedEffort) {
++                                    return index
++                                }
++                            }
++                            return count > 0 ? 0 : -1
++                        }
++
++                        onActivated: function(index) {
++                            anthraciteController.selectEffort(model[index].id)
++                        }
++
++                        ToolTip.visible: hovered && currentIndex >= 0
++                                             && (model[currentIndex].description || "").length > 0
++                        ToolTip.text: currentIndex >= 0
++                                      ? model[currentIndex].description || ""
++                                      : ""
++                    }
++
++                    Rectangle {
++                        id: contextUsage
++                        objectName: "AnthraciteContextUsage"
++                        visible: anthraciteController.usageVisible
++                        Layout.preferredWidth: usageText.implicitWidth + 16
++                        Layout.preferredHeight: 30
++                        radius: 6
++                        color: Qt.rgba(0.50, 0.50, 0.50, 0.10)
++
++                        Label {
++                            id: usageText
++                            anchors.centerIn: parent
++                            text: anthraciteController.usageLabel
++                            color: systemPalette.windowText
++                            font.pixelSize: 11
++                            opacity: 0.72
++                        }
++
++                        Rectangle {
++                            anchors.left: parent.left
++                            anchors.bottom: parent.bottom
++                            width: parent.width * anthraciteController.usageFraction
++                            height: 2
++                            radius: 1
++                            color: anthraciteController.usageFraction > 0.8
++                                   ? Qt.rgba(0.90, 0.35, 0.25, 0.9)
++                                   : Qt.rgba(0.30, 0.52, 0.95, 0.9)
++                        }
++
++                        ToolTip.visible: usageHover.containsMouse
++                        ToolTip.text: anthraciteController.usageDetail
++
++                        MouseArea {
++                            id: usageHover
++                            anchors.fill: parent
++                            hoverEnabled: true
++                        }
++                    }
++                }
++
++                RowLayout {
++                    Layout.fillWidth: true
++
++                    ComboBox {
++                        id: providerPicker
++                        objectName: "AnthraciteProviderPicker"
++                        Layout.preferredWidth: Math.max(105, implicitWidth)
++                        model: anthraciteController.providers
++                        textRole: "name"
++                        enabled: !anthraciteController.busy
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].id === anthraciteController.selectedProvider) {
++                                    return index
++                                }
++                            }
++                            return 0
++                        }
++
++                        onActivated: function(index) {
++                            anthraciteController.selectProvider(model[index].id)
++                        }
++                    }
++
++                    ToolButton {
++                        text: qsTr("Configure…")
++                        flat: true
++                        onClicked: anthraciteController.chooseProvider()
++                    }
++
++                    Item {
++                        Layout.fillWidth: true
++                    }
++
++                    Button {
++                        visible: anthraciteController.busy
++                        text: qsTr("Stop")
++                        onClicked: anthraciteController.stop()
++                    }
++
++                    Button {
++                        visible: !anthraciteController.busy
++                        text: qsTr("Send")
++                        highlighted: true
++                        enabled: composer.text.trim().length > 0
++                        onClicked: send()
++                    }
++                }
++            }
++        }
++    }
++
++    function send() {
++        const text = composer.text.trim()
++        if (text.length === 0 || anthraciteController.busy) {
++            return
++        }
++        composer.text = ""
++        anthraciteController.submit(text)
++    }
++}
+diff --git a/src/Mod/Anthracite/Gui/Sidebar.cpp b/src/Mod/Anthracite/Gui/Sidebar.cpp
+new file mode 100644
+index 0000000000..13b8236097
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -0,0 +1,671 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "Sidebar.h"
++
++#include "AgentBridge.h"
++
++#include <QDockWidget>
++#include <QQmlContext>
++#include <QQuickWidget>
++#include <QUrl>
++#include <QVBoxLayout>
++
++#include <QStringList>
++
++#include <algorithm>
++#include <utility>
++
++#include <Gui/DockWindowManager.h>
++
++
++using namespace AnthraciteGui;
++
++namespace
++{
++QString formatTokens(qint64 tokens)
++{
++    if (tokens >= 1'000'000) {
++        return QStringLiteral("%1m").arg(tokens / 1'000'000.0, 0, 'f', 1);
++    }
++    if (tokens >= 1'000) {
++        return QStringLiteral("%1k").arg(tokens / 1'000.0, 0, 'f', 1);
++    }
++    return QString::number(tokens);
++}
++}  // namespace
++
++SidebarController::SidebarController(QObject* parent)
++    : QObject(parent)
++    , conversation(this)
++    , currentStatus(QStringLiteral("Ready"))
++{
++    showWelcome();
++}
++
++void SidebarController::showWelcome()
++{
++    conversation.append(
++        QStringLiteral("Anthracite"),
++        QStringLiteral("Connect an existing agent and describe what you want to make in FreeCAD."),
++        QStringLiteral("system")
++    );
++}
++
++QAbstractItemModel* SidebarController::messages()
++{
++    return &conversation;
++}
++
++QString SidebarController::status() const
++{
++    return currentStatus;
++}
++
++bool SidebarController::busy() const
++{
++    return turnBusy;
++}
++
++bool SidebarController::interactionPending() const
++{
++    return !pendingInteractionKind.isEmpty();
++}
++
++QString SidebarController::interactionKind() const
++{
++    return pendingInteractionKind;
++}
++
++QString SidebarController::interactionTitle() const
++{
++    return pendingInteractionTitle;
++}
++
++QString SidebarController::interactionDetail() const
++{
++    return pendingInteractionDetail;
++}
++
++bool SidebarController::interactionAllowSession() const
++{
++    return pendingAllowSession;
++}
++
++QVariantList SidebarController::interactionQuestions() const
++{
++    return pendingQuestions;
++}
++
++bool SidebarController::inputComplete() const
++{
++    if (pendingInteractionKind != QLatin1String("user_input") || pendingQuestions.isEmpty()) {
++        return false;
++    }
++    for (const auto& value : pendingQuestions) {
++        const QString id = value.toMap().value(QStringLiteral("id")).toString();
++        if (id.isEmpty() || pendingAnswers.value(id).toString().trimmed().isEmpty()) {
++            return false;
++        }
++    }
++    return true;
++}
++
++QVariantList SidebarController::threads() const
++{
++    return availableThreads;
++}
++
++QString SidebarController::currentThreadId() const
++{
++    return activeThreadId;
++}
++
++QString SidebarController::draft() const
++{
++    return currentDraft;
++}
++
++QVariantList SidebarController::models() const
++{
++    return availableModels;
++}
++
++QString SidebarController::selectedModel() const
++{
++    return currentModel;
++}
++
++QVariantList SidebarController::reasoningEfforts() const
++{
++    return availableEfforts;
++}
++
++QString SidebarController::selectedEffort() const
++{
++    return currentEffort;
++}
++
++bool SidebarController::modelControlsAvailable() const
++{
++    return !availableModels.isEmpty();
++}
++
++QString SidebarController::usageLabel() const
++{
++    return currentUsageLabel;
++}
++
++QString SidebarController::usageDetail() const
++{
++    return currentUsageDetail;
++}
++
++double SidebarController::usageFraction() const
++{
++    return currentUsageFraction;
++}
++
++bool SidebarController::usageVisible() const
++{
++    return !currentUsageLabel.isEmpty();
++}
++
++QVariantList SidebarController::providers() const
++{
++    return {
++        QVariantMap {
++            {QStringLiteral("id"), QStringLiteral("codex")},
++            {QStringLiteral("name"), QStringLiteral("Codex")},
++        },
++        QVariantMap {
++            {QStringLiteral("id"), QStringLiteral("opencode")},
++            {QStringLiteral("name"), QStringLiteral("OpenCode")},
++        },
++    };
++}
++
++QString SidebarController::selectedProvider() const
++{
++    return currentProvider;
++}
++
++void SidebarController::submit(const QString& prompt)
++{
++    const QString text = prompt.trimmed();
++    if (text.isEmpty() || turnBusy) {
++        return;
++    }
++
++    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
++    conversation.beginTurn();
++    clearInteraction();
++    if (!currentDraft.isEmpty()) {
++        currentDraft.clear();
++        Q_EMIT draftChanged();
++        Q_EMIT draftEdited(currentDraft);
++    }
++    setBusy(true);
++    setStatus(QStringLiteral("Starting agent"));
++    Q_EMIT promptSubmitted(text);
++}
++
++void SidebarController::stop()
++{
++    if (turnBusy) {
++        Q_EMIT stopRequested();
++        setStatus(QStringLiteral("Stopping"));
++    }
++}
++
++void SidebarController::chooseProvider()
++{
++    Q_EMIT chooseProviderRequested();
++}
++
++void SidebarController::selectProvider(const QString& provider)
++{
++    if (turnBusy || (provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
++        || provider == currentProvider) {
++        return;
++    }
++    currentProvider = provider;
++    Q_EMIT providerChanged();
++    Q_EMIT providerSelected(provider);
++}
++
++void SidebarController::newThread()
++{
++    if (!turnBusy) {
++        Q_EMIT newThreadRequested();
++    }
++}
++
++void SidebarController::selectThread(const QString& threadId)
++{
++    if (!turnBusy && !threadId.isEmpty() && threadId != activeThreadId) {
++        Q_EMIT threadSelected(threadId);
++    }
++}
++
++void SidebarController::setDraft(const QString& body)
++{
++    if (currentDraft == body) {
++        return;
++    }
++    currentDraft = body;
++    Q_EMIT draftChanged();
++    Q_EMIT draftEdited(currentDraft);
++}
++
++void SidebarController::selectModel(const QString& model)
++{
++    if (!turnBusy && model != currentModel) {
++        applyModelSelection(model, QString(), true);
++    }
++}
++
++void SidebarController::selectEffort(const QString& effort)
++{
++    if (!turnBusy && effort != currentEffort) {
++        applyModelSelection(currentModel, effort, true);
++    }
++}
++
++void SidebarController::respondToApproval(const QString& decision)
++{
++    if (pendingInteractionKind != QLatin1String("approval") || pendingRequestId.isEmpty()) {
++        return;
++    }
++    const QString requestId = pendingRequestId;
++    appendActivity(
++        decision.startsWith(QLatin1String("approve")) ? tr("Approved provider request")
++                                                      : tr("Declined provider request")
++    );
++    clearInteraction();
++    setStatus(QStringLiteral("Thinking"));
++    Q_EMIT approvalResponded(requestId, decision);
++}
++
++void SidebarController::setInputAnswer(const QString& questionId, const QString& answer)
++{
++    if (pendingInteractionKind != QLatin1String("user_input") || questionId.isEmpty()) {
++        return;
++    }
++    const QString text = answer.trimmed();
++    if (text.isEmpty()) {
++        pendingAnswers.remove(questionId);
++    }
++    else {
++        pendingAnswers.insert(questionId, text);
++    }
++    Q_EMIT interactionChanged();
++}
++
++QString SidebarController::inputAnswer(const QString& questionId) const
++{
++    return pendingAnswers.value(questionId).toString();
++}
++
++void SidebarController::submitInputAnswers()
++{
++    if (!inputComplete() || pendingRequestId.isEmpty()) {
++        return;
++    }
++    const QString requestId = pendingRequestId;
++    const QVariantMap answers = pendingAnswers;
++    appendActivity(tr("Answered provider question"));
++    clearInteraction();
++    setStatus(QStringLiteral("Thinking"));
++    Q_EMIT userInputResponded(requestId, answers);
++}
++
++void SidebarController::appendActivity(const QString& text)
++{
++    conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
++}
++
++void SidebarController::resetHistory()
++{
++    conversation.clear();
++}
++
++void SidebarController::appendUserMessage(const QString& text)
++{
++    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
++    conversation.beginTurn();
++}
++
++void SidebarController::beginAssistantMessage()
++{
++    conversation.beginAssistantMessage();
++}
++
++void SidebarController::appendAssistantDelta(const QString& delta)
++{
++    conversation.appendAssistantDelta(delta);
++}
++
++void SidebarController::updatePlan(const QString& explanation, const QVariantList& steps)
++{
++    QStringList lines;
++    if (!explanation.trimmed().isEmpty()) {
++        lines.append(explanation.trimmed());
++        lines.append(QString());
++    }
++    for (const auto& value : steps) {
++        const QVariantMap step = value.toMap();
++        const QString status = step.value(QStringLiteral("status")).toString();
++        const QString marker = status == QLatin1String("completed") ? QStringLiteral("●")
++            : status == QLatin1String("inProgress")                 ? QStringLiteral("◐")
++                                                                    : QStringLiteral("○");
++        lines.append(
++            QStringLiteral("%1 %2").arg(marker, step.value(QStringLiteral("step")).toString())
++        );
++    }
++    conversation.upsertPlan(lines.join(QLatin1Char('\n')));
++}
++
++void SidebarController::showApproval(
++    const QString& requestId,
++    const QString& title,
++    const QString& detail,
++    bool allowSession
++)
++{
++    clearInteraction();
++    pendingRequestId = requestId;
++    pendingInteractionKind = QStringLiteral("approval");
++    pendingInteractionTitle = title;
++    pendingInteractionDetail = detail;
++    pendingAllowSession = allowSession;
++    setStatus(QStringLiteral("Approval needed"));
++    Q_EMIT interactionChanged();
++}
++
++void SidebarController::showUserInput(const QString& requestId, const QVariantList& questions)
++{
++    clearInteraction();
++    pendingRequestId = requestId;
++    pendingInteractionKind = QStringLiteral("user_input");
++    pendingInteractionTitle = tr("Input needed");
++    pendingQuestions = questions;
++    setStatus(QStringLiteral("Input needed"));
++    Q_EMIT interactionChanged();
++}
++
++void SidebarController::clearInteraction()
++{
++    if (!interactionPending() && pendingRequestId.isEmpty()) {
++        return;
++    }
++    pendingRequestId.clear();
++    pendingInteractionKind.clear();
++    pendingInteractionTitle.clear();
++    pendingInteractionDetail.clear();
++    pendingQuestions.clear();
++    pendingAnswers.clear();
++    pendingAllowSession = false;
++    Q_EMIT interactionChanged();
++}
++
++void SidebarController::restoreProvider(const QString& provider)
++{
++    const QString normalized = provider == QLatin1String("opencode") ? provider
++                                                                     : QStringLiteral("codex");
++    if (currentProvider != normalized) {
++        currentProvider = normalized;
++        Q_EMIT providerChanged();
++    }
++}
++
++void SidebarController::completeTurn()
++{
++    clearInteraction();
++    setBusy(false);
++    setStatus(QStringLiteral("Ready"));
++}
++
++void SidebarController::failTurn(const QString& error)
++{
++    clearInteraction();
++    conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
++    setBusy(false);
++    setStatus(QStringLiteral("Error"));
++}
++
++void SidebarController::updateStatus(const QString& status)
++{
++    setStatus(status);
++}
++
++void SidebarController::updateThreads(const QString& currentThreadId, const QVariantList& threads)
++{
++    activeThreadId = currentThreadId;
++    availableThreads = threads;
++    Q_EMIT threadsChanged();
++}
++
++void SidebarController::loadDraft(const QString& body)
++{
++    if (currentDraft == body) {
++        return;
++    }
++    currentDraft = body;
++    Q_EMIT draftChanged();
++}
++
++void SidebarController::updateModelCatalog(const QVariantList& models)
++{
++    availableModels = models;
++    applyModelSelection(currentModel, currentEffort, false);
++}
++
++void SidebarController::restoreModelSelection(const QString& model, const QString& effort)
++{
++    applyModelSelection(model, effort, false);
++}
++
++void SidebarController::updateUsage(const QVariantMap& usage)
++{
++    const qint64 used = usage.value(QStringLiteral("usedTokens")).toLongLong();
++    const qint64 maximum = usage.value(QStringLiteral("maxTokens")).toLongLong();
++    const qint64 processed = usage.value(QStringLiteral("totalProcessedTokens")).toLongLong();
++    if (used <= 0) {
++        clearUsage();
++        return;
++    }
++
++    currentUsageLabel = maximum > 0 ? tr("%1 / %2").arg(formatTokens(used), formatTokens(maximum))
++                                    : tr("%1 tokens").arg(formatTokens(used));
++    currentUsageDetail = maximum > 0
++        ? tr("Context window: %1 of %2 tokens").arg(formatTokens(used), formatTokens(maximum))
++        : tr("Context window: %1 tokens").arg(formatTokens(used));
++    if (processed > used) {
++        currentUsageDetail += tr("; %1 processed in this conversation").arg(formatTokens(processed));
++    }
++    currentUsageFraction = maximum > 0
++        ? std::clamp(static_cast<double>(used) / static_cast<double>(maximum), 0.0, 1.0)
++        : 0.0;
++    Q_EMIT usageChanged();
++}
++
++void SidebarController::clearUsage()
++{
++    if (currentUsageLabel.isEmpty()) {
++        return;
++    }
++    currentUsageLabel.clear();
++    currentUsageDetail.clear();
++    currentUsageFraction = 0.0;
++    Q_EMIT usageChanged();
++}
++
++void SidebarController::documentContextChanged()
++{
++    clearInteraction();
++    setBusy(false);
++    resetHistory();
++    showWelcome();
++    updateThreads(QString(), {});
++    loadDraft(QString());
++    availableModels.clear();
++    currentModel.clear();
++    currentEffort.clear();
++    availableEfforts.clear();
++    Q_EMIT modelsChanged();
++    clearUsage();
++    setStatus(QStringLiteral("Connecting"));
++}
++
++void SidebarController::applyModelSelection(
++    const QString& requestedModel,
++    const QString& requestedEffort,
++    bool edited
++)
++{
++    if (availableModels.isEmpty()) {
++        const bool changed = currentModel != requestedModel || currentEffort != requestedEffort
++            || !availableEfforts.isEmpty();
++        currentModel = requestedModel;
++        currentEffort = requestedEffort;
++        availableEfforts.clear();
++        if (changed) {
++            Q_EMIT modelsChanged();
++        }
++        if (edited) {
++            Q_EMIT modelSelectionEdited(currentModel, currentEffort);
++        }
++        return;
++    }
++
++    QString model = requestedModel;
++    QVariantMap modelData;
++    for (const auto& value : availableModels) {
++        const QVariantMap candidate = value.toMap();
++        if (candidate.value(QStringLiteral("model")).toString() == model) {
++            modelData = candidate;
++            break;
++        }
++    }
++    if (modelData.isEmpty() && !availableModels.isEmpty()) {
++        for (const auto& value : availableModels) {
++            const QVariantMap candidate = value.toMap();
++            if (candidate.value(QStringLiteral("isDefault")).toBool()) {
++                modelData = candidate;
++                break;
++            }
++        }
++        if (modelData.isEmpty()) {
++            modelData = availableModels.constFirst().toMap();
++        }
++        model = modelData.value(QStringLiteral("model")).toString();
++    }
++
++    QVariantList efforts = modelData.value(QStringLiteral("efforts")).toList();
++    QString effort = requestedEffort;
++    bool effortSupported = false;
++    for (const auto& value : efforts) {
++        if (value.toMap().value(QStringLiteral("id")).toString() == effort) {
++            effortSupported = true;
++            break;
++        }
++    }
++    if (!effortSupported) {
++        effort = modelData.value(QStringLiteral("defaultEffort")).toString();
++        if (effort.isEmpty() && !efforts.isEmpty()) {
++            effort = efforts.constFirst().toMap().value(QStringLiteral("id")).toString();
++        }
++    }
++
++    const bool changed = model != currentModel || effort != currentEffort
++        || efforts != availableEfforts;
++    currentModel = model;
++    currentEffort = effort;
++    availableEfforts = efforts;
++    if (changed) {
++        Q_EMIT modelsChanged();
++    }
++    if (edited) {
++        Q_EMIT modelSelectionEdited(currentModel, currentEffort);
++    }
++}
++
++void SidebarController::setStatus(QString status)
++{
++    if (currentStatus == status) {
++        return;
++    }
++    currentStatus = std::move(status);
++    Q_EMIT statusChanged();
++}
++
++void SidebarController::setBusy(bool busy)
++{
++    if (turnBusy == busy) {
++        return;
++    }
++    turnBusy = busy;
++    Q_EMIT busyChanged();
++}
++
++Sidebar::Sidebar(QWidget* parent)
++    : QWidget(parent)
++    , sidebarController(this)
++    , agentBridge(new AgentBridge(&sidebarController, this))
++    , quickView(new QQuickWidget(this))
++{
++    setWindowTitle(tr("Anthracite"));
++    setMinimumWidth(320);
++
++    quickView->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    quickView->rootContext()->setContextProperty(
++        QStringLiteral("anthraciteController"),
++        &sidebarController
++    );
++    quickView->setSource(QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml")));
++
++    auto* layout = new QVBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->addWidget(quickView);
++}
++
++Sidebar::~Sidebar()
++{
++    delete quickView;
++    quickView = nullptr;
++    delete agentBridge;
++    agentBridge = nullptr;
++}
++
++SidebarController* Sidebar::controller()
++{
++    return &sidebarController;
++}
++
++Sidebar* AnthraciteGui::ensureSidebar()
++{
++    auto* manager = Gui::DockWindowManager::instance();
++    if (auto* existing = qobject_cast<Sidebar*>(manager->getDockWindow("AnthraciteSidebar"))) {
++        return existing;
++    }
++
++    auto* sidebar = new Sidebar();
++    manager->addDockWindow("AnthraciteSidebar", sidebar, Qt::RightDockWidgetArea);
++    return sidebar;
++}
++
++void AnthraciteGui::showSidebar()
++{
++    auto* sidebar = ensureSidebar();
++    auto* dock = qobject_cast<QDockWidget*>(sidebar->parentWidget());
++    if (dock) {
++        dock->show();
++        dock->raise();
++    }
++    sidebar->setFocus();
++}
++
++SidebarController* AnthraciteGui::sidebarController()
++{
++    return ensureSidebar()->controller();
++}
+diff --git a/src/Mod/Anthracite/Gui/Sidebar.h b/src/Mod/Anthracite/Gui/Sidebar.h
+new file mode 100644
+index 0000000000..ac4872061b
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#ifndef ANTHRACITEGUI_SIDEBAR_H
++#define ANTHRACITEGUI_SIDEBAR_H
++
++#include <QPointer>
++#include <QString>
++#include <QVariantList>
++#include <QVariantMap>
++#include <QWidget>
++
++#include "ConversationModel.h"
++
++class QQuickWidget;
++
++namespace AnthraciteGui
++{
++class AgentBridge;
++
++class SidebarController: public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
++    Q_PROPERTY(QString status READ status NOTIFY statusChanged)
++    Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
++    Q_PROPERTY(bool interactionPending READ interactionPending NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionKind READ interactionKind NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionTitle READ interactionTitle NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionDetail READ interactionDetail NOTIFY interactionChanged)
++    Q_PROPERTY(bool interactionAllowSession READ interactionAllowSession NOTIFY interactionChanged)
++    Q_PROPERTY(QVariantList interactionQuestions READ interactionQuestions NOTIFY interactionChanged)
++    Q_PROPERTY(bool inputComplete READ inputComplete NOTIFY interactionChanged)
++    Q_PROPERTY(QVariantList threads READ threads NOTIFY threadsChanged)
++    Q_PROPERTY(QString currentThreadId READ currentThreadId NOTIFY threadsChanged)
++    Q_PROPERTY(QString draft READ draft NOTIFY draftChanged)
++    Q_PROPERTY(QVariantList models READ models NOTIFY modelsChanged)
++    Q_PROPERTY(QString selectedModel READ selectedModel NOTIFY modelsChanged)
++    Q_PROPERTY(QVariantList reasoningEfforts READ reasoningEfforts NOTIFY modelsChanged)
++    Q_PROPERTY(QString selectedEffort READ selectedEffort NOTIFY modelsChanged)
++    Q_PROPERTY(bool modelControlsAvailable READ modelControlsAvailable NOTIFY modelsChanged)
++    Q_PROPERTY(QString usageLabel READ usageLabel NOTIFY usageChanged)
++    Q_PROPERTY(QString usageDetail READ usageDetail NOTIFY usageChanged)
++    Q_PROPERTY(double usageFraction READ usageFraction NOTIFY usageChanged)
++    Q_PROPERTY(bool usageVisible READ usageVisible NOTIFY usageChanged)
++    Q_PROPERTY(QVariantList providers READ providers CONSTANT)
++    Q_PROPERTY(QString selectedProvider READ selectedProvider NOTIFY providerChanged)
++
++public:
++    explicit SidebarController(QObject* parent = nullptr);
++
++    QAbstractItemModel* messages();
++    QString status() const;
++    bool busy() const;
++    bool interactionPending() const;
++    QString interactionKind() const;
++    QString interactionTitle() const;
++    QString interactionDetail() const;
++    bool interactionAllowSession() const;
++    QVariantList interactionQuestions() const;
++    bool inputComplete() const;
++    QVariantList threads() const;
++    QString currentThreadId() const;
++    QString draft() const;
++    QVariantList models() const;
++    QString selectedModel() const;
++    QVariantList reasoningEfforts() const;
++    QString selectedEffort() const;
++    bool modelControlsAvailable() const;
++    QString usageLabel() const;
++    QString usageDetail() const;
++    double usageFraction() const;
++    bool usageVisible() const;
++    QVariantList providers() const;
++    QString selectedProvider() const;
++
++    Q_INVOKABLE void submit(const QString& prompt);
++    Q_INVOKABLE void stop();
++    Q_INVOKABLE void chooseProvider();
++    Q_INVOKABLE void selectProvider(const QString& provider);
++    Q_INVOKABLE void newThread();
++    Q_INVOKABLE void selectThread(const QString& threadId);
++    Q_INVOKABLE void setDraft(const QString& body);
++    Q_INVOKABLE void selectModel(const QString& model);
++    Q_INVOKABLE void selectEffort(const QString& effort);
++    Q_INVOKABLE void respondToApproval(const QString& decision);
++    Q_INVOKABLE void setInputAnswer(const QString& questionId, const QString& answer);
++    Q_INVOKABLE QString inputAnswer(const QString& questionId) const;
++    Q_INVOKABLE void submitInputAnswers();
++
++    void appendActivity(const QString& text);
++    void resetHistory();
++    void showWelcome();
++    void appendUserMessage(const QString& text);
++    void beginAssistantMessage();
++    void appendAssistantDelta(const QString& delta);
++    void updatePlan(const QString& explanation, const QVariantList& steps);
++    void showApproval(
++        const QString& requestId,
++        const QString& title,
++        const QString& detail,
++        bool allowSession
++    );
++    void showUserInput(const QString& requestId, const QVariantList& questions);
++    void clearInteraction();
++    void completeTurn();
++    void failTurn(const QString& error);
++    void updateStatus(const QString& status);
++    void updateThreads(const QString& currentThreadId, const QVariantList& threads);
++    void loadDraft(const QString& body);
++    void updateModelCatalog(const QVariantList& models);
++    void restoreModelSelection(const QString& model, const QString& effort);
++    void updateUsage(const QVariantMap& usage);
++    void clearUsage();
++    void documentContextChanged();
++    void restoreProvider(const QString& provider);
++
++Q_SIGNALS:
++    void promptSubmitted(const QString& prompt);
++    void stopRequested();
++    void chooseProviderRequested();
++    void providerSelected(const QString& provider);
++    void newThreadRequested();
++    void threadSelected(const QString& threadId);
++    void draftEdited(const QString& body);
++    void modelSelectionEdited(const QString& model, const QString& effort);
++    void approvalResponded(const QString& requestId, const QString& decision);
++    void userInputResponded(const QString& requestId, const QVariantMap& answers);
++    void statusChanged();
++    void busyChanged();
++    void interactionChanged();
++    void threadsChanged();
++    void draftChanged();
++    void modelsChanged();
++    void usageChanged();
++    void providerChanged();
++
++private:
++    void setStatus(QString status);
++    void setBusy(bool busy);
++    void applyModelSelection(const QString& model, const QString& effort, bool edited);
++
++    ConversationModel conversation;
++    QString currentStatus;
++    QString pendingRequestId;
++    QString pendingInteractionKind;
++    QString pendingInteractionTitle;
++    QString pendingInteractionDetail;
++    QVariantList pendingQuestions;
++    QVariantMap pendingAnswers;
++    QVariantList availableThreads;
++    QString activeThreadId;
++    QString currentDraft;
++    QVariantList availableModels;
++    QVariantList availableEfforts;
++    QString currentModel;
++    QString currentEffort;
++    QString currentUsageLabel;
++    QString currentUsageDetail;
++    double currentUsageFraction = 0.0;
++    bool pendingAllowSession = false;
++    bool turnBusy = false;
++    QString currentProvider = QStringLiteral("codex");
++};
++
++class Sidebar: public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit Sidebar(QWidget* parent = nullptr);
++    ~Sidebar() override;
++    SidebarController* controller();
++
++private:
++    SidebarController sidebarController;
++    AgentBridge* agentBridge;
++    QQuickWidget* quickView;
++};
++
++Sidebar* ensureSidebar();
++void showSidebar();
++SidebarController* sidebarController();
++}  // namespace AnthraciteGui
++
++#endif  // ANTHRACITEGUI_SIDEBAR_H
+diff --git a/src/Mod/Anthracite/TestAnthraciteGui.py b/src/Mod/Anthracite/TestAnthraciteGui.py
+new file mode 100644
+index 0000000000..ede4cf8a06
+--- /dev/null
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++import FreeCAD as App
++import FreeCADGui as Gui
++from PySide import QtCore, QtWidgets
++from PySide6 import QtQuickWidgets
++
++import AnthraciteExecutor
++import AnthraciteGui  # noqa: F401 - importing registers the dock window
++
++
++def run_smoke_test():
++    main_window = Gui.getMainWindow()
++    dock = main_window.findChild(QtWidgets.QDockWidget, "AnthraciteSidebar")
++    if dock is None:
++        raise AssertionError("AnthraciteSidebar was not registered as a dock window.")
++    if dock.widget() is None:
++        raise AssertionError("AnthraciteSidebar does not contain its native widget.")
++    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
++    if quick_widget is None:
++        raise AssertionError("AnthraciteSidebar does not contain its QML surface.")
++    if quick_widget.status() != QtQuickWidgets.QQuickWidget.Ready:
++        errors = "; ".join(error.toString() for error in quick_widget.errors())
++        raise AssertionError(f"Anthracite QML did not load: {errors}")
++    root = quick_widget.rootObject()
++    if root.findChild(QtCore.QObject, "AnthraciteInteractionCard") is None:
++        raise AssertionError("Anthracite QML does not expose the interaction card.")
++    if root.findChild(QtCore.QObject, "AnthraciteRequestedInput") is None:
++        raise AssertionError("Anthracite QML does not expose requested-input controls.")
++    if root.findChild(QtCore.QObject, "AnthraciteThreadPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the conversation picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteNewThread") is None:
++        raise AssertionError("Anthracite QML does not expose the new-conversation control.")
++    if root.findChild(QtCore.QObject, "AnthraciteComposer") is None:
++        raise AssertionError("Anthracite QML does not expose the persistent composer.")
++    if root.findChild(QtCore.QObject, "AnthraciteModelControls") is None:
++        raise AssertionError("Anthracite QML does not expose model controls.")
++    if root.findChild(QtCore.QObject, "AnthraciteModelPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the model picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteEffortPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the reasoning-effort picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is None:
++        raise AssertionError("Anthracite QML does not expose context-window usage.")
++    if root.findChild(QtCore.QObject, "AnthraciteProviderPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the provider picker.")
++
++    render_document = App.newDocument("AnthraciteRender")
++    render_result = AnthraciteExecutor.execute(
++        "\n".join(
++            [
++                "box = doc.addObject('Part::Box', 'RenderBox')",
++                "box.Length = 12",
++                "box.Width = 8",
++                "box.Height = 5",
++                "cad.render(width=256, height=192)",
++            ]
++        )
++    )
++    if not render_result["ok"]:
++        raise AssertionError(f"Viewport observation failed: {render_result}")
++    if not render_result["images"][0].startswith("data:image/png;base64,"):
++        raise AssertionError("Viewport observation did not return an inline PNG.")
++    if render_result["observation"]["render"]["width"] != 256:
++        raise AssertionError("Viewport observation metadata is incomplete.")
++    Gui.Selection.addSelection(render_document.getObject("RenderBox"), "Face1")
++    selection_result = AnthraciteExecutor.execute("cad.selection()")
++    selection = selection_result["result"][0]
++    if selection["object"] != "RenderBox":
++        raise AssertionError("Selection observation lost the internal object name.")
++    if selection["subelements"][0]["name"] != "Face1":
++        raise AssertionError("Selection observation lost the selected face.")
++    if selection["subelements"][0]["topology"]["shapeType"] != "Face":
++        raise AssertionError("Selection observation did not describe selected topology.")
++    Gui.Selection.clearSelection()
++    App.closeDocument(render_document.Name)
++
++    first = App.newDocument("AnthraciteContextOne")
++    second = App.newDocument("AnthraciteContextTwo")
++    App.setActiveDocument(first.Name)
++    QtWidgets.QApplication.processEvents()
++    App.setActiveDocument(second.Name)
++    QtWidgets.QApplication.processEvents()
++    App.closeDocument(first.Name)
++    App.closeDocument(second.Name)
++    QtWidgets.QApplication.processEvents()
++    print("ANTHRACITE_GUI_SMOKE_OK")
++
++
++run_smoke_test()
++QtCore.QTimer.singleShot(0, QtWidgets.QApplication.instance().quit)

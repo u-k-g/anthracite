@@ -1,0 +1,93 @@
+diff --git a/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake b/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
+index 15a7bbf6d8..bdb336f3ac 100644
+--- a/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
++++ b/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
+@@ -103,6 +103,7 @@ macro(InitializeFreeCADBuildOptions)
+     option(BUILD_SANDBOX "Build the FreeCAD Sandbox module which is only for testing purposes" OFF)
+     option(BUILD_TEMPLATE "Build the FreeCAD template module which is only for testing purposes" OFF)
+     option(BUILD_ADDONMGR "Build the FreeCAD addon manager module" ON)
++    option(BUILD_ANTHRACITE "Build the Anthracite agent module" ON)
+     option(BUILD_BIM "Build the FreeCAD BIM module" ON)
+     option(BUILD_DRAFT "Build the FreeCAD draft module" ON)
+     option(BUILD_DRAWING "Build the FreeCAD drawing module" OFF)
+diff --git a/cMake/FreeCAD_Helpers/PrintFinalReport.cmake b/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
+index 489257995b..da0b45211f 100644
+--- a/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
++++ b/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
+@@ -91,6 +91,7 @@ macro(PrintFinalReport)
+     value(FREECAD_USE_PYSIDE)
+     value(FREECAD_USE_SHIBOKEN)
+     value(BUILD_ADDONMGR)
++    value(BUILD_ANTHRACITE)
+     value(BUILD_BIM)
+     value(BUILD_ASSEMBLY)
+     value(BUILD_CLOUD)
+diff --git a/src/Mod/Anthracite/CMakeLists.txt b/src/Mod/Anthracite/CMakeLists.txt
+new file mode 100644
+index 0000000000..c7ce83d47d
+--- /dev/null
++++ b/src/Mod/Anthracite/CMakeLists.txt
+@@ -0,0 +1,31 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++set(Anthracite_Scripts
++    AnthraciteExecutor.py
++    Init.py
++    TestAnthracite.py
++)
++
++if(BUILD_GUI)
++    list(APPEND Anthracite_Scripts
++        InitGui.py
++        TestAnthraciteGui.py
++    )
++    add_subdirectory(Gui)
++endif()
++
++add_custom_target(AnthraciteScripts ALL
++    SOURCES ${Anthracite_Scripts}
++)
++
++fc_target_copy_resource(
++    AnthraciteScripts
++    ${CMAKE_CURRENT_SOURCE_DIR}
++    ${CMAKE_BINARY_DIR}/Mod/Anthracite
++    ${Anthracite_Scripts}
++)
++
++install(
++    FILES ${Anthracite_Scripts}
++    DESTINATION Mod/Anthracite
++)
+diff --git a/src/Mod/Anthracite/Init.py b/src/Mod/Anthracite/Init.py
+new file mode 100644
+index 0000000000..bd4fba4dfe
+--- /dev/null
++++ b/src/Mod/Anthracite/Init.py
+@@ -0,0 +1 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
+diff --git a/src/Mod/Anthracite/InitGui.py b/src/Mod/Anthracite/InitGui.py
+new file mode 100644
+index 0000000000..ae2e5ce6e7
+--- /dev/null
++++ b/src/Mod/Anthracite/InitGui.py
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++# Importing the native module registers the sidebar and its command.
++import AnthraciteGui  # noqa: F401
+diff --git a/src/Mod/CMakeLists.txt b/src/Mod/CMakeLists.txt
+index e07921e12a..e68f4fc9f3 100644
+--- a/src/Mod/CMakeLists.txt
++++ b/src/Mod/CMakeLists.txt
+@@ -6,6 +6,10 @@ if(BUILD_ADDONMGR)
+   add_subdirectory(AddonManager)
+ endif(BUILD_ADDONMGR)
+ 
++if(BUILD_ANTHRACITE)
++  add_subdirectory(Anthracite)
++endif(BUILD_ANTHRACITE)
++
+ if(BUILD_BIM)
+   add_subdirectory(BIM)
+ endif(BUILD_BIM)

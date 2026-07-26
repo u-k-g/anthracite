@@ -1,0 +1,1886 @@
+diff --git a/src/Mod/Anthracite/Runtime/src/providers/codex.rs b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+new file mode 100644
+index 0000000000..989f18d2c8
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+@@ -0,0 +1,970 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use super::ProviderAdapter;
++use crate::process::{IoEvent, LineProcess};
++use crate::protocol::{self, Emitter};
++use crate::store::Store;
++use serde_json::{Map, Value, json};
++use std::collections::{HashMap, HashSet};
++use std::sync::mpsc;
++
++const INITIALIZE_ID: u64 = 1;
++const THREAD_START_ID: u64 = 2;
++const THREAD_FALLBACK_ID: u64 = 3;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum PendingKind {
++    CommandApproval,
++    FileChangeApproval,
++    PermissionApproval,
++    UserInput,
++}
++
++struct PendingRequest {
++    server_id: Value,
++    kind: PendingKind,
++    params: Value,
++}
++
++pub struct CodexAdapter {
++    process: LineProcess,
++    cwd: String,
++    next_request_id: u64,
++    next_interaction_id: u64,
++    thread_id: Option<String>,
++    turn_id: Option<String>,
++    resume_thread_id: Option<String>,
++    model_request_ids: HashSet<u64>,
++    model_catalog: Vec<Value>,
++    pending: HashMap<String, PendingRequest>,
++    emitter: Emitter,
++}
++
++impl CodexAdapter {
++    pub fn start(
++        binary: &str,
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++        store: Store,
++    ) -> Result<Self, String> {
++        let process = LineProcess::start(binary, &["app-server"], cwd, sender)?;
++        let emitter = Emitter::new(store);
++        let resume_thread_id = emitter.provider_thread_id()?;
++        let adapter = Self {
++            process,
++            cwd: cwd.to_owned(),
++            next_request_id: 4,
++            next_interaction_id: 1,
++            thread_id: None,
++            turn_id: None,
++            resume_thread_id,
++            model_request_ids: HashSet::new(),
++            model_catalog: Vec::new(),
++            pending: HashMap::new(),
++            emitter,
++        };
++        adapter.process.send(&json!({
++            "id": INITIALIZE_ID,
++            "method": "initialize",
++            "params": {
++                "clientInfo": {
++                    "name": "anthracite_freecad",
++                    "title": "Anthracite for FreeCAD",
++                    "version": env!("CARGO_PKG_VERSION")
++                },
++                "capabilities": {
++                    "experimentalApi": true
++                }
++            }
++        }))?;
++        Ok(adapter)
++    }
++
++    fn send(&self, value: &Value) -> Result<(), String> {
++        self.process.send(value)
++    }
++
++    fn request(&mut self, method: &str, params: Value) -> Result<u64, String> {
++        let id = self.next_request_id;
++        self.next_request_id += 1;
++        self.send(&json!({"id": id, "method": method, "params": params}))?;
++        Ok(id)
++    }
++
++    fn developer_instructions() -> &'static str {
++        concat!(
++            "You are operating inside FreeCAD through Anthracite. ",
++            "Use the freecad tool for CAD inspection and every CAD mutation. ",
++            "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
++            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "Use cad.selection() for selected faces and edges. Treat subelement names as ",
++            "momentary references and re-inspect after topology-changing edits. ",
++            "A tool call is one undoable transaction: failures roll back automatically. ",
++            "Read the returned observation, fix errors, and verify the finished model. ",
++            "Use cad.render() when a viewport image would materially improve verification."
++        )
++    }
++
++    fn freecad_tool() -> Value {
++        json!({
++            "type": "function",
++            "name": "freecad",
++            "description": concat!(
++                "Execute ordinary Python inside the active FreeCAD GUI. ",
++                "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++                "cad.selection() describes selected objects, faces, and edges. ",
++                "The complete source runs as one transaction, recomputes and validates, ",
++                "then returns result/stdout plus created, changed, and deleted objects. ",
++                "Call cad.render() to attach a viewport image for visual verification."
++            ),
++            "inputSchema": {
++                "type": "object",
++                "properties": {
++                    "code": {
++                        "type": "string",
++                        "description": "Complete ordinary FreeCAD Python source."
++                    }
++                },
++                "required": ["code"],
++                "additionalProperties": false
++            }
++        })
++    }
++
++    fn open_thread(&self, request_id: u64) -> Result<(), String> {
++        if let Some(thread_id) = &self.resume_thread_id {
++            self.send(&json!({
++                "id": request_id,
++                "method": "thread/resume",
++                "params": {
++                    "threadId": thread_id,
++                    "cwd": self.cwd,
++                    "developerInstructions": Self::developer_instructions()
++                }
++            }))
++        } else {
++            self.send(&json!({
++                "id": request_id,
++                "method": "thread/start",
++                "params": {
++                    "cwd": self.cwd,
++                    "serviceName": "anthracite_freecad",
++                    "developerInstructions": Self::developer_instructions(),
++                    "dynamicTools": [Self::freecad_tool()]
++                }
++            }))
++        }
++    }
++
++    fn response_id(message: &Value) -> Option<u64> {
++        message.get("id").and_then(Value::as_u64)
++    }
++
++    fn reasoning_label(effort: &str) -> String {
++        match effort {
++            "minimal" => "Minimal",
++            "low" => "Low",
++            "medium" => "Medium",
++            "high" => "High",
++            "xhigh" => "Extra High",
++            "max" => "Max",
++            "ultra" => "Ultra",
++            other => other,
++        }
++        .to_owned()
++    }
++
++    fn normalize_models(models: &Value) -> Vec<Value> {
++        models
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter_map(|model| {
++                let slug = model.get("model").and_then(Value::as_str)?;
++                let default_effort = model
++                    .get("defaultReasoningEffort")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                let efforts = model
++                    .get("supportedReasoningEfforts")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                    .filter_map(|option| {
++                        let effort = option.get("reasoningEffort").and_then(Value::as_str)?;
++                        Some(json!({
++                            "id": effort,
++                            "label": Self::reasoning_label(effort),
++                            "description": option
++                                .get("description")
++                                .and_then(Value::as_str)
++                                .unwrap_or(""),
++                            "isDefault": effort == default_effort
++                        }))
++                    })
++                    .collect::<Vec<_>>();
++                Some(json!({
++                    "id": model.get("id").and_then(Value::as_str).unwrap_or(slug),
++                    "model": slug,
++                    "name": model
++                        .get("displayName")
++                        .and_then(Value::as_str)
++                        .unwrap_or(slug),
++                    "description": model
++                        .get("description")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                    "isDefault": model
++                        .get("isDefault")
++                        .and_then(Value::as_bool)
++                        .unwrap_or(false),
++                    "defaultEffort": default_effort,
++                    "efforts": efforts
++                }))
++            })
++            .collect()
++    }
++
++    fn normalize_usage(usage: &Value) -> Value {
++        let used_tokens = usage
++            .pointer("/last/totalTokens")
++            .and_then(Value::as_u64)
++            .unwrap_or(0);
++        let total_processed_tokens = usage
++            .pointer("/total/totalTokens")
++            .and_then(Value::as_u64)
++            .unwrap_or(used_tokens);
++        json!({
++            "usedTokens": used_tokens,
++            "maxTokens": usage.get("modelContextWindow"),
++            "totalProcessedTokens": total_processed_tokens,
++            "inputTokens": usage.pointer("/last/inputTokens"),
++            "cachedInputTokens": usage.pointer("/last/cachedInputTokens"),
++            "outputTokens": usage.pointer("/last/outputTokens"),
++            "reasoningOutputTokens": usage.pointer("/last/reasoningOutputTokens")
++        })
++    }
++
++    fn request_models(&mut self, cursor: Option<&str>) -> Result<(), String> {
++        let params = cursor.map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
++        let request_id = self.request("model/list", params)?;
++        self.model_request_ids.insert(request_id);
++        Ok(())
++    }
++
++    fn handle_model_response(&mut self, message: &Value) -> Result<(), String> {
++        if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            self.emitter.emit(
++                "runtime.warning",
++                json!({"message": format!("Could not load Codex models: {error}")}),
++            );
++            return Ok(());
++        }
++
++        self.model_catalog
++            .extend(Self::normalize_models(&message["result"]["data"]));
++        if let Some(cursor) = message
++            .pointer("/result/nextCursor")
++            .and_then(Value::as_str)
++            .map(str::to_owned)
++        {
++            self.request_models(Some(&cursor))?;
++        } else {
++            self.emitter.emit(
++                "model.catalog",
++                json!({
++                    "provider": "codex",
++                    "models": std::mem::take(&mut self.model_catalog)
++                }),
++            );
++        }
++        Ok(())
++    }
++
++    fn next_pending_id(&mut self) -> String {
++        let result = format!("codex-request-{}", self.next_interaction_id);
++        self.next_interaction_id += 1;
++        result
++    }
++
++    fn open_approval(&mut self, server_id: Value, kind: PendingKind, params: Value) {
++        let request_id = self.next_pending_id();
++        let (request_kind, title, detail, allow_session) = match kind {
++            PendingKind::CommandApproval => (
++                "command_execution_approval",
++                "Run command",
++                params
++                    .get("command")
++                    .or_else(|| params.get("reason"))
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested permission to run a command."),
++                true,
++            ),
++            PendingKind::FileChangeApproval => (
++                "file_change_approval",
++                "Change files",
++                params
++                    .get("reason")
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested permission to change files."),
++                true,
++            ),
++            PendingKind::PermissionApproval => (
++                "permission_approval",
++                "Grant additional access",
++                params
++                    .get("reason")
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested additional permissions."),
++                true,
++            ),
++            PendingKind::UserInput => unreachable!(),
++        };
++
++        self.emitter.emit(
++            "request.opened",
++            json!({
++                "requestId": request_id,
++                "requestKind": request_kind,
++                "title": title,
++                "detail": detail,
++                "allowSession": allow_session,
++                "providerArgs": params
++            }),
++        );
++        self.pending.insert(
++            request_id,
++            PendingRequest {
++                server_id,
++                kind,
++                params,
++            },
++        );
++    }
++
++    fn open_user_input(&mut self, server_id: Value, params: Value) {
++        let request_id = self.next_pending_id();
++        self.emitter.emit(
++            "user_input.requested",
++            json!({
++                "requestId": request_id,
++                "questions": params.get("questions").cloned().unwrap_or_else(|| json!([])),
++                "autoResolutionMs": params.get("autoResolutionMs").cloned().unwrap_or(Value::Null)
++            }),
++        );
++        self.pending.insert(
++            request_id,
++            PendingRequest {
++                server_id,
++                kind: PendingKind::UserInput,
++                params,
++            },
++        );
++    }
++
++    fn handle_server_request(&mut self, message: &Value) -> Result<(), String> {
++        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
++        let server_id = message.get("id").cloned().unwrap_or(Value::Null);
++        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
++        match method {
++            "item/tool/call" => {
++                let tool = params.get("tool").and_then(Value::as_str).unwrap_or("");
++                let code = params
++                    .pointer("/arguments/code")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                if tool != "freecad" || code.is_empty() {
++                    self.send(&json!({
++                        "id": server_id,
++                        "result": {
++                            "contentItems": [{
++                                "type": "inputText",
++                                "text": "The FreeCAD tool requires a non-empty code string."
++                            }],
++                            "success": false
++                        }
++                    }))?;
++                    return Ok(());
++                }
++                self.emitter.emit(
++                    "tool.call",
++                    json!({
++                        "requestId": server_id,
++                        "tool": "freecad",
++                        "arguments": {"code": code}
++                    }),
++                );
++            }
++            "item/commandExecution/requestApproval" => {
++                self.open_approval(server_id, PendingKind::CommandApproval, params);
++            }
++            "item/fileChange/requestApproval" => {
++                self.open_approval(server_id, PendingKind::FileChangeApproval, params);
++            }
++            "item/permissions/requestApproval" => {
++                self.open_approval(server_id, PendingKind::PermissionApproval, params);
++            }
++            "item/tool/requestUserInput" => {
++                self.open_user_input(server_id, params);
++            }
++            _ => {
++                self.send(&json!({
++                    "id": server_id,
++                    "error": {
++                        "code": -32601,
++                        "message": format!("Anthracite does not handle server request {method}.")
++                    }
++                }))?;
++                protocol::emit_warning(format!(
++                    "Provider requested unsupported interaction: {method}"
++                ));
++            }
++        }
++        Ok(())
++    }
++
++    fn item_description(item: &Value) -> Option<(&'static str, String, Option<String>)> {
++        match item.get("type").and_then(Value::as_str) {
++            Some("dynamicToolCall") => Some((
++                "dynamic_tool_call",
++                format!(
++                    "Calling {}",
++                    item.get("tool").and_then(Value::as_str).unwrap_or("tool")
++                ),
++                None,
++            )),
++            Some("commandExecution") => Some((
++                "command_execution",
++                "Running command".to_string(),
++                item.get("command")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned),
++            )),
++            Some("fileChange") => Some((
++                "file_change",
++                "Changing files".to_string(),
++                item.get("path").and_then(Value::as_str).map(str::to_owned),
++            )),
++            Some("mcpToolCall") => Some((
++                "mcp_tool_call",
++                format!(
++                    "Calling {}",
++                    item.get("tool")
++                        .and_then(Value::as_str)
++                        .unwrap_or("MCP tool")
++                ),
++                item.get("server")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned),
++            )),
++            _ => None,
++        }
++    }
++
++    fn handle_notification(&mut self, message: &Value) {
++        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
++        let params = message.get("params").unwrap_or(&Value::Null);
++        match method {
++            "turn/started" => {
++                self.turn_id = params
++                    .pointer("/turn/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned);
++                self.emitter.emit(
++                    "turn.started",
++                    json!({"turnId": self.turn_id, "provider": "codex"}),
++                );
++            }
++            "item/agentMessage/delta" => {
++                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
++                    self.emitter.emit(
++                        "content.delta",
++                        json!({"streamKind": "assistant_text", "text": delta}),
++                    );
++                }
++            }
++            "item/started" | "item/completed" => {
++                let item = params.get("item").unwrap_or(&Value::Null);
++                if let Some((kind, title, detail)) = Self::item_description(item) {
++                    self.emitter.emit(
++                        if method == "item/started" {
++                            "item.started"
++                        } else {
++                            "item.completed"
++                        },
++                        json!({
++                            "itemId": item.get("id"),
++                            "kind": kind,
++                            "title": title,
++                            "detail": detail
++                        }),
++                    );
++                }
++            }
++            "turn/plan/updated" => {
++                self.emitter.emit(
++                    "plan.updated",
++                    json!({
++                        "explanation": params.get("explanation"),
++                        "steps": params.get("plan").cloned().unwrap_or_else(|| json!([]))
++                    }),
++                );
++            }
++            "thread/tokenUsage/updated" => {
++                self.emitter.emit(
++                    "usage.updated",
++                    Self::normalize_usage(params.get("tokenUsage").unwrap_or(&Value::Null)),
++                );
++            }
++            "turn/completed" => {
++                let status = params
++                    .pointer("/turn/status")
++                    .and_then(Value::as_str)
++                    .unwrap_or("completed");
++                let error = params
++                    .pointer("/turn/error/message")
++                    .and_then(Value::as_str);
++                self.turn_id = None;
++                self.emitter
++                    .emit("turn.completed", json!({"status": status, "error": error}));
++            }
++            "error" => {
++                let text = params
++                    .pointer("/error/message")
++                    .or_else(|| params.get("message"))
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex reported an unknown error.");
++                self.emitter.emit(
++                    "runtime.error",
++                    json!({"class": "provider_error", "message": text}),
++                );
++            }
++            _ => {}
++        }
++    }
++
++    fn handle_response(&mut self, message: &Value) -> Result<(), String> {
++        if let Some(response_id) = Self::response_id(message)
++            && self.model_request_ids.remove(&response_id)
++        {
++            return self.handle_model_response(message);
++        }
++        if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            if Self::response_id(message) == Some(THREAD_START_ID)
++                && self.resume_thread_id.is_some()
++            {
++                self.emitter.emit(
++                    "runtime.warning",
++                    json!({
++                        "message": format!(
++                            "Could not resume the previous Codex thread; starting a new one: {error}"
++                        )
++                    }),
++                );
++                self.resume_thread_id = None;
++                self.open_thread(THREAD_FALLBACK_ID)?;
++                return Ok(());
++            }
++            return Err(format!("Codex protocol error: {error}"));
++        }
++        match Self::response_id(message) {
++            Some(INITIALIZE_ID) => {
++                self.send(&json!({"method": "initialized"}))?;
++                self.request_models(None)?;
++                self.open_thread(THREAD_START_ID)?;
++            }
++            Some(THREAD_START_ID | THREAD_FALLBACK_ID) => {
++                self.thread_id = message
++                    .pointer("/result/thread/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned);
++                if let Some(thread_id) = &self.thread_id {
++                    self.emitter.set_provider_thread_id(thread_id);
++                    self.emitter.emit(
++                        "runtime.ready",
++                        json!({
++                            "provider": "codex",
++                            "threadId": thread_id,
++                            "capabilities": {
++                                "approvals": true,
++                                "userInput": true,
++                                "plans": true,
++                                "usage": true,
++                                "modelOverrides": true
++                            }
++                        }),
++                    );
++                } else {
++                    return Err(
++                        "Codex thread/start response did not include a thread id.".to_string()
++                    );
++                }
++            }
++            Some(_) => {
++                if let Some(turn_id) = message
++                    .pointer("/result/turn/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned)
++                {
++                    self.turn_id = Some(turn_id);
++                }
++            }
++            None => return Err("Codex returned an unrecognized protocol message.".to_string()),
++        }
++        Ok(())
++    }
++
++    fn codex_decision(decision: &str) -> Result<&'static str, String> {
++        match decision {
++            "approve" => Ok("accept"),
++            "approve_session" => Ok("acceptForSession"),
++            "decline" => Ok("decline"),
++            "cancel" => Ok("cancel"),
++            _ => Err(format!("Unknown approval decision: {decision}")),
++        }
++    }
++
++    fn approval_result(pending: &PendingRequest, decision: &str) -> Result<Value, String> {
++        match pending.kind {
++            PendingKind::CommandApproval | PendingKind::FileChangeApproval => {
++                Ok(json!({"decision": Self::codex_decision(decision)?}))
++            }
++            PendingKind::PermissionApproval => {
++                let permissions = if matches!(decision, "approve" | "approve_session") {
++                    pending
++                        .params
++                        .get("permissions")
++                        .cloned()
++                        .unwrap_or_else(|| json!({}))
++                } else {
++                    json!({})
++                };
++                Ok(json!({
++                    "permissions": permissions,
++                    "scope": if decision == "approve_session" { "session" } else { "turn" }
++                }))
++            }
++            PendingKind::UserInput => {
++                Err("The pending interaction requires user-input answers.".to_string())
++            }
++        }
++    }
++
++    fn user_input_response(answers: &Value) -> Value {
++        let mut result = Map::new();
++        if let Some(values) = answers.as_object() {
++            for (question_id, answer) in values {
++                let answers = match answer {
++                    Value::Array(items) => items.clone(),
++                    Value::String(text) => vec![Value::String(text.clone())],
++                    _ => vec![Value::String(answer.to_string())],
++                };
++                result.insert(question_id.clone(), json!({"answers": answers}));
++            }
++        }
++        Value::Object(result)
++    }
++
++    fn tool_content_items(result: &str, images: &Value) -> Vec<Value> {
++        let mut items = vec![json!({"type": "inputText", "text": result})];
++        items.extend(
++            images
++                .as_array()
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str)
++                .filter(|image| image.starts_with("data:image/"))
++                .map(|image| json!({"type": "inputImage", "imageUrl": image})),
++        );
++        items
++    }
++}
++
++impl ProviderAdapter for CodexAdapter {
++    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
++        let thread_id = self
++            .thread_id
++            .clone()
++            .ok_or_else(|| "Codex thread is not ready.".to_string())?;
++        let mut params = json!({
++            "threadId": thread_id,
++            "input": [{
++                "type": "text",
++                "text": prompt,
++                "textElements": []
++            }]
++        });
++        if let Some(params) = params.as_object_mut() {
++            if !model.is_empty() {
++                params.insert("model".to_owned(), json!(model));
++            }
++            if !effort.is_empty() {
++                params.insert("effort".to_owned(), json!(effort));
++            }
++        }
++        self.request("turn/start", params)?;
++        self.emitter
++            .record("content.user", &json!({"text": prompt}));
++        self.emitter
++            .emit("session.state", json!({"state": "running"}));
++        Ok(())
++    }
++
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++        images: &Value,
++    ) -> Result<(), String> {
++        self.emitter.record(
++            "tool.result",
++            &json!({
++                "requestId": request_id,
++                "result": result,
++                "success": success,
++                "imageCount": images.as_array().map_or(0, Vec::len)
++            }),
++        );
++        self.send(&json!({
++            "id": request_id,
++            "result": {
++                "contentItems": Self::tool_content_items(result, images),
++                "success": success
++            }
++        }))
++    }
++
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String> {
++        let pending = self
++            .pending
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown pending provider request: {request_id}"))?;
++        let result = match Self::approval_result(&pending, decision) {
++            Ok(result) => result,
++            Err(error) => {
++                self.pending.insert(request_id.to_owned(), pending);
++                return Err(error);
++            }
++        };
++        self.send(&json!({"id": pending.server_id, "result": result}))?;
++        self.emitter.emit(
++            "request.resolved",
++            json!({"requestId": request_id, "decision": decision}),
++        );
++        Ok(())
++    }
++
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String> {
++        let pending = self
++            .pending
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown pending user-input request: {request_id}"))?;
++        if pending.kind != PendingKind::UserInput {
++            self.pending.insert(request_id.to_owned(), pending);
++            return Err("The pending interaction is an approval request.".to_string());
++        }
++        let provider_answers = Self::user_input_response(answers);
++        self.send(&json!({
++            "id": pending.server_id,
++            "result": {"answers": provider_answers}
++        }))?;
++        self.emitter.emit(
++            "user_input.resolved",
++            json!({"requestId": request_id, "answers": answers}),
++        );
++        Ok(())
++    }
++
++    fn save_draft(&mut self, body: &str, save_id: &Value) {
++        self.emitter.save_draft(body, save_id);
++    }
++
++    fn save_model_selection(&mut self, model: &str, effort: &str) {
++        self.emitter.save_model_selection(model, effort);
++    }
++
++    fn interrupt(&mut self) -> Result<(), String> {
++        if let (Some(thread_id), Some(turn_id)) = (self.thread_id.clone(), self.turn_id.clone()) {
++            self.request(
++                "turn/interrupt",
++                json!({"threadId": thread_id, "turnId": turn_id}),
++            )?;
++        }
++        Ok(())
++    }
++
++    fn handle_message(&mut self, message: Value) -> Result<(), String> {
++        if message.get("method").is_some() && message.get("id").is_some() {
++            return self.handle_server_request(&message);
++        }
++        if message.get("method").is_some() {
++            self.handle_notification(&message);
++            return Ok(());
++        }
++        self.handle_response(&message)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalizes_user_input_answers() {
++        assert_eq!(
++            CodexAdapter::user_input_response(&json!({
++                "target": "Part Design",
++                "features": ["Pocket", "Fillet"]
++            })),
++            json!({
++                "target": {"answers": ["Part Design"]},
++                "features": {"answers": ["Pocket", "Fillet"]}
++            })
++        );
++    }
++
++    #[test]
++    fn maps_generic_approval_decisions() {
++        assert_eq!(CodexAdapter::codex_decision("approve").unwrap(), "accept");
++        assert_eq!(
++            CodexAdapter::codex_decision("approve_session").unwrap(),
++            "acceptForSession"
++        );
++        assert_eq!(CodexAdapter::codex_decision("decline").unwrap(), "decline");
++        assert!(CodexAdapter::codex_decision("always").is_err());
++    }
++
++    #[test]
++    fn classifies_codex_activity_without_leaking_provider_shapes() {
++        assert_eq!(
++            CodexAdapter::item_description(&json!({
++                "type": "commandExecution",
++                "command": "git status"
++            })),
++            Some((
++                "command_execution",
++                "Running command".to_string(),
++                Some("git status".to_string())
++            ))
++        );
++    }
++
++    #[test]
++    fn builds_provider_specific_approval_responses_behind_the_adapter() {
++        let command = PendingRequest {
++            server_id: json!(12),
++            kind: PendingKind::CommandApproval,
++            params: json!({}),
++        };
++        assert_eq!(
++            CodexAdapter::approval_result(&command, "approve_session").unwrap(),
++            json!({"decision": "acceptForSession"})
++        );
++
++        let permissions = PendingRequest {
++            server_id: json!(13),
++            kind: PendingKind::PermissionApproval,
++            params: json!({
++                "permissions": {"network": {"enabled": true}}
++            }),
++        };
++        assert_eq!(
++            CodexAdapter::approval_result(&permissions, "approve").unwrap(),
++            json!({
++                "permissions": {"network": {"enabled": true}},
++                "scope": "turn"
++            })
++        );
++        assert_eq!(
++            CodexAdapter::approval_result(&permissions, "decline").unwrap(),
++            json!({"permissions": {}, "scope": "turn"})
++        );
++    }
++
++    #[test]
++    fn normalizes_live_codex_model_capabilities() {
++        assert_eq!(
++            CodexAdapter::normalize_models(&json!([{
++                "id": "gpt-test",
++                "model": "gpt-test",
++                "displayName": "GPT Test",
++                "description": "A test model",
++                "isDefault": true,
++                "defaultReasoningEffort": "high",
++                "supportedReasoningEfforts": [
++                    {"reasoningEffort": "low", "description": "Quick"},
++                    {"reasoningEffort": "high", "description": "Thorough"}
++                ]
++            }])),
++            vec![json!({
++                "id": "gpt-test",
++                "model": "gpt-test",
++                "name": "GPT Test",
++                "description": "A test model",
++                "isDefault": true,
++                "defaultEffort": "high",
++                "efforts": [
++                    {
++                        "id": "low",
++                        "label": "Low",
++                        "description": "Quick",
++                        "isDefault": false
++                    },
++                    {
++                        "id": "high",
++                        "label": "High",
++                        "description": "Thorough",
++                        "isDefault": true
++                    }
++                ]
++            })]
++        );
++    }
++
++    #[test]
++    fn attaches_local_render_data_to_dynamic_tool_results() {
++        assert_eq!(
++            CodexAdapter::tool_content_items(
++                r#"{"ok":true}"#,
++                &json!([
++                    "data:image/png;base64,AAAA",
++                    "https://example.com/not-allowed.png"
++                ])
++            ),
++            vec![
++                json!({"type": "inputText", "text": r#"{"ok":true}"#}),
++                json!({
++                    "type": "inputImage",
++                    "imageUrl": "data:image/png;base64,AAAA"
++                })
++            ]
++        );
++    }
++
++    #[test]
++    fn normalizes_context_window_usage() {
++        assert_eq!(
++            CodexAdapter::normalize_usage(&json!({
++                "last": {
++                    "inputTokens": 1200,
++                    "cachedInputTokens": 800,
++                    "outputTokens": 200,
++                    "reasoningOutputTokens": 100,
++                    "totalTokens": 1500
++                },
++                "total": {"totalTokens": 4200},
++                "modelContextWindow": 128000
++            })),
++            json!({
++                "usedTokens": 1500,
++                "maxTokens": 128000,
++                "totalProcessedTokens": 4200,
++                "inputTokens": 1200,
++                "cachedInputTokens": 800,
++                "outputTokens": 200,
++                "reasoningOutputTokens": 100
++            })
++        );
++    }
++}
+diff --git a/src/Mod/Anthracite/Runtime/src/providers/mod.rs b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+new file mode 100644
+index 0000000000..296aea425e
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++mod codex;
++mod opencode;
++
++use crate::process::IoEvent;
++use crate::store::Store;
++use serde_json::Value;
++use std::sync::mpsc;
++
++pub trait ProviderAdapter {
++    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String>;
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++        images: &Value,
++    ) -> Result<(), String>;
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String>;
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String>;
++    fn save_draft(&mut self, body: &str, save_id: &Value);
++    fn save_model_selection(&mut self, model: &str, effort: &str);
++    fn interrupt(&mut self) -> Result<(), String>;
++    fn handle_message(&mut self, message: Value) -> Result<(), String>;
++    fn handle_mcp_message(
++        &mut self,
++        _message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    ) -> Result<(), String> {
++        if let Some(response) = response {
++            let _ = response.send(serde_json::json!({
++                "jsonrpc": "2.0",
++                "id": Value::Null,
++                "error": {"code": -32601, "message": "Provider does not expose MCP."}
++            }));
++        }
++        Ok(())
++    }
++}
++
++pub fn start(
++    kind: &str,
++    binary: &str,
++    cwd: &str,
++    sender: &mpsc::Sender<IoEvent>,
++    store: Store,
++) -> Result<Box<dyn ProviderAdapter>, String> {
++    match kind {
++        "codex" => Ok(Box::new(codex::CodexAdapter::start(
++            binary, cwd, sender, store,
++        )?)),
++        "opencode" => Ok(Box::new(opencode::OpenCodeAdapter::start(
++            binary, cwd, sender, store,
++        )?)),
++        _ => Err(format!("Unsupported provider adapter: {kind}")),
++    }
++}
+diff --git a/src/Mod/Anthracite/Runtime/src/providers/opencode.rs b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
+new file mode 100644
+index 0000000000..cf5ede17b0
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
+@@ -0,0 +1,840 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use super::ProviderAdapter;
++use crate::process::{ChildProcess, IoEvent, McpBridge};
++use crate::protocol::Emitter;
++use crate::store::Store;
++use serde_json::{Value, json};
++use std::collections::HashMap;
++use std::io::{BufRead, BufReader};
++use std::net::TcpListener;
++use std::sync::mpsc;
++use std::thread;
++use std::time::{Duration, Instant};
++
++struct PendingTool {
++    jsonrpc_id: Value,
++    response: mpsc::Sender<Value>,
++}
++
++pub struct OpenCodeAdapter {
++    _process: ChildProcess,
++    base_url: String,
++    session_id: String,
++    active_turn: bool,
++    next_tool_id: u64,
++    pending_tools: HashMap<String, PendingTool>,
++    pending_questions: HashMap<String, Vec<String>>,
++    message_roles: HashMap<String, String>,
++    part_kinds: HashMap<String, String>,
++    emitted_text: HashMap<String, String>,
++    emitter: Emitter,
++}
++
++impl OpenCodeAdapter {
++    pub fn start(
++        binary: &str,
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++        store: Store,
++    ) -> Result<Self, String> {
++        let port = available_port()?;
++        let port_text = port.to_string();
++        let process = ChildProcess::start(
++            binary,
++            &[
++                "serve",
++                "--hostname",
++                "127.0.0.1",
++                "--port",
++                &port_text,
++                "--print-logs",
++            ],
++            cwd,
++            sender,
++        )?;
++        let base_url = format!("http://127.0.0.1:{port}");
++        wait_until_ready(&base_url)?;
++
++        let bridge = McpBridge::start(sender)?;
++        let executable = std::env::current_exe()
++            .map_err(|error| format!("Could not locate the Anthracite runtime: {error}"))?;
++        let mut command = vec![executable.to_string_lossy().to_string()];
++        command.extend(bridge.proxy_arguments());
++        post_json(
++            &base_url,
++            "/mcp",
++            &json!({
++                "name": "anthracite",
++                "config": {
++                    "type": "local",
++                    "command": command,
++                    "cwd": cwd,
++                    "enabled": true,
++                    "timeout": 120000
++                }
++            }),
++        )?;
++
++        let emitter = Emitter::new(store);
++        let resume_id = emitter.provider_thread_id()?;
++        let session = match resume_id {
++            Some(id) => match get_json(&base_url, &format!("/session/{id}")) {
++                Ok(session) if session.get("id").and_then(Value::as_str) == Some(id.as_str()) => {
++                    session
++                }
++                Ok(_) | Err(_) => create_session(&base_url)?,
++            },
++            None => create_session(&base_url)?,
++        };
++        let session_id = session
++            .get("id")
++            .and_then(Value::as_str)
++            .ok_or_else(|| "OpenCode session response did not include an id.".to_string())?
++            .to_string();
++        emitter.set_provider_thread_id(&session_id);
++
++        spawn_event_reader(&base_url, sender);
++        let catalog = get_json(&base_url, "/provider")?;
++        emitter.emit(
++            "model.catalog",
++            json!({
++                "provider": "opencode",
++                "models": normalize_models(&catalog)
++            }),
++        );
++        emitter.emit(
++            "runtime.ready",
++            json!({
++                "provider": "opencode",
++                "threadId": session_id,
++                "capabilities": {
++                    "approvals": true,
++                    "userInput": true,
++                    "plans": false,
++                    "usage": true,
++                    "modelOverrides": true
++                }
++            }),
++        );
++
++        Ok(Self {
++            _process: process,
++            base_url,
++            session_id,
++            active_turn: false,
++            next_tool_id: 1,
++            pending_tools: HashMap::new(),
++            pending_questions: HashMap::new(),
++            message_roles: HashMap::new(),
++            part_kinds: HashMap::new(),
++            emitted_text: HashMap::new(),
++            emitter,
++        })
++    }
++
++    fn session_matches(&self, event: &Value) -> bool {
++        event
++            .pointer("/properties/sessionID")
++            .and_then(Value::as_str)
++            == Some(self.session_id.as_str())
++    }
++
++    fn tool_description() -> &'static str {
++        concat!(
++            "Execute ordinary Python inside the active FreeCAD GUI. ",
++            "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++            "cad.selection() describes selected objects, faces, and edges. ",
++            "The complete source runs as one transaction, recomputes and validates, ",
++            "then returns result/stdout plus created, changed, and deleted objects. ",
++            "Call cad.render() to attach a viewport image for visual verification."
++        )
++    }
++
++    fn developer_instructions() -> &'static str {
++        concat!(
++            "You are operating inside FreeCAD through Anthracite. ",
++            "Use the anthracite_freecad MCP tool for CAD inspection and every CAD mutation. ",
++            "It accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
++            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "Use cad.selection() for selected faces and edges. Treat subelement names as ",
++            "momentary references and re-inspect after topology-changing edits. ",
++            "A tool call is one undoable transaction: failures roll back automatically. ",
++            "Read the returned observation, fix errors, and verify the finished model. ",
++            "Use cad.render() when a viewport image would materially improve verification."
++        )
++    }
++
++    fn mcp_result(result: &str, success: bool, images: &Value) -> Value {
++        let mut content = vec![json!({"type": "text", "text": result})];
++        content.extend(
++            images
++                .as_array()
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str)
++                .filter_map(|image| image.strip_prefix("data:image/"))
++                .filter_map(|rest| {
++                    let (format, data) = rest.split_once(";base64,")?;
++                    Some(json!({
++                        "type": "image",
++                        "data": data,
++                        "mimeType": format!("image/{format}")
++                    }))
++                }),
++        );
++        json!({"content": content, "isError": !success})
++    }
++
++    fn emit_part_text(&mut self, part: &Value, kind: &str) {
++        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("");
++        let text = part.get("text").and_then(Value::as_str).unwrap_or("");
++        if part_id.is_empty() || text.is_empty() {
++            return;
++        }
++        let previous = self
++            .emitted_text
++            .get(part_id)
++            .map(String::as_str)
++            .unwrap_or("");
++        let delta = if let Some(suffix) = text.strip_prefix(previous) {
++            suffix
++        } else if previous.starts_with(text) {
++            ""
++        } else {
++            text
++        };
++        self.emitted_text
++            .insert(part_id.to_string(), text.to_string());
++        if !delta.is_empty() {
++            self.emitter.emit(
++                "content.delta",
++                json!({
++                    "streamKind": if kind == "reasoning" {
++                        "reasoning_text"
++                    } else {
++                        "assistant_text"
++                    },
++                    "text": delta
++                }),
++            );
++        }
++    }
++
++    fn handle_part(&mut self, part: &Value) {
++        let part_id = part.get("id").and_then(Value::as_str).unwrap_or("");
++        let message_id = part.get("messageID").and_then(Value::as_str).unwrap_or("");
++        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
++        if !part_id.is_empty() {
++            self.part_kinds
++                .insert(part_id.to_string(), kind.to_string());
++        }
++        if self.message_roles.get(message_id).map(String::as_str) != Some("assistant") {
++            return;
++        }
++        match part.get("type").and_then(Value::as_str) {
++            Some("text" | "reasoning") => self.emit_part_text(part, kind),
++            Some("tool") => {
++                let state = part
++                    .pointer("/state/status")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                let message_type = match state {
++                    "pending" => "item.started",
++                    "completed" | "error" => "item.completed",
++                    _ => "item.updated",
++                };
++                self.emitter.emit(
++                    message_type,
++                    json!({
++                        "itemId": part.get("callID"),
++                        "kind": "mcp_tool_call",
++                        "title": part.get("tool").and_then(Value::as_str).unwrap_or("Tool"),
++                        "detail": part.pointer("/state/title").or_else(|| part.pointer("/state/error"))
++                    }),
++                );
++            }
++            Some("step-finish") => {
++                let tokens = part.get("tokens").unwrap_or(&Value::Null);
++                self.emitter.emit(
++                    "usage.updated",
++                    json!({
++                        "usedTokens": tokens.get("total")
++                            .or_else(|| tokens.get("input")),
++                        "inputTokens": tokens.get("input"),
++                        "outputTokens": tokens.get("output"),
++                        "reasoningOutputTokens": tokens.get("reasoning")
++                    }),
++                );
++            }
++            _ => {}
++        }
++    }
++
++    fn error_text(error: &Value) -> String {
++        error
++            .pointer("/data/message")
++            .or_else(|| error.get("message"))
++            .and_then(Value::as_str)
++            .unwrap_or("OpenCode reported an unknown error.")
++            .to_string()
++    }
++}
++
++impl ProviderAdapter for OpenCodeAdapter {
++    fn start_turn(&mut self, prompt: &str, model: &str, effort: &str) -> Result<(), String> {
++        if self.active_turn {
++            return Err("OpenCode is already running a turn.".to_string());
++        }
++        let mut body = json!({
++            "system": Self::developer_instructions(),
++            "parts": [{"type": "text", "text": prompt}]
++        });
++        if !model.is_empty() {
++            let (provider_id, model_id) = model
++                .split_once('/')
++                .ok_or_else(|| "OpenCode models must use provider/model format.".to_string())?;
++            body["model"] = json!({"providerID": provider_id, "modelID": model_id});
++        }
++        if !effort.is_empty() {
++            body["variant"] = json!(effort);
++        }
++        post_json(
++            &self.base_url,
++            &format!("/session/{}/prompt_async", self.session_id),
++            &body,
++        )?;
++        self.active_turn = true;
++        self.emitter
++            .record("content.user", &json!({"text": prompt}));
++        self.emitter.emit(
++            "turn.started",
++            json!({"turnId": self.session_id, "provider": "opencode"}),
++        );
++        self.emitter
++            .emit("session.state", json!({"state": "running"}));
++        Ok(())
++    }
++
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++        images: &Value,
++    ) -> Result<(), String> {
++        let request_id = request_id
++            .as_str()
++            .ok_or_else(|| "OpenCode tool request id was not a string.".to_string())?;
++        let pending = self
++            .pending_tools
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown OpenCode tool request: {request_id}"))?;
++        self.emitter.record(
++            "tool.result",
++            &json!({
++                "requestId": request_id,
++                "result": result,
++                "success": success,
++                "imageCount": images.as_array().map_or(0, Vec::len)
++            }),
++        );
++        pending
++            .response
++            .send(json!({
++                "jsonrpc": "2.0",
++                "id": pending.jsonrpc_id,
++                "result": Self::mcp_result(result, success, images)
++            }))
++            .map_err(|_| "OpenCode MCP connection closed before the tool completed.".to_string())
++    }
++
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String> {
++        let reply = match decision {
++            "approve" => "once",
++            "approve_session" => "always",
++            "decline" | "cancel" => "reject",
++            _ => return Err(format!("Unknown approval decision: {decision}")),
++        };
++        post_json(
++            &self.base_url,
++            &format!("/permission/{request_id}/reply"),
++            &json!({"reply": reply}),
++        )?;
++        self.emitter.emit(
++            "request.resolved",
++            json!({"requestId": request_id, "decision": decision}),
++        );
++        Ok(())
++    }
++
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String> {
++        let question_ids = self
++            .pending_questions
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown OpenCode user-input request: {request_id}"))?;
++        let answers = question_ids
++            .iter()
++            .map(|id| match answers.get(id) {
++                Some(Value::Array(values)) => values.clone(),
++                Some(Value::String(value)) => vec![json!(value)],
++                Some(value) => vec![json!(value.to_string())],
++                None => Vec::new(),
++            })
++            .collect::<Vec<_>>();
++        post_json(
++            &self.base_url,
++            &format!("/question/{request_id}/reply"),
++            &json!({"answers": answers}),
++        )?;
++        self.emitter.emit(
++            "user_input.resolved",
++            json!({"requestId": request_id, "answers": answers}),
++        );
++        Ok(())
++    }
++
++    fn save_draft(&mut self, body: &str, save_id: &Value) {
++        self.emitter.save_draft(body, save_id);
++    }
++
++    fn save_model_selection(&mut self, model: &str, effort: &str) {
++        self.emitter.save_model_selection(model, effort);
++    }
++
++    fn interrupt(&mut self) -> Result<(), String> {
++        post_json(
++            &self.base_url,
++            &format!("/session/{}/abort", self.session_id),
++            &json!({}),
++        )?;
++        self.active_turn = false;
++        Ok(())
++    }
++
++    fn handle_message(&mut self, message: Value) -> Result<(), String> {
++        if !self.session_matches(&message) {
++            return Ok(());
++        }
++        let properties = message.get("properties").unwrap_or(&Value::Null);
++        match message.get("type").and_then(Value::as_str).unwrap_or("") {
++            "message.updated" => {
++                if let (Some(message_id), Some(role)) = (
++                    properties.pointer("/info/id").and_then(Value::as_str),
++                    properties.pointer("/info/role").and_then(Value::as_str),
++                ) {
++                    self.message_roles
++                        .insert(message_id.to_string(), role.to_string());
++                }
++            }
++            "message.part.delta" => {
++                if properties.get("field").and_then(Value::as_str) == Some("text")
++                    && let Some(delta) = properties.get("delta").and_then(Value::as_str)
++                    && let Some(part_id) = properties.get("partID").and_then(Value::as_str)
++                    && properties
++                        .get("messageID")
++                        .and_then(Value::as_str)
++                        .and_then(|id| self.message_roles.get(id))
++                        .map(String::as_str)
++                        == Some("assistant")
++                {
++                    self.emitted_text
++                        .entry(part_id.to_string())
++                        .or_default()
++                        .push_str(delta);
++                    self.emitter.emit(
++                        "content.delta",
++                        json!({
++                            "streamKind": if self.part_kinds.get(part_id).map(String::as_str)
++                                == Some("reasoning") {
++                                "reasoning_text"
++                            } else {
++                                "assistant_text"
++                            },
++                            "text": delta
++                        }),
++                    );
++                }
++            }
++            "message.part.updated" => self.handle_part(&properties["part"]),
++            "permission.asked" => {
++                let request_id = properties.get("id").and_then(Value::as_str).unwrap_or("");
++                self.emitter.emit(
++                    "request.opened",
++                    json!({
++                        "requestId": request_id,
++                        "requestKind": format!(
++                            "{}_approval",
++                            properties.get("permission").and_then(Value::as_str).unwrap_or("permission")
++                        ),
++                        "title": "OpenCode permission",
++                        "detail": properties.get("patterns")
++                            .and_then(Value::as_array)
++                            .map(|patterns| patterns.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
++                            .unwrap_or_default(),
++                        "allowSession": true,
++                        "providerArgs": properties.get("metadata")
++                    }),
++                );
++            }
++            "question.asked" => {
++                let request_id = properties.get("id").and_then(Value::as_str).unwrap_or("");
++                let mut ids = Vec::new();
++                let questions = properties
++                    .get("questions")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                    .enumerate()
++                    .map(|(index, question)| {
++                        let id = format!("question-{index}");
++                        ids.push(id.clone());
++                        json!({
++                            "id": id,
++                            "header": question.get("header"),
++                            "question": question.get("question"),
++                            "options": question.get("options"),
++                            "multiSelect": question.get("multiple")
++                        })
++                    })
++                    .collect::<Vec<_>>();
++                self.pending_questions.insert(request_id.to_string(), ids);
++                self.emitter.emit(
++                    "user_input.requested",
++                    json!({"requestId": request_id, "questions": questions}),
++                );
++            }
++            "session.status" => {
++                if properties.pointer("/status/type").and_then(Value::as_str) == Some("idle")
++                    && self.active_turn
++                {
++                    self.active_turn = false;
++                    self.emitter
++                        .emit("turn.completed", json!({"status": "completed"}));
++                }
++            }
++            "session.idle" if self.active_turn => {
++                self.active_turn = false;
++                self.emitter
++                    .emit("turn.completed", json!({"status": "completed"}));
++            }
++            "session.error" => {
++                self.active_turn = false;
++                let text = Self::error_text(&properties["error"]);
++                self.emitter.emit(
++                    "runtime.error",
++                    json!({"class": "provider_error", "message": text}),
++                );
++                self.emitter
++                    .emit("turn.completed", json!({"status": "failed", "error": text}));
++            }
++            _ => {}
++        }
++        Ok(())
++    }
++
++    fn handle_mcp_message(
++        &mut self,
++        message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    ) -> Result<(), String> {
++        let Some(response) = response else {
++            return Ok(());
++        };
++        let id = message.get("id").cloned().unwrap_or(Value::Null);
++        match message.get("method").and_then(Value::as_str).unwrap_or("") {
++            "initialize" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "protocolVersion": "2025-06-18",
++                        "capabilities": {"tools": {}},
++                        "serverInfo": {
++                            "name": "anthracite",
++                            "version": env!("CARGO_PKG_VERSION")
++                        }
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "ping" => response
++                .send(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "tools/list" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "tools": [{
++                            "name": "freecad",
++                            "description": Self::tool_description(),
++                            "inputSchema": {
++                                "type": "object",
++                                "properties": {
++                                    "code": {
++                                        "type": "string",
++                                        "description": "Complete ordinary FreeCAD Python source."
++                                    }
++                                },
++                                "required": ["code"],
++                                "additionalProperties": false
++                            }
++                        }]
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++            "tools/call" => {
++                let code = message
++                    .pointer("/params/arguments/code")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                if message.pointer("/params/name").and_then(Value::as_str) != Some("freecad")
++                    || code.is_empty()
++                {
++                    return response
++                        .send(json!({
++                            "jsonrpc": "2.0",
++                            "id": id,
++                            "result": {
++                                "content": [{
++                                    "type": "text",
++                                    "text": "The freecad tool requires a non-empty code string."
++                                }],
++                                "isError": true
++                            }
++                        }))
++                        .map_err(|_| "OpenCode MCP connection closed.".to_string());
++                }
++                let request_id = format!("opencode-tool-{}", self.next_tool_id);
++                self.next_tool_id += 1;
++                self.pending_tools.insert(
++                    request_id.clone(),
++                    PendingTool {
++                        jsonrpc_id: id,
++                        response,
++                    },
++                );
++                self.emitter.emit(
++                    "tool.call",
++                    json!({
++                        "requestId": request_id,
++                        "tool": "freecad",
++                        "arguments": {"code": code}
++                    }),
++                );
++                Ok(())
++            }
++            method => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "error": {
++                        "code": -32601,
++                        "message": format!("Unsupported MCP method: {method}")
++                    }
++                }))
++                .map_err(|_| "OpenCode MCP connection closed.".to_string()),
++        }
++    }
++}
++
++fn available_port() -> Result<u16, String> {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .map_err(|error| format!("Could not reserve an OpenCode server port: {error}"))?;
++    listener
++        .local_addr()
++        .map(|address| address.port())
++        .map_err(|error| format!("Could not inspect the OpenCode server port: {error}"))
++}
++
++fn wait_until_ready(base_url: &str) -> Result<(), String> {
++    let started = Instant::now();
++    while started.elapsed() < Duration::from_secs(30) {
++        if get_json(base_url, "/global/health").is_ok() {
++            return Ok(());
++        }
++        thread::sleep(Duration::from_millis(100));
++    }
++    Err("OpenCode server did not become ready within 30 seconds.".to_string())
++}
++
++fn create_session(base_url: &str) -> Result<Value, String> {
++    post_json(
++        base_url,
++        "/session",
++        &json!({"title": "Anthracite FreeCAD"}),
++    )
++}
++
++fn get_json(base_url: &str, path: &str) -> Result<Value, String> {
++    let mut response = ureq::get(format!("{base_url}{path}"))
++        .call()
++        .map_err(|error| format!("OpenCode GET {path} failed: {error}"))?;
++    response
++        .body_mut()
++        .read_json::<Value>()
++        .map_err(|error| format!("OpenCode GET {path} returned invalid JSON: {error}"))
++}
++
++fn post_json(base_url: &str, path: &str, body: &Value) -> Result<Value, String> {
++    let mut response = ureq::post(format!("{base_url}{path}"))
++        .send_json(body)
++        .map_err(|error| format!("OpenCode POST {path} failed: {error}"))?;
++    if response.status().as_u16() == 204 {
++        return Ok(Value::Null);
++    }
++    response
++        .body_mut()
++        .read_json::<Value>()
++        .map_err(|error| format!("OpenCode POST {path} returned invalid JSON: {error}"))
++}
++
++fn spawn_event_reader(base_url: &str, sender: &mpsc::Sender<IoEvent>) {
++    let base_url = base_url.to_string();
++    let sender = sender.clone();
++    thread::spawn(move || {
++        let result = ureq::get(format!("{base_url}/event"))
++            .header("Accept", "text/event-stream")
++            .call();
++        let Ok(response) = result else {
++            let _ = sender.send(IoEvent::ProviderError(
++                "Could not subscribe to OpenCode events.".to_string(),
++            ));
++            return;
++        };
++        for line in BufReader::new(response.into_parts().1.into_reader()).lines() {
++            let Ok(line) = line else {
++                break;
++            };
++            if let Some(data) = line.strip_prefix("data: ")
++                && sender
++                    .send(IoEvent::ProviderLine(data.to_string()))
++                    .is_err()
++            {
++                return;
++            }
++        }
++    });
++}
++
++fn normalize_models(catalog: &Value) -> Vec<Value> {
++    let connected = catalog
++        .get("connected")
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter_map(Value::as_str)
++        .collect::<Vec<_>>();
++    let mut models = catalog
++        .get("all")
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter(|provider| {
++            provider
++                .get("id")
++                .and_then(Value::as_str)
++                .is_some_and(|id| connected.contains(&id))
++        })
++        .flat_map(|provider| {
++            let provider_id = provider.get("id").and_then(Value::as_str).unwrap_or("");
++            let provider_name = provider
++                .get("name")
++                .and_then(Value::as_str)
++                .unwrap_or(provider_id);
++            provider
++                .get("models")
++                .and_then(Value::as_object)
++                .into_iter()
++                .flatten()
++                .map(move |(model_id, model)| {
++                    let variants = model
++                        .get("variants")
++                        .and_then(Value::as_object)
++                        .into_iter()
++                        .flatten()
++                        .map(|(id, _)| {
++                            json!({
++                                "id": id,
++                                "label": id,
++                                "description": ""
++                            })
++                        })
++                        .collect::<Vec<_>>();
++                    let slug = format!("{provider_id}/{model_id}");
++                    json!({
++                        "id": slug,
++                        "model": slug,
++                        "name": format!(
++                            "{} · {}",
++                            provider_name,
++                            model.get("name").and_then(Value::as_str).unwrap_or(model_id)
++                        ),
++                        "description": model.get("family"),
++                        "isDefault": false,
++                        "defaultEffort": "",
++                        "efforts": variants
++                    })
++                })
++                .collect::<Vec<_>>()
++        })
++        .collect::<Vec<_>>();
++    models.insert(
++        0,
++        json!({
++            "id": "opencode-default",
++            "model": "",
++            "name": "OpenCode default",
++            "description": "Use OpenCode's configured model selection.",
++            "isDefault": true,
++            "defaultEffort": "",
++            "efforts": []
++        }),
++    );
++    models
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalizes_only_connected_opencode_models() {
++        let models = normalize_models(&json!({
++            "connected": ["openai"],
++            "default": {"openai": "gpt-5"},
++            "all": [
++                {
++                    "id": "openai",
++                    "name": "OpenAI",
++                    "models": {
++                        "gpt-5": {
++                            "name": "GPT-5",
++                            "family": "gpt",
++                            "variants": {"high": {}}
++                        }
++                    }
++                },
++                {
++                    "id": "other",
++                    "name": "Other",
++                    "models": {"hidden": {"name": "Hidden"}}
++                }
++            ]
++        }));
++        assert_eq!(models.len(), 2);
++        assert_eq!(models[0]["model"], "");
++        assert_eq!(models[0]["isDefault"], true);
++        assert_eq!(models[1]["model"], "openai/gpt-5");
++        assert_eq!(models[1]["isDefault"], false);
++        assert_eq!(models[1]["efforts"][0]["id"], "high");
++    }
++
++    #[test]
++    fn builds_mcp_image_content() {
++        let result =
++            OpenCodeAdapter::mcp_result("ok", true, &json!(["data:image/png;base64,AAAA"]));
++        assert_eq!(result["content"][1]["mimeType"], "image/png");
++        assert_eq!(result["isError"], false);
++    }
++}

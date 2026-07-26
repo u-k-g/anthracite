@@ -1,6 +1,9 @@
+diff --git a/src/Mod/Anthracite/AnthraciteExecutor.py b/src/Mod/Anthracite/AnthraciteExecutor.py
+new file mode 100644
+index 0000000000..307c79262b
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,572 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -8,9 +11,12 @@
 +from __future__ import annotations
 +
 +import ast
++import base64
 +import contextlib
 +import io
 +import json
++import os
++import tempfile
 +import traceback
 +from typing import Any
 +
@@ -24,7 +30,52 @@
 +
 +_MAX_TEXT = 12_000
 +_MAX_VALUE = 500
++_MAX_RENDER_DIMENSION = 2_048
++_MAX_RENDER_PIXELS = 4_194_304
++_MAX_RENDER_BYTES = 8_000_000
 +_revisions: dict[str, int] = {}
++_executing_docs: set[str] = set()
++
++
++def _bump_revision(doc: Any) -> None:
++    if doc is None:
++        return
++    name = str(doc.Name)
++    if name not in _executing_docs:
++        _revisions[name] = _revisions.get(name, 0) + 1
++
++
++def _bump_object_revision(obj: Any) -> None:
++    _bump_revision(getattr(obj, "Document", None))
++
++
++class _RevisionObserver:
++    """Make an agent's expected revision stale after any non-agent CAD edit."""
++
++    def slotCreatedObject(self, obj):
++        _bump_object_revision(obj)
++
++    def slotDeletedObject(self, obj):
++        _bump_object_revision(obj)
++
++    def slotChangedObject(self, obj, _property):
++        _bump_object_revision(obj)
++
++    def slotChangedDocument(self, doc, _property):
++        _bump_revision(doc)
++
++    def slotUndoDocument(self, doc):
++        _bump_revision(doc)
++
++    def slotRedoDocument(self, doc):
++        _bump_revision(doc)
++
++    def slotDeletedDocument(self, doc):
++        _revisions.pop(str(doc.Name), None)
++
++
++_revision_observer = _RevisionObserver()
++App.addDocumentObserver(_revision_observer)
 +
 +
 +def _bounded(text: str, limit: int = _MAX_TEXT) -> str:
@@ -54,16 +105,14 @@
 +    return _value_summary(value)
 +
 +
-+def _shape_summary(obj: Any) -> dict[str, Any] | None:
-+    if not hasattr(obj, "Shape"):
-+        return None
++def _topology_summary(shape: Any) -> dict[str, Any]:
 +    try:
-+        shape = obj.Shape
 +        if shape.isNull():
 +            return {"null": True}
 +        bounds = shape.BoundBox
 +        return {
 +            "null": False,
++            "shapeType": str(shape.ShapeType),
 +            "valid": bool(shape.isValid()),
 +            "solids": len(shape.Solids),
 +            "faces": len(shape.Faces),
@@ -78,6 +127,60 @@
 +        }
 +    except Exception as error:
 +        return {"error": str(error)}
++
++
++def _shape_summary(obj: Any) -> dict[str, Any] | None:
++    if not hasattr(obj, "Shape"):
++        return None
++    return _topology_summary(obj.Shape)
++
++
++def _selection_snapshot(doc: Any) -> list[dict[str, Any]]:
++    if Gui is None:
++        return []
++    try:
++        selections = Gui.Selection.getSelectionEx(str(doc.Name))
++    except Exception:
++        return []
++
++    result = []
++    for selection in selections:
++        obj = getattr(selection, "Object", None)
++        if obj is None:
++            continue
++        subelement_names = list(getattr(selection, "SubElementNames", []))
++        subobjects = list(getattr(selection, "SubObjects", []))
++        subelements = []
++        for index, name in enumerate(subelement_names):
++            subelements.append(
++                {
++                    "name": str(name),
++                    "topology": (
++                        _topology_summary(subobjects[index])
++                        if index < len(subobjects)
++                        else None
++                    ),
++                }
++            )
++        result.append(
++            {
++                "document": str(doc.Name),
++                "object": str(obj.Name),
++                "label": str(obj.Label),
++                "type": str(obj.TypeId),
++                "subelements": subelements,
++            }
++        )
++    return result
++
++
++def _active_workbench() -> str | None:
++    if Gui is None:
++        return None
++    try:
++        return str(Gui.activeWorkbench().name())
++    except Exception:
++        return None
 +
 +
 +def _object_snapshot(obj: Any) -> dict[str, Any]:
@@ -159,6 +262,8 @@
 +
 +    return {
 +        "document": str(doc.Name),
++        "workbench": _active_workbench(),
++        "selection": _selection_snapshot(doc),
 +        "created": created,
 +        "deleted": sorted(before_names - after_names),
 +        "changed": changed,
@@ -185,6 +290,88 @@
 +    return invalid
 +
 +
++def _render_spec(
++    width: int,
++    height: int,
++    view: str,
++    fit: bool,
++) -> dict[str, Any]:
++    width = int(width)
++    height = int(height)
++    view = str(view).lower()
++    supported_views = {
++        "current",
++        "axonometric",
++        "front",
++        "rear",
++        "left",
++        "right",
++        "top",
++        "bottom",
++    }
++    if width < 64 or height < 64:
++        raise ValueError("Render dimensions must each be at least 64 pixels.")
++    if width > _MAX_RENDER_DIMENSION or height > _MAX_RENDER_DIMENSION:
++        raise ValueError(
++            f"Render dimensions cannot exceed {_MAX_RENDER_DIMENSION} pixels."
++        )
++    if width * height > _MAX_RENDER_PIXELS:
++        raise ValueError(
++            f"Render area cannot exceed {_MAX_RENDER_PIXELS} pixels."
++        )
++    if view not in supported_views:
++        raise ValueError(
++            f"Unsupported render view {view!r}; expected one of "
++            f"{', '.join(sorted(supported_views))}."
++        )
++    return {"width": width, "height": height, "view": view, "fit": bool(fit)}
++
++
++def _render_view(spec: dict[str, Any]) -> dict[str, Any]:
++    if Gui is None or Gui.activeDocument() is None:
++        raise RuntimeError("Viewport rendering requires the FreeCAD GUI.")
++
++    active_view = Gui.activeDocument().activeView()
++    view_method = {
++        "axonometric": "viewAxonometric",
++        "front": "viewFront",
++        "rear": "viewRear",
++        "left": "viewLeft",
++        "right": "viewRight",
++        "top": "viewTop",
++        "bottom": "viewBottom",
++    }.get(spec["view"])
++    if view_method is not None:
++        getattr(active_view, view_method)()
++    if spec["fit"]:
++        active_view.fitAll()
++
++    descriptor, path = tempfile.mkstemp(prefix="anthracite-view-", suffix=".png")
++    os.close(descriptor)
++    try:
++        active_view.saveImage(path, spec["width"], spec["height"], "Current")
++        with open(path, "rb") as image_file:
++            image = image_file.read(_MAX_RENDER_BYTES + 1)
++    finally:
++        try:
++            os.unlink(path)
++        except FileNotFoundError:
++            pass
++
++    if not image:
++        raise RuntimeError("FreeCAD did not produce a viewport image.")
++    if len(image) > _MAX_RENDER_BYTES:
++        raise RuntimeError(
++            f"Viewport image exceeded the {_MAX_RENDER_BYTES}-byte limit."
++        )
++    return {
++        **spec,
++        "mimeType": "image/png",
++        "dataUrl": "data:image/png;base64,"
++        + base64.b64encode(image).decode("ascii"),
++    }
++
++
 +def _compile(source: str):
 +    tree = ast.parse(source, filename="<anthracite-freecad>", mode="exec")
 +    if tree.body and isinstance(tree.body[-1], ast.Expr):
@@ -202,6 +389,7 @@
 +    def __init__(self, doc: Any):
 +        self.doc = doc
 +        self.events: list[dict[str, Any]] = []
++        self.render_request: dict[str, Any] | None = None
 +
 +    def find(
 +        self,
@@ -233,6 +421,11 @@
 +            return []
 +        return list(Gui.Selection.getSelection())
 +
++    def selection(self) -> list[dict[str, Any]]:
++        """Describe selected objects and momentary face/edge references."""
++
++        return _selection_snapshot(self.doc)
++
 +    def emit(self, label: str, value: Any) -> None:
 +        self.events.append({"label": str(label), "value": _json_safe(value)})
 +
@@ -248,6 +441,19 @@
 +        if Gui is not None and Gui.activeDocument() is not None:
 +            Gui.activeDocument().activeView().viewAxonometric()
 +            Gui.activeDocument().activeView().fitAll()
++
++    def render(
++        self,
++        *,
++        width: int = 960,
++        height: int = 720,
++        view: str = "axonometric",
++        fit: bool = True,
++    ) -> dict[str, Any]:
++        """Attach one bounded viewport render to this tool observation."""
++
++        self.render_request = _render_spec(width, height, view, fit)
++        return {"scheduled": True, **self.render_request}
 +
 +
 +def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
@@ -296,6 +502,7 @@
 +    }
 +
 +    doc.openTransaction("Anthracite agent")
++    _executing_docs.add(doc.Name)
 +    try:
 +        code = _compile(source)
 +        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -307,6 +514,11 @@
 +        doc.recompute()
 +        cad.assert_valid()
 +        after = _document_snapshot(doc)
++        rendered = (
++            _render_view(cad.render_request)
++            if cad.render_request is not None
++            else None
++        )
 +        doc.commitTransaction()
 +    except Exception as error:
 +        error_traceback = traceback.format_exc()
@@ -315,6 +527,7 @@
 +            doc.recompute()
 +        except Exception:
 +            error_traceback += "\nRollback failure:\n" + traceback.format_exc()
++        _executing_docs.discard(doc.Name)
 +        after_rollback = _document_snapshot(doc)
 +        return {
 +            "ok": False,
@@ -333,14 +546,25 @@
 +
 +    revision += 1
 +    _revisions[doc.Name] = revision
++    _executing_docs.discard(doc.Name)
++    observation = _observation(doc, before, after)
++    images = []
++    if rendered is not None:
++        observation["render"] = {
++            key: value
++            for key, value in rendered.items()
++            if key != "dataUrl"
++        }
++        images.append(rendered["dataUrl"])
 +    return {
 +        "ok": True,
 +        "revision": revision,
 +        "stdout": _bounded(stdout.getvalue()),
 +        "stderr": _bounded(stderr.getvalue()),
 +        "result": _json_safe(namespace.get("_result")),
-+        "observation": _observation(doc, before, after),
++        "observation": observation,
 +        "events": cad.events,
++        "images": images,
 +    }
 +
 +
@@ -352,21 +576,12 @@
 +        ensure_ascii=False,
 +        separators=(",", ":"),
 +    )
---- a/src/Mod/Anthracite/CMakeLists.txt
-+++ b/src/Mod/Anthracite/CMakeLists.txt
-@@ -1,7 +1,9 @@
- # SPDX-License-Identifier: LGPL-2.1-or-later
- 
- set(Anthracite_Scripts
-+    AnthraciteExecutor.py
-     Init.py
-+    TestAnthracite.py
- )
- 
- if(BUILD_GUI)
+diff --git a/src/Mod/Anthracite/TestAnthracite.py b/src/Mod/Anthracite/TestAnthracite.py
+new file mode 100644
+index 0000000000..ed86774a7f
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,117 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -404,6 +619,7 @@
 +        self.assertEqual(result["revision"], 1)
 +        self.assertEqual(result["result"], 42)
 +        self.assertEqual(result["events"], [{"label": "created", "value": "Thing"}])
++        self.assertEqual(result["observation"]["selection"], [])
 +        self.assertEqual(
 +            [item["name"] for item in result["observation"]["created"]],
 +            ["Thing"],
@@ -437,6 +653,48 @@
 +        self.assertTrue(stale["conflict"])
 +        self.assertEqual(stale["revision"], 1)
 +        self.assertIsNone(self.doc.getObject("NeverCreated"))
++
++    def test_external_edit_invalidates_agent_revision(self):
++        first = AnthraciteExecutor.execute("41 + 1")
++        self.doc.addObject("App::FeaturePython", "UserEdit")
++
++        stale = AnthraciteExecutor.execute(
++            "doc.addObject('App::FeaturePython', 'NeverCreated')",
++            expected_revision=first["revision"],
++        )
++
++        self.assertFalse(stale["ok"])
++        self.assertTrue(stale["conflict"])
++        self.assertGreater(stale["revision"], first["revision"])
++        self.assertIsNone(self.doc.getObject("NeverCreated"))
++
++    def test_render_request_is_bounded_and_keeps_one_final_view(self):
++        cad = AnthraciteExecutor.Cad(self.doc)
++        scheduled = cad.render(
++            width=800,
++            height=600,
++            view="front",
++            fit=False,
++        )
++
++        self.assertEqual(
++            scheduled,
++            {
++                "scheduled": True,
++                "width": 800,
++                "height": 600,
++                "view": "front",
++                "fit": False,
++            },
++        )
++        with self.assertRaises(ValueError):
++            cad.render(width=4096, height=4096)
++        with self.assertRaises(ValueError):
++            cad.render(view="invented")
++
++    def test_selection_context_is_empty_without_a_gui_selection(self):
++        cad = AnthraciteExecutor.Cad(self.doc)
++        self.assertEqual(cad.selection(), [])
 +
 +
 +if __name__ == "__main__":

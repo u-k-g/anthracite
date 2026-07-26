@@ -24,7 +24,7 @@ interface.
 <details open>
 <summary><strong>status</strong></summary>
 
-The working vertical slice is implemented in twelve ordered patches:
+The working vertical slice is implemented end to end:
 
 - a persistent native FreeCAD dock with a QML chat timeline and composer
 - a transactional `freecad` Python executor with rollback, recompute, validation, structured
@@ -112,14 +112,18 @@ proven integration gaps.
 - `nix-shell` enters the Quilt development environment
 - `just setup` materializes the pinned FreeCAD source
 - `just push` applies the current patch series
-- `just patch-new 0001-short-description` creates the next patch
-- `just patch-add src/path/to/file` records a file before it is edited
+- `just patch-edit sidebar` makes an existing semantic patch current
+- `just patch-new feature-name` creates a new semantic patch when no existing patch owns the change
+- `just patch-add src/path/to/file` adds a path not already owned by the current patch
 - `just patch-refresh` turns source changes into the current patch
 - `just validate` applies the full series in an isolated checkout
 
-Make changes in `build/src`, then refresh the patch. Do not leave implementation only in the ignored
-source tree. FreeCAD version bumps are deliberate: change the pin, repair every patch in order,
-then build and test.
+Patches describe current features and divergences, not their development history. Amend the
+existing owning patch whenever possible; patch order belongs only in `patches/series`, so filenames
+are never numbered. Keep each source file owned by one patch where practical. Make changes in
+`build/src`, then refresh the patch. Do not leave implementation only in the ignored source tree.
+FreeCAD version bumps are deliberate: change the pin, repair every patch in order, then build and
+test.
 
 With FreeCAD materialized and the patches applied, configure and build the complete application:
 

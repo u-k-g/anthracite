@@ -37,8 +37,9 @@ nix-shell                 # when Quilt is not already available
 just doctor
 just setup                # materialize the pinned FreeCAD source
 just push                 # apply the existing series
-just patch-new 0001-name
-just patch-add path/in/freecad
+just patch-edit sidebar   # select an existing owning patch
+just patch-new feature-name
+just patch-add path/in/freecad  # only when the patch does not own it yet
 
 # Edit and test build/src/path/in/freecad.
 
@@ -47,12 +48,16 @@ just patch-refresh
 just validate
 ```
 
-- Run `patch-add` before editing every file. For a new file, add its nonexistent
-  path first and then create it.
+- Run `patch-add` before editing a path not already owned by the current patch.
+  For a new file, add its nonexistent path first and then create it.
 - Make changes in `build/src`, then let `patch-refresh` produce the patch.
   Do not normally hand-edit generated hunks.
-- Apply all earlier patches before creating a new topmost patch.
-- Keep patches small, ordered, and independently understandable.
+- Patches describe current features or divergences, not development history.
+  Amend the existing owning patch instead of layering a fix over it.
+- Patch filenames are semantic and unnumbered. Only `patches/series` defines
+  order.
+- Keep each source file owned by one patch where practical. Create a new patch
+  only when no existing patch is the natural owner.
 - `just validate` applies the full series to an isolated checkout and checks
   patch integrity; it does not replace focused compilation or tests.
 - Do not reset, replace, or delete a dirty `build/src`. Preserve or refresh the

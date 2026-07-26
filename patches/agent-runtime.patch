@@ -1,220 +1,14 @@
---- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
-+++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -15,6 +15,7 @@
- #include <QJsonObject>
- #include <QStandardPaths>
- #include <QThread>
-+#include <QUuid>
- 
- #include <App/Application.h>
- #include <App/Document.h>
-@@ -149,6 +150,8 @@ void AgentBridge::processStarted()
-                 },
-             },
-             {"cwd", workingDirectory()},
-+            {"storagePath", databasePath()},
-+            {"document", documentContext()},
-         }
-     );
- }
-@@ -247,7 +250,29 @@ void AgentBridge::handleMessage(const QJ
- {
-     const QString type = message.value("type").toString();
-     const QJsonObject payload = message.value("payload").toObject();
--    if (type == QLatin1String("runtime.ready")) {
-+    if (type == QLatin1String("history.snapshot")) {
-+        const QJsonArray events = payload.value("events").toArray();
-+        if (!events.isEmpty()) {
-+            sidebar->resetHistory();
-+            assistantMessageStarted = false;
-+            for (const auto& value : events) {
-+                const QJsonObject event = value.toObject();
-+                if (event.value("type").toString() == QLatin1String("content.user")) {
-+                    sidebar->appendUserMessage(
-+                        event.value("payload").toObject().value("text").toString()
-+                    );
-+                    assistantMessageStarted = false;
-+                }
-+                else {
-+                    handleMessage(event);
-+                }
-+            }
-+            if (!queuedPrompt.isEmpty()) {
-+                sidebar->appendUserMessage(queuedPrompt);
-+            }
-+        }
-+    }
-+    else if (type == QLatin1String("runtime.ready")) {
-         runtimeReady = true;
-         sidebar->appendActivity(tr("Codex connected"));
-         sidebar->updateStatus(tr("Thinking"));
-@@ -424,6 +449,39 @@ QString AgentBridge::workingDirectory()
-     return QDir::currentPath();
- }
- 
-+QString AgentBridge::databasePath() const
-+{
-+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
-+        .filePath(QStringLiteral("Anthracite/anthracite.db"));
-+}
-+
-+QJsonObject AgentBridge::documentContext()
-+{
-+    const auto* document = App::GetApplication().getActiveDocument();
-+    if (!document) {
-+        if (unsavedDocumentKey.isEmpty()) {
-+            unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
-+        }
-+        return {
-+            {"displayName", tr("Unsaved FreeCAD document")},
-+            {"sessionKey", unsavedDocumentKey},
-+        };
-+    }
-+
-+    const QString name = QString::fromUtf8(document->getName());
-+    if (name != unsavedDocumentName || unsavedDocumentKey.isEmpty()) {
-+        unsavedDocumentName = name;
-+        unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
-+    }
-+
-+    const QString fileName = QString::fromStdString(document->getFileName());
-+    return {
-+        {"path", fileName},
-+        {"displayName", fileName.isEmpty() ? name : QFileInfo(fileName).fileName()},
-+        {"sessionKey", unsavedDocumentKey},
-+    };
-+}
-+
- void AgentBridge::fail(const QString& message)
- {
-     queuedPrompt.clear();
---- a/src/Mod/Anthracite/Gui/AgentBridge.h
-+++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -44,6 +44,8 @@ private:
-     QString runtimePath() const;
-     QString codexPath() const;
-     QString workingDirectory() const;
-+    QString databasePath() const;
-+    QJsonObject documentContext();
-     void fail(const QString& message);
- 
-     SidebarController* sidebar;
-@@ -53,6 +55,8 @@ private:
-     bool runtimeReady = false;
-     bool assistantMessageStarted = false;
-     bool stopping = false;
-+    QString unsavedDocumentName;
-+    QString unsavedDocumentKey;
-     std::optional<int> documentRevision;
- };
- }  // namespace AnthraciteGui
---- a/src/Mod/Anthracite/Gui/CMakeLists.txt
-+++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -7,6 +7,7 @@ find_package(
- )
- 
- find_program(CARGO_EXECUTABLE cargo REQUIRED)
-+find_package(ZLIB REQUIRED)
- 
- set(AnthraciteRuntime_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime)
- set(AnthraciteRuntime_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/runtime-target)
-@@ -16,10 +17,23 @@ set(AnthraciteRuntime_BUILD_BINARY
- set(AnthraciteRuntime_BINARY
-     ${CMAKE_BINARY_DIR}/Mod/Anthracite/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
- )
-+get_filename_component(AnthraciteRuntime_LIBRARY_DIR ${ZLIB_LIBRARY} DIRECTORY)
-+set(AnthraciteRuntime_CARGO_ENV)
-+if(UNIX)
-+    # Turso's native build dependencies use zlib and iconv. Build and run
-+    # against the same native library directory as FreeCAD.
-+    set(
-+        AnthraciteRuntime_CARGO_ENV
-+        "LIBRARY_PATH=${AnthraciteRuntime_LIBRARY_DIR}"
-+        "RUSTFLAGS=-C link-arg=-Wl,-rpath,${AnthraciteRuntime_LIBRARY_DIR}"
-+    )
-+endif()
- 
- add_custom_command(
-     OUTPUT ${AnthraciteRuntime_BINARY}
-     COMMAND
-+        ${CMAKE_COMMAND} -E env
-+        ${AnthraciteRuntime_CARGO_ENV}
-         ${CARGO_EXECUTABLE} build
-         --locked
-         --release
-@@ -35,6 +49,7 @@ add_custom_command(
-         ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
-         ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
-         ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
-         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
-         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
-     COMMENT "Building Anthracite agent runtime"
---- a/src/Mod/Anthracite/Gui/ConversationModel.cpp
-+++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -52,6 +52,15 @@ void ConversationModel::append(QString a
-     endInsertRows();
- }
- 
-+void ConversationModel::clear()
-+{
-+    beginResetModel();
-+    messages.clear();
-+    assistantRow = -1;
-+    planRow = -1;
-+    endResetModel();
-+}
-+
- void ConversationModel::beginTurn()
- {
-     assistantRow = -1;
---- a/src/Mod/Anthracite/Gui/ConversationModel.h
-+++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -29,6 +29,7 @@ public:
-     QHash<int, QByteArray> roleNames() const override;
- 
-     void append(QString author, QString body, QString kind);
-+    void clear();
-     void beginTurn();
-     void beginAssistantMessage();
-     void appendAssistantDelta(const QString& delta);
---- a/src/Mod/Anthracite/Gui/Sidebar.cpp
-+++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -171,6 +171,17 @@ void SidebarController::appendActivity(c
-     conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
- }
- 
-+void SidebarController::resetHistory()
-+{
-+    conversation.clear();
-+}
-+
-+void SidebarController::appendUserMessage(const QString& text)
-+{
-+    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
-+    conversation.beginTurn();
-+}
-+
- void SidebarController::beginAssistantMessage()
- {
-     conversation.beginAssistantMessage();
---- a/src/Mod/Anthracite/Gui/Sidebar.h
-+++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -53,6 +53,8 @@ public:
-     Q_INVOKABLE void submitInputAnswers();
- 
-     void appendActivity(const QString& text);
-+    void resetHistory();
-+    void appendUserMessage(const QString& text);
-     void beginAssistantMessage();
-     void appendAssistantDelta(const QString& delta);
-     void updatePlan(const QString& explanation, const QVariantList& steps);
---- a/src/Mod/Anthracite/Runtime/Cargo.lock
+diff --git a/src/Mod/Anthracite/Runtime/Cargo.lock b/src/Mod/Anthracite/Runtime/Cargo.lock
+new file mode 100644
+index 0000000000..ade2ffc9fd
+--- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/Cargo.lock
-@@ -3,10 +3,791 @@
- version = 4
- 
- [[package]]
+@@ -0,0 +1,2412 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
 +name = "aead"
 +version = "0.5.2"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,14 +72,15 @@
 +]
 +
 +[[package]]
- name = "anthracite-runtime"
- version = "0.1.0"
- dependencies = [
-  "serde_json",
++name = "anthracite-runtime"
++version = "0.1.0"
++dependencies = [
++ "serde_json",
 + "sha2",
 + "tempfile",
 + "tokio",
 + "turso",
++ "ureq",
 + "uuid",
 +]
 +
@@ -499,6 +294,35 @@
 +]
 +
 +[[package]]
++name = "cookie"
++version = "0.18.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
++dependencies = [
++ "percent-encoding",
++ "time",
++ "version_check",
++]
++
++[[package]]
++name = "cookie_store"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
++dependencies = [
++ "cookie",
++ "document-features",
++ "idna",
++ "indexmap",
++ "log",
++ "serde",
++ "serde_derive",
++ "serde_json",
++ "time",
++ "url",
++]
++
++[[package]]
 +name = "core-foundation-sys"
 +version = "0.8.7"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,6 +428,15 @@
 +]
 +
 +[[package]]
++name = "document-features"
++version = "0.2.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
++dependencies = [
++ "litrs",
++]
++
++[[package]]
 +name = "either"
 +version = "1.17.0"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -628,6 +461,12 @@
 + "env_filter",
 + "log",
 +]
++
++[[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 +
 +[[package]]
 +name = "errno"
@@ -792,6 +631,12 @@
 +checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 +
 +[[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
++
++[[package]]
 +name = "heck"
 +version = "0.5.0"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -827,6 +672,12 @@
 + "bytes",
 + "itoa",
 +]
++
++[[package]]
++name = "httparse"
++version = "1.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 +
 +[[package]]
 +name = "iana-time-zone"
@@ -956,6 +807,16 @@
 +]
 +
 +[[package]]
++name = "indexmap"
++version = "2.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
++dependencies = [
++ "equivalent",
++ "hashbrown",
++]
++
++[[package]]
 +name = "inout"
 +version = "0.1.4"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1000,13 +861,15 @@
 +checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 +dependencies = [
 + "either",
- ]
- 
- [[package]]
-@@ -16,12 +797,332 @@ source = "registry+https://github.com/ru
- checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
- 
- [[package]]
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
 +name = "jobserver"
 +version = "0.1.35"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1104,6 +967,12 @@
 +checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 +
 +[[package]]
++name = "litrs"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
++
++[[package]]
 +name = "lock_api"
 +version = "0.4.14"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1128,12 +997,12 @@
 +]
 +
 +[[package]]
- name = "memchr"
- version = "2.8.3"
- source = "registry+https://github.com/rust-lang/crates.io-index"
- checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
- 
- [[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
 +name = "memoffset"
 +version = "0.9.1"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1333,13 +1202,15 @@
 +]
 +
 +[[package]]
- name = "proc-macro2"
- version = "1.0.107"
- source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -31,6 +1132,29 @@ dependencies = [
- ]
- 
- [[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
 +name = "prost"
 +version = "0.14.4"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1363,13 +1234,15 @@
 +]
 +
 +[[package]]
- name = "quote"
- version = "1.0.47"
- source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -40,12 +1164,208 @@ dependencies = [
- ]
- 
- [[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
 +name = "r-efi"
 +version = "5.3.0"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1565,29 +1438,49 @@
 +checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 +
 +[[package]]
- name = "serde"
- version = "1.0.229"
- source = "registry+https://github.com/rust-lang/crates.io-index"
- checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
- dependencies = [
-  "serde_core",
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
 + "serde_derive",
- ]
- 
- [[package]]
-@@ -65,7 +1385,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06b
- dependencies = [
-  "proc-macro2",
-  "quote",
-- "syn",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
 + "syn 3.0.3",
- ]
- 
- [[package]]
-@@ -82,6 +1402,128 @@ dependencies = [
- ]
- 
- [[package]]
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
 +name = "sha1_smol"
 +version = "1.0.1"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1710,13 +1603,17 @@
 +]
 +
 +[[package]]
- name = "syn"
- version = "3.0.3"
- source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -93,12 +1535,770 @@ dependencies = [
- ]
- 
- [[package]]
++name = "syn"
++version = "3.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
 +name = "synstructure"
 +version = "0.13.2"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2089,12 +1986,12 @@
 +]
 +
 +[[package]]
- name = "unicode-ident"
- version = "1.0.24"
- source = "registry+https://github.com/rust-lang/crates.io-index"
- checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
- 
- [[package]]
++name = "unicode-ident"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
++
++[[package]]
 +name = "unicode-width"
 +version = "0.1.14"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2111,6 +2008,34 @@
 +]
 +
 +[[package]]
++name = "ureq"
++version = "3.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
++dependencies = [
++ "base64",
++ "cookie_store",
++ "log",
++ "percent-encoding",
++ "serde",
++ "serde_json",
++ "ureq-proto",
++ "utf8-zero",
++]
++
++[[package]]
++name = "ureq-proto"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
++dependencies = [
++ "base64",
++ "http",
++ "httparse",
++ "log",
++]
++
++[[package]]
 +name = "url"
 +version = "2.5.8"
 +source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2121,6 +2046,12 @@
 + "percent-encoding",
 + "serde",
 +]
++
++[[package]]
++name = "utf8-zero"
++version = "0.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 +
 +[[package]]
 +name = "utf8_iter"
@@ -2481,43 +2412,80 @@
 +]
 +
 +[[package]]
- name = "zmij"
- version = "1.0.23"
- source = "registry+https://github.com/rust-lang/crates.io-index"
---- a/src/Mod/Anthracite/Runtime/Cargo.toml
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/src/Mod/Anthracite/Runtime/Cargo.toml b/src/Mod/Anthracite/Runtime/Cargo.toml
+new file mode 100644
+index 0000000000..90ab8bab60
+--- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/Cargo.toml
-@@ -8,3 +8,10 @@ license = "LGPL-2.1-or-later"
- 
- [dependencies]
- serde_json = "1.0"
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++[package]
++name = "anthracite-runtime"
++version = "0.1.0"
++edition = "2024"
++license = "LGPL-2.1-or-later"
++
++[dependencies]
++serde_json = "1.0"
 +sha2 = "0.10"
 +tokio = { version = "1.0", features = ["rt"] }
 +turso = { version = "=0.4.4", default-features = false }
++ureq = { version = "3.3", default-features = false, features = ["json"] }
 +uuid = { version = "1.0", features = ["v4"] }
 +
 +[dev-dependencies]
 +tempfile = "3"
---- a/src/Mod/Anthracite/Runtime/src/main.rs
+diff --git a/src/Mod/Anthracite/Runtime/src/main.rs b/src/Mod/Anthracite/Runtime/src/main.rs
+new file mode 100644
+index 0000000000..f75b292f9d
+--- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/main.rs
-@@ -3,11 +3,13 @@
- mod process;
- mod protocol;
- mod providers;
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++mod process;
++mod protocol;
++mod providers;
 +mod store;
- 
- use process::IoEvent;
- use providers::ProviderAdapter;
- use serde_json::Value;
- use std::sync::mpsc;
++
++use process::IoEvent;
++use providers::ProviderAdapter;
++use serde_json::Value;
++use std::sync::mpsc;
 +use store::Store;
- 
- fn handle_host_message(
-     message: Value,
-@@ -36,7 +38,21 @@ fn handle_host_message(
-                 .and_then(Value::as_str)
-                 .unwrap_or("");
-             let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or(".");
--            providers::start(kind, binary, cwd, sender).map(|started| *provider = Some(started))
++
++fn handle_host_message(
++    message: Value,
++    provider: &mut Option<Box<dyn ProviderAdapter>>,
++    sender: &mpsc::Sender<IoEvent>,
++) -> bool {
++    if message
++        .get("protocolVersion")
++        .and_then(Value::as_u64)
++        .is_some_and(|version| version != protocol::VERSION)
++    {
++        protocol::emit_error("Unsupported Anthracite runtime protocol version.");
++        return true;
++    }
++
++    let payload = protocol::payload(&message);
++    let result = match protocol::message_type(&message) {
++        "session.start" => {
++            let provider_config = payload.get("provider").unwrap_or(&Value::Null);
++            let kind = provider_config
++                .get("kind")
++                .and_then(Value::as_str)
++                .unwrap_or("");
++            let binary = provider_config
++                .get("binary")
++                .and_then(Value::as_str)
++                .unwrap_or("");
++            let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or(".");
 +            let database_path = payload
 +                .get("storagePath")
 +                .and_then(Value::as_str)
@@ -2530,45 +2498,566 @@
 +                database_path,
 +                payload.get("document").unwrap_or(&Value::Null),
 +                kind,
++                payload.get("localThreadId").and_then(Value::as_str),
++                payload
++                    .get("createThread")
++                    .and_then(Value::as_bool)
++                    .unwrap_or(false),
 +            )
 +            .and_then(|store| providers::start(kind, binary, cwd, sender, store))
 +            .map(|started| *provider = Some(started))
-         }
-         "turn.start" => provider
-             .as_mut()
---- a/src/Mod/Anthracite/Runtime/src/protocol.rs
++        }
++        "turn.start" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.start_turn(
++                    payload.get("prompt").and_then(Value::as_str).unwrap_or(""),
++                    payload.get("model").and_then(Value::as_str).unwrap_or(""),
++                    payload.get("effort").and_then(Value::as_str).unwrap_or(""),
++                )
++            }),
++        "tool.result" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.return_tool_result(
++                    payload.get("requestId").cloned().unwrap_or(Value::Null),
++                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
++                    payload
++                        .get("success")
++                        .and_then(Value::as_bool)
++                        .unwrap_or(false),
++                    payload.get("images").unwrap_or(&Value::Null),
++                )
++            }),
++        "request.resolve" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.resolve_request(
++                    payload
++                        .get("requestId")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                    payload
++                        .get("decision")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                )
++            }),
++        "user_input.resolve" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.resolve_user_input(
++                    payload
++                        .get("requestId")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                    payload.get("answers").unwrap_or(&Value::Null),
++                )
++            }),
++        "draft.save" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .map(|provider| {
++                provider.save_draft(
++                    payload.get("body").and_then(Value::as_str).unwrap_or(""),
++                    payload.get("saveId").unwrap_or(&Value::Null),
++                );
++            }),
++        "model.selection.save" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .map(|provider| {
++                provider.save_model_selection(
++                    payload.get("model").and_then(Value::as_str).unwrap_or(""),
++                    payload.get("effort").and_then(Value::as_str).unwrap_or(""),
++                );
++            }),
++        "turn.interrupt" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| provider.interrupt()),
++        "session.shutdown" => return false,
++        command => Err(format!("Unknown runtime command: {command}")),
++    };
++
++    if let Err(error) = result {
++        protocol::emit_error(error);
++    }
++    true
++}
++
++fn main() {
++    let arguments = std::env::args().collect::<Vec<_>>();
++    if arguments.get(1).map(String::as_str) == Some("--mcp-proxy") {
++        let result = match (arguments.get(2), arguments.get(3)) {
++            (Some(address), Some(token)) => process::run_mcp_proxy(address, token),
++            _ => Err("Usage: anthracite-runtime --mcp-proxy ADDRESS TOKEN".to_string()),
++        };
++        if let Err(error) = result {
++            eprintln!("{error}");
++            std::process::exit(1);
++        }
++        return;
++    }
++
++    let (sender, receiver) = mpsc::channel();
++    process::spawn_host_reader(sender.clone());
++
++    let mut provider: Option<Box<dyn ProviderAdapter>> = None;
++    while let Ok(event) = receiver.recv() {
++        match event {
++            IoEvent::HostLine(line) => match serde_json::from_str::<Value>(&line) {
++                Ok(message) => {
++                    if !handle_host_message(message, &mut provider, &sender) {
++                        break;
++                    }
++                }
++                Err(error) => protocol::emit_error(format!("Invalid host JSON: {error}")),
++            },
++            IoEvent::HostClosed => break,
++            IoEvent::ProviderLine(line) => match serde_json::from_str::<Value>(&line) {
++                Ok(message) => {
++                    if let Some(provider) = &mut provider
++                        && let Err(error) = provider.handle_message(message)
++                    {
++                        protocol::emit_error(error);
++                    }
++                }
++                Err(error) => protocol::emit_error(format!("Invalid provider JSON: {error}")),
++            },
++            IoEvent::ProviderError(line) => eprintln!("provider: {line}"),
++            IoEvent::ProviderClosed => {
++                protocol::emit_error("Provider process closed its output.");
++                provider = None;
++            }
++            IoEvent::McpMessage { message, response } => {
++                if let Some(provider) = &mut provider
++                    && let Err(error) = provider.handle_mcp_message(message, response)
++                {
++                    protocol::emit_error(error);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/Mod/Anthracite/Runtime/src/process.rs b/src/Mod/Anthracite/Runtime/src/process.rs
+new file mode 100644
+index 0000000000..ab9958efc9
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/process.rs
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use serde_json::Value;
++use std::io::{BufRead, BufReader, Write};
++use std::net::{TcpListener, TcpStream};
++use std::process::{Child, ChildStdin, Command, Stdio};
++use std::sync::{Arc, Mutex, mpsc};
++use std::thread;
++
++pub enum IoEvent {
++    HostLine(String),
++    HostClosed,
++    ProviderLine(String),
++    ProviderError(String),
++    ProviderClosed,
++    McpMessage {
++        message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    },
++}
++
++pub fn spawn_host_reader(sender: mpsc::Sender<IoEvent>) {
++    thread::spawn(move || {
++        for line in std::io::stdin().lock().lines() {
++            match line {
++                Ok(line) => {
++                    if sender.send(IoEvent::HostLine(line)).is_err() {
++                        return;
++                    }
++                }
++                Err(error) => {
++                    let _ = sender.send(IoEvent::ProviderError(error.to_string()));
++                    return;
++                }
++            }
++        }
++        let _ = sender.send(IoEvent::HostClosed);
++    });
++}
++
++fn spawn_line_reader<R: std::io::Read + Send + 'static>(
++    reader: R,
++    sender: mpsc::Sender<IoEvent>,
++    map: fn(String) -> IoEvent,
++    closed: Option<IoEvent>,
++) {
++    thread::spawn(move || {
++        for line in BufReader::new(reader).lines() {
++            match line {
++                Ok(line) => {
++                    if sender.send(map(line)).is_err() {
++                        return;
++                    }
++                }
++                Err(error) => {
++                    let _ = sender.send(IoEvent::ProviderError(error.to_string()));
++                    return;
++                }
++            }
++        }
++        if let Some(event) = closed {
++            let _ = sender.send(event);
++        }
++    });
++}
++
++pub struct LineProcess {
++    child: Child,
++    input: Arc<Mutex<ChildStdin>>,
++}
++
++impl LineProcess {
++    pub fn start(
++        binary: &str,
++        arguments: &[&str],
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++    ) -> Result<Self, String> {
++        let mut child = Command::new(binary)
++            .args(arguments)
++            .current_dir(cwd)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .map_err(|error| format!("Could not start provider at {binary}: {error}"))?;
++
++        let input = child
++            .stdin
++            .take()
++            .ok_or_else(|| "Provider did not expose standard input.".to_string())?;
++        let output = child
++            .stdout
++            .take()
++            .ok_or_else(|| "Provider did not expose standard output.".to_string())?;
++        let errors = child
++            .stderr
++            .take()
++            .ok_or_else(|| "Provider did not expose standard error.".to_string())?;
++
++        spawn_line_reader(
++            output,
++            sender.clone(),
++            IoEvent::ProviderLine,
++            Some(IoEvent::ProviderClosed),
++        );
++        spawn_line_reader(errors, sender.clone(), IoEvent::ProviderError, None);
++
++        Ok(Self {
++            child,
++            input: Arc::new(Mutex::new(input)),
++        })
++    }
++
++    pub fn send(&self, value: &Value) -> Result<(), String> {
++        let mut input = self
++            .input
++            .lock()
++            .map_err(|_| "Provider input lock was poisoned.".to_string())?;
++        serde_json::to_writer(&mut *input, value).map_err(|error| error.to_string())?;
++        input.write_all(b"\n").map_err(|error| error.to_string())?;
++        input.flush().map_err(|error| error.to_string())
++    }
++}
++
++impl Drop for LineProcess {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++pub struct ChildProcess {
++    child: Child,
++}
++
++impl ChildProcess {
++    pub fn start(
++        binary: &str,
++        arguments: &[&str],
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++    ) -> Result<Self, String> {
++        let mut child = Command::new(binary)
++            .args(arguments)
++            .current_dir(cwd)
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .map_err(|error| format!("Could not start provider at {binary}: {error}"))?;
++        let output = child
++            .stdout
++            .take()
++            .ok_or_else(|| "Provider did not expose standard output.".to_string())?;
++        let errors = child
++            .stderr
++            .take()
++            .ok_or_else(|| "Provider did not expose standard error.".to_string())?;
++        spawn_line_reader(
++            output,
++            sender.clone(),
++            IoEvent::ProviderError,
++            Some(IoEvent::ProviderClosed),
++        );
++        spawn_line_reader(errors, sender.clone(), IoEvent::ProviderError, None);
++        Ok(Self { child })
++    }
++}
++
++impl Drop for ChildProcess {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++pub struct McpBridge {
++    address: String,
++    token: String,
++}
++
++impl McpBridge {
++    pub fn start(sender: &mpsc::Sender<IoEvent>) -> Result<Self, String> {
++        let listener = TcpListener::bind("127.0.0.1:0")
++            .map_err(|error| format!("Could not bind the Anthracite MCP bridge: {error}"))?;
++        let address = listener
++            .local_addr()
++            .map_err(|error| format!("Could not inspect the Anthracite MCP bridge: {error}"))?
++            .to_string();
++        let token = uuid::Uuid::new_v4().to_string();
++        let expected_token = token.clone();
++        let sender = sender.clone();
++        thread::spawn(move || {
++            for stream in listener.incoming() {
++                let Ok(stream) = stream else {
++                    break;
++                };
++                let sender = sender.clone();
++                let expected_token = expected_token.clone();
++                thread::spawn(move || {
++                    if let Err(error) = serve_mcp_connection(stream, &expected_token, &sender) {
++                        let _ = sender.send(IoEvent::ProviderError(format!(
++                            "Anthracite MCP bridge: {error}"
++                        )));
++                    }
++                });
++            }
++        });
++        Ok(Self { address, token })
++    }
++
++    pub fn proxy_arguments(&self) -> Vec<String> {
++        vec![
++            "--mcp-proxy".to_string(),
++            self.address.clone(),
++            self.token.clone(),
++        ]
++    }
++}
++
++fn serve_mcp_connection(
++    stream: TcpStream,
++    expected_token: &str,
++    sender: &mpsc::Sender<IoEvent>,
++) -> Result<(), String> {
++    let reader_stream = stream
++        .try_clone()
++        .map_err(|error| format!("could not clone connection: {error}"))?;
++    let mut reader = BufReader::new(reader_stream);
++    let mut writer = stream;
++    let mut authentication = String::new();
++    reader
++        .read_line(&mut authentication)
++        .map_err(|error| format!("could not read authentication: {error}"))?;
++    if authentication.trim_end() != expected_token {
++        return Err("proxy authentication failed".to_string());
++    }
++
++    for line in reader.lines() {
++        let line = line.map_err(|error| format!("could not read proxy message: {error}"))?;
++        let message: Value = serde_json::from_str(&line)
++            .map_err(|error| format!("proxy sent invalid JSON: {error}"))?;
++        if let Some(value) = basic_mcp_response(&message) {
++            serde_json::to_writer(&mut writer, &value)
++                .map_err(|error| format!("could not encode MCP response: {error}"))?;
++            writer
++                .write_all(b"\n")
++                .and_then(|()| writer.flush())
++                .map_err(|error| format!("could not write MCP response: {error}"))?;
++            continue;
++        }
++        let response = message.get("id").map(|_| {
++            let (response_sender, response_receiver) = mpsc::channel();
++            (response_sender, response_receiver)
++        });
++        sender
++            .send(IoEvent::McpMessage {
++                message,
++                response: response.as_ref().map(|(sender, _)| sender.clone()),
++            })
++            .map_err(|_| "runtime closed while handling MCP message".to_string())?;
++        if let Some((_, receiver)) = response {
++            let value = receiver
++                .recv()
++                .map_err(|_| "runtime closed before responding to MCP".to_string())?;
++            serde_json::to_writer(&mut writer, &value)
++                .map_err(|error| format!("could not encode MCP response: {error}"))?;
++            writer
++                .write_all(b"\n")
++                .and_then(|()| writer.flush())
++                .map_err(|error| format!("could not write MCP response: {error}"))?;
++        }
++    }
++    Ok(())
++}
++
++fn basic_mcp_response(message: &Value) -> Option<Value> {
++    let id = message.get("id")?.clone();
++    match message.get("method").and_then(Value::as_str).unwrap_or("") {
++        "initialize" => Some(serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "result": {
++                "protocolVersion": message
++                    .pointer("/params/protocolVersion")
++                    .and_then(Value::as_str)
++                    .unwrap_or("2025-06-18"),
++                "capabilities": {"tools": {}},
++                "serverInfo": {
++                    "name": "anthracite",
++                    "version": env!("CARGO_PKG_VERSION")
++                }
++            }
++        })),
++        "ping" => Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})),
++        "tools/list" => Some(serde_json::json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "result": {
++                "tools": [{
++                    "name": "freecad",
++                    "description": concat!(
++                        "Execute ordinary Python inside the active FreeCAD GUI. ",
++                        "App/FreeCAD, Gui, doc, and cad are prebound. The complete ",
++                        "source runs as one transaction, recomputes and validates, ",
++                        "then returns a structured CAD observation."
++                    ),
++                    "inputSchema": {
++                        "type": "object",
++                        "properties": {
++                            "code": {
++                                "type": "string",
++                                "description": "Complete ordinary FreeCAD Python source."
++                            }
++                        },
++                        "required": ["code"],
++                        "additionalProperties": false
++                    }
++                }]
++            }
++        })),
++        _ => None,
++    }
++}
++
++pub fn run_mcp_proxy(address: &str, token: &str) -> Result<(), String> {
++    let stream = TcpStream::connect(address)
++        .map_err(|error| format!("Could not connect to Anthracite MCP bridge: {error}"))?;
++    let mut writer = stream
++        .try_clone()
++        .map_err(|error| format!("Could not clone Anthracite MCP connection: {error}"))?;
++    writer
++        .write_all(format!("{token}\n").as_bytes())
++        .and_then(|()| writer.flush())
++        .map_err(|error| format!("Could not authenticate Anthracite MCP proxy: {error}"))?;
++
++    let output_thread = thread::spawn(move || -> Result<(), String> {
++        let stdout = std::io::stdout();
++        let mut output = stdout.lock();
++        for line in BufReader::new(stream).lines() {
++            let line = line.map_err(|error| format!("Could not read MCP response: {error}"))?;
++            output
++                .write_all(line.as_bytes())
++                .and_then(|()| output.write_all(b"\n"))
++                .and_then(|()| output.flush())
++                .map_err(|error| format!("Could not write MCP response: {error}"))?;
++        }
++        Ok(())
++    });
++
++    for line in std::io::stdin().lock().lines() {
++        let line = line.map_err(|error| format!("Could not read MCP request: {error}"))?;
++        writer
++            .write_all(line.as_bytes())
++            .and_then(|()| writer.write_all(b"\n"))
++            .and_then(|()| writer.flush())
++            .map_err(|error| format!("Could not forward MCP request: {error}"))?;
++    }
++    output_thread
++        .join()
++        .map_err(|_| "Anthracite MCP output thread panicked.".to_string())?
++}
+diff --git a/src/Mod/Anthracite/Runtime/src/protocol.rs b/src/Mod/Anthracite/Runtime/src/protocol.rs
+new file mode 100644
+index 0000000000..3b1866713c
+--- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
-@@ -3,6 +3,8 @@
- use serde_json::{Value, json};
- use std::io::{self, Write};
- 
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use serde_json::{Value, json};
++use std::io::{self, Write};
++
 +use crate::store::Store;
 +
- pub const VERSION: u64 = 1;
- 
- pub fn message_type(message: &Value) -> &str {
-@@ -13,7 +15,7 @@ pub fn payload(message: &Value) -> &Valu
-     message.get("payload").unwrap_or(&Value::Null)
- }
- 
--pub fn emit(message_type: &str, payload: Value) {
++pub const VERSION: u64 = 1;
++
++pub fn message_type(message: &Value) -> &str {
++    message.get("type").and_then(Value::as_str).unwrap_or("")
++}
++
++pub fn payload(message: &Value) -> &Value {
++    message.get("payload").unwrap_or(&Value::Null)
++}
++
 +pub fn emit_raw(message_type: &str, payload: Value) {
-     let stdout = io::stdout();
-     let mut output = stdout.lock();
-     let value = json!({
-@@ -28,14 +30,53 @@ pub fn emit(message_type: &str, payload:
- }
- 
- pub fn emit_error(message: impl Into<String>) {
--    emit(
++    let stdout = io::stdout();
++    let mut output = stdout.lock();
++    let value = json!({
++        "protocolVersion": VERSION,
++        "type": message_type,
++        "payload": payload
++    });
++    if serde_json::to_writer(&mut output, &value).is_ok() {
++        let _ = output.write_all(b"\n");
++        let _ = output.flush();
++    }
++}
++
++pub fn emit_error(message: impl Into<String>) {
 +    emit_raw(
-         "runtime.error",
-         json!({"class": "provider_error", "message": message.into()}),
-     );
- }
- 
- pub fn emit_warning(message: impl Into<String>) {
--    emit("runtime.warning", json!({"message": message.into()}));
++        "runtime.error",
++        json!({"class": "provider_error", "message": message.into()}),
++    );
++}
++
++pub fn emit_warning(message: impl Into<String>) {
 +    emit_raw("runtime.warning", json!({"message": message.into()}));
 +}
 +
@@ -2580,9 +3069,18 @@
 +    pub fn new(store: Store) -> Self {
 +        let emitter = Self { store };
 +        emit_raw("thread.local.ready", emitter.store.summary());
++        emitter.emit_thread_list();
 +        match emitter.store.history() {
 +            Ok(events) => emit_raw("history.snapshot", json!({"events": events})),
 +            Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
++        }
++        match emitter.store.draft() {
++            Ok(body) => emit_raw("draft.loaded", json!({"body": body})),
++            Err(error) => emit_warning(format!("Could not load composer draft: {error}")),
++        }
++        match emitter.store.model_selection() {
++            Ok(selection) => emit_raw("model.selection", selection),
++            Err(error) => emit_warning(format!("Could not load model selection: {error}")),
 +        }
 +        emitter
 +    }
@@ -2598,6 +3096,9 @@
 +        if let Err(error) = self.store.record(message_type, payload) {
 +            emit_warning(format!("Could not persist runtime event: {error}"));
 +        }
++        if message_type == "content.user" {
++            self.emit_thread_list();
++        }
 +    }
 +
 +    pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
@@ -2609,364 +3110,59 @@
 +            emit_warning(format!("Could not persist provider thread id: {error}"));
 +        }
 +    }
- }
- 
- #[cfg(test)]
---- a/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-+++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-@@ -2,13 +2,15 @@
- 
- use super::ProviderAdapter;
- use crate::process::{IoEvent, LineProcess};
--use crate::protocol;
-+use crate::protocol::{self, Emitter};
-+use crate::store::Store;
- use serde_json::{Map, Value, json};
- use std::collections::HashMap;
- use std::sync::mpsc;
- 
- const INITIALIZE_ID: u64 = 1;
- const THREAD_START_ID: u64 = 2;
-+const THREAD_FALLBACK_ID: u64 = 3;
- 
- #[derive(Clone, Copy, Debug, PartialEq)]
- enum PendingKind {
-@@ -31,20 +33,31 @@ pub struct CodexAdapter {
-     next_interaction_id: u64,
-     thread_id: Option<String>,
-     turn_id: Option<String>,
-+    resume_thread_id: Option<String>,
-     pending: HashMap<String, PendingRequest>,
-+    emitter: Emitter,
- }
- 
- impl CodexAdapter {
--    pub fn start(binary: &str, cwd: &str, sender: &mpsc::Sender<IoEvent>) -> Result<Self, String> {
-+    pub fn start(
-+        binary: &str,
-+        cwd: &str,
-+        sender: &mpsc::Sender<IoEvent>,
-+        store: Store,
-+    ) -> Result<Self, String> {
-         let process = LineProcess::start(binary, &["app-server"], cwd, sender)?;
-+        let emitter = Emitter::new(store);
-+        let resume_thread_id = emitter.provider_thread_id()?;
-         let adapter = Self {
-             process,
-             cwd: cwd.to_owned(),
--            next_request_id: 3,
-+            next_request_id: 4,
-             next_interaction_id: 1,
-             thread_id: None,
-             turn_id: None,
-+            resume_thread_id,
-             pending: HashMap::new(),
-+            emitter,
-         };
-         adapter.process.send(&json!({
-             "id": INITIALIZE_ID,
-@@ -74,44 +87,64 @@ impl CodexAdapter {
-         Ok(id)
-     }
- 
--    fn start_thread(&self) -> Result<(), String> {
--        self.send(&json!({
--            "id": THREAD_START_ID,
--            "method": "thread/start",
--            "params": {
--                "cwd": self.cwd,
--                "serviceName": "anthracite_freecad",
--                "developerInstructions": concat!(
--                    "You are operating inside FreeCAD through Anthracite. ",
--                    "Use the freecad tool for CAD inspection and every CAD mutation. ",
--                    "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
--                    "Prefer parametric, named objects and constraints. Inspect before editing. ",
--                    "A tool call is one undoable transaction: failures roll back automatically. ",
--                    "Read the returned observation, fix errors, and verify the finished model."
--                ),
--                "dynamicTools": [{
--                    "type": "function",
--                    "name": "freecad",
--                    "description": concat!(
--                        "Execute ordinary Python inside the active FreeCAD GUI. ",
--                        "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
--                        "The complete source runs as one transaction, recomputes and validates, ",
--                        "then returns result/stdout plus created, changed, and deleted objects."
--                    ),
--                    "inputSchema": {
--                        "type": "object",
--                        "properties": {
--                            "code": {
--                                "type": "string",
--                                "description": "Complete ordinary FreeCAD Python source."
--                            }
--                        },
--                        "required": ["code"],
--                        "additionalProperties": false
-+    fn developer_instructions() -> &'static str {
-+        concat!(
-+            "You are operating inside FreeCAD through Anthracite. ",
-+            "Use the freecad tool for CAD inspection and every CAD mutation. ",
-+            "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
-+            "Prefer parametric, named objects and constraints. Inspect before editing. ",
-+            "A tool call is one undoable transaction: failures roll back automatically. ",
-+            "Read the returned observation, fix errors, and verify the finished model."
-+        )
-+    }
 +
-+    fn freecad_tool() -> Value {
-+        json!({
-+            "type": "function",
-+            "name": "freecad",
-+            "description": concat!(
-+                "Execute ordinary Python inside the active FreeCAD GUI. ",
-+                "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
-+                "The complete source runs as one transaction, recomputes and validates, ",
-+                "then returns result/stdout plus created, changed, and deleted objects."
-+            ),
-+            "inputSchema": {
-+                "type": "object",
-+                "properties": {
-+                    "code": {
-+                        "type": "string",
-+                        "description": "Complete ordinary FreeCAD Python source."
-                     }
--                }]
-+                },
-+                "required": ["code"],
-+                "additionalProperties": false
-             }
--        }))
-+        })
-+    }
-+
-+    fn open_thread(&self, request_id: u64) -> Result<(), String> {
-+        if let Some(thread_id) = &self.resume_thread_id {
-+            self.send(&json!({
-+                "id": request_id,
-+                "method": "thread/resume",
-+                "params": {
-+                    "threadId": thread_id,
-+                    "cwd": self.cwd,
-+                    "developerInstructions": Self::developer_instructions()
-+                }
-+            }))
-+        } else {
-+            self.send(&json!({
-+                "id": request_id,
-+                "method": "thread/start",
-+                "params": {
-+                    "cwd": self.cwd,
-+                    "serviceName": "anthracite_freecad",
-+                    "developerInstructions": Self::developer_instructions(),
-+                    "dynamicTools": [Self::freecad_tool()]
-+                }
-+            }))
++    pub fn save_draft(&self, body: &str, save_id: &Value) {
++        match self.store.save_draft(body) {
++            Ok(()) => emit_raw("draft.saved", json!({"saveId": save_id})),
++            Err(error) => emit_warning(format!("Could not persist composer draft: {error}")),
 +        }
-     }
- 
-     fn response_id(message: &Value) -> Option<u64> {
-@@ -158,7 +191,7 @@ impl CodexAdapter {
-             PendingKind::UserInput => unreachable!(),
-         };
- 
--        protocol::emit(
-+        self.emitter.emit(
-             "request.opened",
-             json!({
-                 "requestId": request_id,
-@@ -181,7 +214,7 @@ impl CodexAdapter {
- 
-     fn open_user_input(&mut self, server_id: Value, params: Value) {
-         let request_id = self.next_pending_id();
--        protocol::emit(
-+        self.emitter.emit(
-             "user_input.requested",
-             json!({
-                 "requestId": request_id,
-@@ -223,7 +256,7 @@ impl CodexAdapter {
-                     }))?;
-                     return Ok(());
-                 }
--                protocol::emit(
-+                self.emitter.emit(
-                     "tool.call",
-                     json!({
-                         "requestId": server_id,
-@@ -307,14 +340,14 @@ impl CodexAdapter {
-                     .pointer("/turn/id")
-                     .and_then(Value::as_str)
-                     .map(str::to_owned);
--                protocol::emit(
-+                self.emitter.emit(
-                     "turn.started",
-                     json!({"turnId": self.turn_id, "provider": "codex"}),
-                 );
-             }
-             "item/agentMessage/delta" => {
-                 if let Some(delta) = params.get("delta").and_then(Value::as_str) {
--                    protocol::emit(
-+                    self.emitter.emit(
-                         "content.delta",
-                         json!({"streamKind": "assistant_text", "text": delta}),
-                     );
-@@ -323,7 +356,7 @@ impl CodexAdapter {
-             "item/started" | "item/completed" => {
-                 let item = params.get("item").unwrap_or(&Value::Null);
-                 if let Some((kind, title, detail)) = Self::item_description(item) {
--                    protocol::emit(
-+                    self.emitter.emit(
-                         if method == "item/started" {
-                             "item.started"
-                         } else {
-@@ -339,7 +372,7 @@ impl CodexAdapter {
-                 }
-             }
-             "turn/plan/updated" => {
--                protocol::emit(
-+                self.emitter.emit(
-                     "plan.updated",
-                     json!({
-                         "explanation": params.get("explanation"),
-@@ -348,7 +381,7 @@ impl CodexAdapter {
-                 );
-             }
-             "thread/tokenUsage/updated" => {
--                protocol::emit(
-+                self.emitter.emit(
-                     "usage.updated",
-                     params
-                         .get("tokenUsage")
-@@ -365,7 +398,8 @@ impl CodexAdapter {
-                     .pointer("/turn/error/message")
-                     .and_then(Value::as_str);
-                 self.turn_id = None;
--                protocol::emit("turn.completed", json!({"status": status, "error": error}));
-+                self.emitter
-+                    .emit("turn.completed", json!({"status": status, "error": error}));
-             }
-             "error" => {
-                 let text = params
-@@ -373,7 +407,10 @@ impl CodexAdapter {
-                     .or_else(|| params.get("message"))
-                     .and_then(Value::as_str)
-                     .unwrap_or("Codex reported an unknown error.");
--                protocol::emit_error(text);
-+                self.emitter.emit(
-+                    "runtime.error",
-+                    json!({"class": "provider_error", "message": text}),
-+                );
-             }
-             _ => {}
-         }
-@@ -381,20 +418,36 @@ impl CodexAdapter {
- 
-     fn handle_response(&mut self, message: &Value) -> Result<(), String> {
-         if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
-+            if Self::response_id(message) == Some(THREAD_START_ID)
-+                && self.resume_thread_id.is_some()
-+            {
-+                self.emitter.emit(
-+                    "runtime.warning",
-+                    json!({
-+                        "message": format!(
-+                            "Could not resume the previous Codex thread; starting a new one: {error}"
-+                        )
-+                    }),
-+                );
-+                self.resume_thread_id = None;
-+                self.open_thread(THREAD_FALLBACK_ID)?;
-+                return Ok(());
-+            }
-             return Err(format!("Codex protocol error: {error}"));
-         }
-         match Self::response_id(message) {
-             Some(INITIALIZE_ID) => {
-                 self.send(&json!({"method": "initialized"}))?;
--                self.start_thread()?;
-+                self.open_thread(THREAD_START_ID)?;
-             }
--            Some(THREAD_START_ID) => {
-+            Some(THREAD_START_ID | THREAD_FALLBACK_ID) => {
-                 self.thread_id = message
-                     .pointer("/result/thread/id")
-                     .and_then(Value::as_str)
-                     .map(str::to_owned);
-                 if let Some(thread_id) = &self.thread_id {
--                    protocol::emit(
-+                    self.emitter.set_provider_thread_id(thread_id);
-+                    self.emitter.emit(
-                         "runtime.ready",
-                         json!({
-                             "provider": "codex",
-@@ -497,7 +550,10 @@ impl ProviderAdapter for CodexAdapter {
-                 }]
-             }),
-         )?;
--        protocol::emit("session.state", json!({"state": "running"}));
-+        self.emitter
-+            .record("content.user", &json!({"text": prompt}));
-+        self.emitter
-+            .emit("session.state", json!({"state": "running"}));
-         Ok(())
-     }
- 
-@@ -507,6 +563,10 @@ impl ProviderAdapter for CodexAdapter {
-         result: &str,
-         success: bool,
-     ) -> Result<(), String> {
-+        self.emitter.record(
-+            "tool.result",
-+            &json!({"requestId": request_id, "result": result, "success": success}),
++    }
++
++    pub fn save_model_selection(&self, model: &str, effort: &str) {
++        match self.store.save_model_selection(model, effort) {
++            Ok(()) => emit_raw("model.selection", json!({"model": model, "effort": effort})),
++            Err(error) => emit_warning(format!("Could not persist model selection: {error}")),
++        }
++    }
++
++    fn emit_thread_list(&self) {
++        match self.store.threads() {
++            Ok(threads) => emit_raw(
++                "thread.list",
++                json!({
++                    "currentThreadId": self.store.local_thread_id(),
++                    "threads": threads
++                }),
++            ),
++            Err(error) => emit_warning(format!("Could not list conversations: {error}")),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn reads_versioned_host_messages() {
++        let message = json!({
++            "protocolVersion": VERSION,
++            "type": "turn.start",
++            "payload": {"prompt": "Make a box"}
++        });
++        assert_eq!(message_type(&message), "turn.start");
++        assert_eq!(
++            payload(&message).get("prompt").and_then(Value::as_str),
++            Some("Make a box")
 +        );
-         self.send(&json!({
-             "id": request_id,
-             "result": {
-@@ -529,7 +589,7 @@ impl ProviderAdapter for CodexAdapter {
-             }
-         };
-         self.send(&json!({"id": pending.server_id, "result": result}))?;
--        protocol::emit(
-+        self.emitter.emit(
-             "request.resolved",
-             json!({"requestId": request_id, "decision": decision}),
-         );
-@@ -550,7 +610,7 @@ impl ProviderAdapter for CodexAdapter {
-             "id": pending.server_id,
-             "result": {"answers": provider_answers}
-         }))?;
--        protocol::emit(
-+        self.emitter.emit(
-             "user_input.resolved",
-             json!({"requestId": request_id, "answers": answers}),
-         );
---- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
-+++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
-@@ -3,6 +3,7 @@
- mod codex;
- 
- use crate::process::IoEvent;
-+use crate::store::Store;
- use serde_json::Value;
- use std::sync::mpsc;
- 
-@@ -25,9 +26,12 @@ pub fn start(
-     binary: &str,
-     cwd: &str,
-     sender: &mpsc::Sender<IoEvent>,
-+    store: Store,
- ) -> Result<Box<dyn ProviderAdapter>, String> {
-     match kind {
--        "codex" => Ok(Box::new(codex::CodexAdapter::start(binary, cwd, sender)?)),
-+        "codex" => Ok(Box::new(codex::CodexAdapter::start(
-+            binary, cwd, sender, store,
-+        )?)),
-         _ => Err(format!("Unsupported provider adapter: {kind}")),
-     }
- }
++    }
++}
+diff --git a/src/Mod/Anthracite/Runtime/src/store.rs b/src/Mod/Anthracite/Runtime/src/store.rs
+new file mode 100644
+index 0000000000..85e06925c7
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/store.rs
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,772 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use serde_json::{Value, json};
@@ -3032,6 +3228,13 @@
 +    body TEXT NOT NULL,
 +    updated_at_ms INTEGER NOT NULL
 +);
++
++CREATE TABLE IF NOT EXISTS thread_settings (
++    thread_id TEXT PRIMARY KEY,
++    model TEXT NOT NULL DEFAULT '',
++    effort TEXT NOT NULL DEFAULT '',
++    updated_at_ms INTEGER NOT NULL
++);
 +"#;
 +
 +fn now_ms() -> i64 {
@@ -3081,7 +3284,13 @@
 +}
 +
 +impl Store {
-+    pub fn open(database_path: &str, document: &Value, provider: &str) -> Result<Self, String> {
++    pub fn open(
++        database_path: &str,
++        document: &Value,
++        provider: &str,
++        requested_thread_id: Option<&str>,
++        create_thread: bool,
++    ) -> Result<Self, String> {
 +        let path = PathBuf::from(database_path);
 +        if let Some(parent) = path.parent() {
 +            std::fs::create_dir_all(parent).map_err(|error| {
@@ -3113,7 +3322,7 @@
 +            provider: provider.to_owned(),
 +        };
 +        store.document_id = store.resolve_document(document)?;
-+        store.thread_id = store.resolve_thread()?;
++        store.thread_id = store.resolve_thread(requested_thread_id, create_thread)?;
 +        Ok(store)
 +    }
 +
@@ -3136,21 +3345,24 @@
 +    fn resolve_document(&self, document: &Value) -> Result<String, String> {
 +        let raw_path = document.get("path").and_then(Value::as_str).unwrap_or("");
 +        let path = canonical_path(raw_path);
-+        let session_key = if path.is_none() {
-+            document
-+                .get("sessionKey")
-+                .and_then(Value::as_str)
-+                .filter(|value| !value.is_empty())
-+                .map(str::to_owned)
-+        } else {
-+            None
-+        };
++        let session_key = document
++            .get("sessionKey")
++            .and_then(Value::as_str)
++            .filter(|value| !value.is_empty())
++            .map(str::to_owned);
 +        let display_name = document
 +            .get("displayName")
 +            .and_then(Value::as_str)
 +            .filter(|value| !value.is_empty())
 +            .unwrap_or("Unsaved FreeCAD document");
 +        let file_fingerprint = path.as_deref().and_then(fingerprint);
++        let session_document_id = match &session_key {
++            Some(session_key) => self.query_string(
++                "SELECT id FROM documents WHERE session_key = ?1 LIMIT 1",
++                params![session_key.as_str()],
++            )?,
++            None => None,
++        };
 +
 +        if let Some(path) = &path
 +            && let Some(id) = self.query_string(
@@ -3158,24 +3370,52 @@
 +                params![path.as_str()],
 +            )?
 +        {
++            if let Some(session_document_id) = &session_document_id
++                && session_document_id != &id
++            {
++                self.runtime
++                    .block_on(self.connection.execute(
++                        "UPDATE documents SET session_key = NULL WHERE id = ?1",
++                        params![session_document_id.as_str()],
++                    ))
++                    .map_err(|error| error.to_string())?;
++            }
 +            self.runtime
 +                .block_on(self.connection.execute(
 +                    "UPDATE documents
-+                     SET fingerprint = ?1, display_name = ?2, updated_at_ms = ?3
-+                     WHERE id = ?4",
-+                    params![file_fingerprint, display_name, now_ms(), id.clone()],
++                     SET session_key = ?1, fingerprint = ?2,
++                         display_name = ?3, updated_at_ms = ?4
++                     WHERE id = ?5",
++                    params![
++                        session_key,
++                        file_fingerprint,
++                        display_name,
++                        now_ms(),
++                        id.clone()
++                    ],
 +                ))
 +                .map_err(|error| error.to_string())?;
 +            return Ok(id);
 +        }
 +
-+        if path.is_none()
-+            && let Some(session_key) = &session_key
-+            && let Some(id) = self.query_string(
-+                "SELECT id FROM documents WHERE session_key = ?1 LIMIT 1",
-+                params![session_key.as_str()],
-+            )?
-+        {
++        if let Some(id) = session_document_id {
++            if let Some(path) = &path {
++                self.runtime
++                    .block_on(self.connection.execute(
++                        "UPDATE documents
++                         SET canonical_path = ?1, fingerprint = ?2,
++                             display_name = ?3, updated_at_ms = ?4
++                         WHERE id = ?5",
++                        params![
++                            path.as_str(),
++                            file_fingerprint,
++                            display_name,
++                            now_ms(),
++                            id.clone()
++                        ],
++                    ))
++                    .map_err(|error| error.to_string())?;
++            }
 +            return Ok(id);
 +        }
 +
@@ -3205,9 +3445,16 @@
 +                self.runtime
 +                    .block_on(self.connection.execute(
 +                        "UPDATE documents
-+                         SET canonical_path = ?1, display_name = ?2, updated_at_ms = ?3
-+                         WHERE id = ?4",
-+                        params![path.as_str(), display_name, now_ms(), id.clone()],
++                         SET canonical_path = ?1, session_key = ?2,
++                             display_name = ?3, updated_at_ms = ?4
++                         WHERE id = ?5",
++                        params![
++                            path.as_str(),
++                            session_key,
++                            display_name,
++                            now_ms(),
++                            id.clone()
++                        ],
 +                    ))
 +                    .map_err(|error| error.to_string())?;
 +                return Ok(id);
@@ -3236,16 +3483,42 @@
 +        Ok(id)
 +    }
 +
-+    fn resolve_thread(&self) -> Result<String, String> {
-+        if let Some(id) = self.query_string(
-+            "SELECT id
-+             FROM threads
-+             WHERE document_id = ?1 AND provider = ?2 AND archived = 0
-+             ORDER BY updated_at_ms DESC
-+             LIMIT 1",
-+            params![self.document_id.clone(), self.provider.clone()],
-+        )? {
-+            return Ok(id);
++    fn resolve_thread(
++        &self,
++        requested_thread_id: Option<&str>,
++        create_thread: bool,
++    ) -> Result<String, String> {
++        if !create_thread {
++            if let Some(requested_thread_id) = requested_thread_id.filter(|value| !value.is_empty())
++            {
++                return self
++                    .query_string(
++                        "SELECT id
++                         FROM threads
++                         WHERE id = ?1 AND document_id = ?2
++                           AND provider = ?3 AND archived = 0
++                         LIMIT 1",
++                        params![
++                            requested_thread_id,
++                            self.document_id.clone(),
++                            self.provider.clone()
++                        ],
++                    )?
++                    .ok_or_else(|| {
++                        "The selected conversation does not belong to this document.".to_string()
++                    });
++            }
++
++            if let Some(id) = self.query_string(
++                "SELECT id
++                 FROM threads
++                 WHERE document_id = ?1 AND provider = ?2 AND archived = 0
++                 ORDER BY updated_at_ms DESC
++                 LIMIT 1",
++                params![self.document_id.clone(), self.provider.clone()],
++            )? {
++                return Ok(id);
++            }
 +        }
 +
 +        let id = new_id("thread");
@@ -3272,6 +3545,34 @@
 +        &self.thread_id
 +    }
 +
++    pub fn threads(&self) -> Result<Vec<Value>, String> {
++        self.runtime
++            .block_on(async {
++                let mut rows = self
++                    .connection
++                    .query(
++                        "SELECT id, title, updated_at_ms
++                         FROM threads
++                         WHERE document_id = ?1 AND provider = ?2 AND archived = 0
++                         ORDER BY updated_at_ms DESC",
++                        params![self.document_id.clone(), self.provider.clone()],
++                    )
++                    .await?;
++                let mut threads = Vec::new();
++                while let Some(row) = rows.next().await? {
++                    let id = row.get::<String>(0)?;
++                    threads.push(json!({
++                        "id": id,
++                        "title": row.get::<String>(1)?,
++                        "updatedAtMs": row.get::<i64>(2)?,
++                        "current": id == self.thread_id
++                    }));
++                }
++                Ok::<_, turso::Error>(threads)
++            })
++            .map_err(|error| error.to_string())
++    }
++
 +    pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
 +        self.query_string(
 +            "SELECT provider_thread_id
@@ -3288,6 +3589,77 @@
 +                 SET provider_thread_id = ?1, updated_at_ms = ?2
 +                 WHERE id = ?3",
 +                params![provider_thread_id, now_ms(), self.thread_id.clone()],
++            ))
++            .map_err(|error| error.to_string())?;
++        Ok(())
++    }
++
++    pub fn draft(&self) -> Result<String, String> {
++        Ok(self
++            .query_string(
++                "SELECT body FROM drafts WHERE thread_id = ?1 LIMIT 1",
++                params![self.thread_id.clone()],
++            )?
++            .unwrap_or_default())
++    }
++
++    pub fn save_draft(&self, body: &str) -> Result<(), String> {
++        if body.is_empty() {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "DELETE FROM drafts WHERE thread_id = ?1",
++                    params![self.thread_id.clone()],
++                ))
++                .map_err(|error| error.to_string())?;
++        } else {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "INSERT INTO drafts(thread_id, body, updated_at_ms)
++                     VALUES (?1, ?2, ?3)
++                     ON CONFLICT(thread_id) DO UPDATE SET
++                         body = excluded.body,
++                         updated_at_ms = excluded.updated_at_ms",
++                    params![self.thread_id.clone(), body, now_ms()],
++                ))
++                .map_err(|error| error.to_string())?;
++        }
++        Ok(())
++    }
++
++    pub fn model_selection(&self) -> Result<Value, String> {
++        self.runtime
++            .block_on(async {
++                let mut rows = self
++                    .connection
++                    .query(
++                        "SELECT model, effort
++                         FROM thread_settings
++                         WHERE thread_id = ?1
++                         LIMIT 1",
++                        params![self.thread_id.clone()],
++                    )
++                    .await?;
++                Ok::<_, turso::Error>(match rows.next().await? {
++                    Some(row) => json!({
++                        "model": row.get::<String>(0)?,
++                        "effort": row.get::<String>(1)?
++                    }),
++                    None => json!({"model": "", "effort": ""}),
++                })
++            })
++            .map_err(|error| error.to_string())
++    }
++
++    pub fn save_model_selection(&self, model: &str, effort: &str) -> Result<(), String> {
++        self.runtime
++            .block_on(self.connection.execute(
++                "INSERT INTO thread_settings(thread_id, model, effort, updated_at_ms)
++                 VALUES (?1, ?2, ?3, ?4)
++                 ON CONFLICT(thread_id) DO UPDATE SET
++                     model = excluded.model,
++                     effort = excluded.effort,
++                     updated_at_ms = excluded.updated_at_ms",
++                params![self.thread_id.clone(), model, effort, now_ms()],
 +            ))
 +            .map_err(|error| error.to_string())?;
 +        Ok(())
@@ -3397,7 +3769,14 @@
 +            "sessionKey": "not-used-for-saved-documents"
 +        });
 +
-+        let store = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        let store = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
 +        let first_thread = store.local_thread_id().to_owned();
 +        store
 +            .record("content.user", &json!({"text": "Make a bracket"}))
@@ -3410,7 +3789,14 @@
 +            .unwrap();
 +        drop(store);
 +
-+        let reopened = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        let reopened = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
 +        assert_eq!(reopened.local_thread_id(), first_thread);
 +        assert_eq!(reopened.history().unwrap().len(), 2);
 +        assert_eq!(
@@ -3427,6 +3813,8 @@
 +            database_path.to_str().unwrap(),
 +            &json!({"sessionKey": "unsaved-one", "displayName": "Untitled"}),
 +            "codex",
++            None,
++            false,
 +        )
 +        .unwrap();
 +        let first_thread = first.local_thread_id().to_owned();
@@ -3436,19 +3824,23 @@
 +            database_path.to_str().unwrap(),
 +            &json!({"sessionKey": "unsaved-two", "displayName": "Untitled"}),
 +            "codex",
++            None,
++            false,
 +        )
 +        .unwrap();
 +        assert_ne!(second.local_thread_id(), first_thread);
 +    }
 +
 +    #[test]
-+    fn saved_documents_do_not_reuse_unsaved_session_keys() {
++    fn saving_an_unsaved_document_preserves_its_conversations() {
 +        let directory = tempfile::tempdir().unwrap();
 +        let database_path = directory.path().join("anthracite.db");
 +        let unsaved = Store::open(
 +            database_path.to_str().unwrap(),
 +            &json!({"sessionKey": "same-session", "displayName": "Untitled"}),
 +            "codex",
++            None,
++            false,
 +        )
 +        .unwrap();
 +        let unsaved_thread = unsaved.local_thread_id().to_owned();
@@ -3464,9 +3856,82 @@
 +                "displayName": "saved.FCStd"
 +            }),
 +            "codex",
++            None,
++            false,
 +        )
 +        .unwrap();
 +
-+        assert_ne!(saved.local_thread_id(), unsaved_thread);
++        assert_eq!(saved.local_thread_id(), unsaved_thread);
++
++        let moved_path = directory.path().join("saved-as.FCStd");
++        std::fs::write(&moved_path, b"saved-freecad-data").unwrap();
++        let saved_as = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({
++                "path": moved_path,
++                "sessionKey": "same-session",
++                "displayName": "saved-as.FCStd"
++            }),
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
++        assert_eq!(saved_as.local_thread_id(), unsaved_thread);
++    }
++
++    #[test]
++    fn creates_selects_and_lists_document_threads_with_separate_drafts() {
++        let directory = tempfile::tempdir().unwrap();
++        let database_path = directory.path().join("anthracite.db");
++        let document = json!({"sessionKey": "threaded-document", "displayName": "Untitled"});
++        let first = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
++        let first_thread = first.local_thread_id().to_owned();
++        first
++            .record("content.user", &json!({"text": "First conversation"}))
++            .unwrap();
++        first.save_draft("first draft").unwrap();
++        first.save_model_selection("gpt-first", "high").unwrap();
++        drop(first);
++
++        let second = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            true,
++        )
++        .unwrap();
++        let second_thread = second.local_thread_id().to_owned();
++        assert_ne!(second_thread, first_thread);
++        second.save_draft("second draft").unwrap();
++        assert_eq!(second.threads().unwrap().len(), 2);
++        drop(second);
++
++        let selected = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            Some(&first_thread),
++            false,
++        )
++        .unwrap();
++        assert_eq!(selected.local_thread_id(), first_thread);
++        assert_eq!(selected.draft().unwrap(), "first draft");
++        assert_eq!(
++            selected.model_selection().unwrap(),
++            json!({"model": "gpt-first", "effort": "high"})
++        );
++        assert!(
++            second_thread.starts_with("thread-"),
++            "thread IDs remain opaque and provider-independent"
++        );
 +    }
 +}

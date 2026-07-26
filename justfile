@@ -194,7 +194,7 @@ patch-new name: _require-source _require-quilt
     if [[ "$patch_name" != *.patch ]]; then
         patch_name="${patch_name}.patch"
     fi
-    if [[ "$patch_name" == /* || "$patch_name" == *..* || ! "$patch_name" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*\.patch$ ]]; then
+    if [[ "$patch_name" == /* || "$patch_name" == *..* || ! "$patch_name" =~ ^[A-Za-z][A-Za-z0-9._/-]*\.patch$ ]]; then
         printf 'Invalid patch name: %s\n' "$patch_name" >&2
         exit 1
     fi
@@ -205,6 +205,31 @@ patch-new name: _require-source _require-quilt
     fi
     mkdir -p "$(dirname "{{ patch_dir }}/$patch_name")"
     quilt new "$patch_name"
+
+# Pop the stack and apply through one existing semantic patch so it can be amended.
+patch-edit name: _require-source _require-quilt
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{ root }}/devutils/quilt-env.sh"
+    cd "{{ source_dir }}"
+    patch_name={{ quote(name) }}
+    if [[ "$patch_name" != *.patch ]]; then
+        patch_name="${patch_name}.patch"
+    fi
+    if ! awk -v target="$patch_name" \
+        '!/^[[:space:]]*(#|$)/ && $1 == target { found = 1 } END { exit !found }' \
+        "{{ series_file }}"; then
+        printf 'Patch is not in the series: %s\n' "$patch_name" >&2
+        exit 1
+    fi
+    if [[ "$(quilt top 2>/dev/null || true)" == "$patch_name" ]]; then
+        printf 'Patch is already current: %s\n' "$patch_name"
+        exit 0
+    fi
+    if quilt top >/dev/null 2>&1; then
+        quilt pop -a
+    fi
+    quilt push "$patch_name"
 
 # Add one source path to the current topmost patch before editing it.
 patch-add path: _require-source _require-quilt
@@ -220,6 +245,11 @@ patch-add path: _require-source _require-quilt
     if [[ "$source_path" == /* || "$source_path" == .. || "$source_path" == ../* || "$source_path" == */../* ]]; then
         printf 'Path must be relative to build/src: %s\n' "$source_path" >&2
         exit 1
+    fi
+    if quilt files |
+        awk -v target="$source_path" '$0 == target { found = 1 } END { exit !found }'; then
+        printf 'Path is already owned by %s: %s\n' "$(quilt top)" "$source_path"
+        exit 0
     fi
     quilt add "$source_path"
 
