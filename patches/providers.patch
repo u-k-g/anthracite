@@ -1,6 +1,3 @@
-diff --git a/src/Mod/Anthracite/Runtime/src/providers/codex.rs b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
-new file mode 100644
-index 0000000000..989f18d2c8
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
 @@ -0,0 +1,970 @@
@@ -974,9 +971,6 @@ index 0000000000..989f18d2c8
 +        );
 +    }
 +}
-diff --git a/src/Mod/Anthracite/Runtime/src/providers/mod.rs b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
-new file mode 100644
-index 0000000000..296aea425e
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
 @@ -0,0 +1,58 @@
@@ -1038,18 +1032,16 @@ index 0000000000..296aea425e
 +        _ => Err(format!("Unsupported provider adapter: {kind}")),
 +    }
 +}
-diff --git a/src/Mod/Anthracite/Runtime/src/providers/opencode.rs b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-new file mode 100644
-index 0000000000..cf5ede17b0
 --- /dev/null
 +++ b/src/Mod/Anthracite/Runtime/src/providers/opencode.rs
-@@ -0,0 +1,840 @@
+@@ -0,0 +1,868 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +use super::ProviderAdapter;
 +use crate::process::{ChildProcess, IoEvent, McpBridge};
 +use crate::protocol::Emitter;
 +use crate::store::Store;
++use base64::{Engine as _, engine::general_purpose::STANDARD};
 +use serde_json::{Value, json};
 +use std::collections::HashMap;
 +use std::io::{BufRead, BufReader};
@@ -1066,6 +1058,7 @@ index 0000000000..cf5ede17b0
 +pub struct OpenCodeAdapter {
 +    _process: ChildProcess,
 +    base_url: String,
++    server_password: String,
 +    session_id: String,
 +    active_turn: bool,
 +    next_tool_id: u64,
@@ -1086,21 +1079,16 @@ index 0000000000..cf5ede17b0
 +    ) -> Result<Self, String> {
 +        let port = available_port()?;
 +        let port_text = port.to_string();
++        let server_password = uuid::Uuid::new_v4().to_string();
 +        let process = ChildProcess::start(
 +            binary,
-+            &[
-+                "serve",
-+                "--hostname",
-+                "127.0.0.1",
-+                "--port",
-+                &port_text,
-+                "--print-logs",
-+            ],
++            &["serve", "--hostname", "127.0.0.1", "--port", &port_text],
 +            cwd,
++            &[("OPENCODE_SERVER_PASSWORD", server_password.as_str())],
 +            sender,
 +        )?;
 +        let base_url = format!("http://127.0.0.1:{port}");
-+        wait_until_ready(&base_url)?;
++        wait_until_ready(&base_url, &server_password)?;
 +
 +        let bridge = McpBridge::start(sender)?;
 +        let executable = std::env::current_exe()
@@ -1120,18 +1108,19 @@ index 0000000000..cf5ede17b0
 +                    "timeout": 120000
 +                }
 +            }),
++            &server_password,
 +        )?;
 +
 +        let emitter = Emitter::new(store);
 +        let resume_id = emitter.provider_thread_id()?;
 +        let session = match resume_id {
-+            Some(id) => match get_json(&base_url, &format!("/session/{id}")) {
++            Some(id) => match get_json(&base_url, &format!("/session/{id}"), &server_password) {
 +                Ok(session) if session.get("id").and_then(Value::as_str) == Some(id.as_str()) => {
 +                    session
 +                }
-+                Ok(_) | Err(_) => create_session(&base_url)?,
++                Ok(_) | Err(_) => create_session(&base_url, &server_password)?,
 +            },
-+            None => create_session(&base_url)?,
++            None => create_session(&base_url, &server_password)?,
 +        };
 +        let session_id = session
 +            .get("id")
@@ -1140,8 +1129,8 @@ index 0000000000..cf5ede17b0
 +            .to_string();
 +        emitter.set_provider_thread_id(&session_id);
 +
-+        spawn_event_reader(&base_url, sender);
-+        let catalog = get_json(&base_url, "/provider")?;
++        spawn_event_reader(&base_url, &server_password, sender);
++        let catalog = get_json(&base_url, "/provider", &server_password)?;
 +        emitter.emit(
 +            "model.catalog",
 +            json!({
@@ -1167,6 +1156,7 @@ index 0000000000..cf5ede17b0
 +        Ok(Self {
 +            _process: process,
 +            base_url,
++            server_password,
 +            session_id,
 +            active_turn: false,
 +            next_tool_id: 1,
@@ -1349,6 +1339,7 @@ index 0000000000..cf5ede17b0
 +            &self.base_url,
 +            &format!("/session/{}/prompt_async", self.session_id),
 +            &body,
++            &self.server_password,
 +        )?;
 +        self.active_turn = true;
 +        self.emitter
@@ -1406,6 +1397,7 @@ index 0000000000..cf5ede17b0
 +            &self.base_url,
 +            &format!("/permission/{request_id}/reply"),
 +            &json!({"reply": reply}),
++            &self.server_password,
 +        )?;
 +        self.emitter.emit(
 +            "request.resolved",
@@ -1432,6 +1424,7 @@ index 0000000000..cf5ede17b0
 +            &self.base_url,
 +            &format!("/question/{request_id}/reply"),
 +            &json!({"answers": answers}),
++            &self.server_password,
 +        )?;
 +        self.emitter.emit(
 +            "user_input.resolved",
@@ -1453,6 +1446,7 @@ index 0000000000..cf5ede17b0
 +            &self.base_url,
 +            &format!("/session/{}/abort", self.session_id),
 +            &json!({}),
++            &self.server_password,
 +        )?;
 +        self.active_turn = false;
 +        Ok(())
@@ -1693,10 +1687,17 @@ index 0000000000..cf5ede17b0
 +        .map_err(|error| format!("Could not inspect the OpenCode server port: {error}"))
 +}
 +
-+fn wait_until_ready(base_url: &str) -> Result<(), String> {
++fn authorization_header(server_password: &str) -> String {
++    format!(
++        "Basic {}",
++        STANDARD.encode(format!("opencode:{server_password}"))
++    )
++}
++
++fn wait_until_ready(base_url: &str, server_password: &str) -> Result<(), String> {
 +    let started = Instant::now();
 +    while started.elapsed() < Duration::from_secs(30) {
-+        if get_json(base_url, "/global/health").is_ok() {
++        if get_json(base_url, "/global/health", server_password).is_ok() {
 +            return Ok(());
 +        }
 +        thread::sleep(Duration::from_millis(100));
@@ -1704,16 +1705,18 @@ index 0000000000..cf5ede17b0
 +    Err("OpenCode server did not become ready within 30 seconds.".to_string())
 +}
 +
-+fn create_session(base_url: &str) -> Result<Value, String> {
++fn create_session(base_url: &str, server_password: &str) -> Result<Value, String> {
 +    post_json(
 +        base_url,
 +        "/session",
 +        &json!({"title": "Anthracite FreeCAD"}),
++        server_password,
 +    )
 +}
 +
-+fn get_json(base_url: &str, path: &str) -> Result<Value, String> {
++fn get_json(base_url: &str, path: &str, server_password: &str) -> Result<Value, String> {
 +    let mut response = ureq::get(format!("{base_url}{path}"))
++        .header("Authorization", authorization_header(server_password))
 +        .call()
 +        .map_err(|error| format!("OpenCode GET {path} failed: {error}"))?;
 +    response
@@ -1722,8 +1725,14 @@ index 0000000000..cf5ede17b0
 +        .map_err(|error| format!("OpenCode GET {path} returned invalid JSON: {error}"))
 +}
 +
-+fn post_json(base_url: &str, path: &str, body: &Value) -> Result<Value, String> {
++fn post_json(
++    base_url: &str,
++    path: &str,
++    body: &Value,
++    server_password: &str,
++) -> Result<Value, String> {
 +    let mut response = ureq::post(format!("{base_url}{path}"))
++        .header("Authorization", authorization_header(server_password))
 +        .send_json(body)
 +        .map_err(|error| format!("OpenCode POST {path} failed: {error}"))?;
 +    if response.status().as_u16() == 204 {
@@ -1735,11 +1744,13 @@ index 0000000000..cf5ede17b0
 +        .map_err(|error| format!("OpenCode POST {path} returned invalid JSON: {error}"))
 +}
 +
-+fn spawn_event_reader(base_url: &str, sender: &mpsc::Sender<IoEvent>) {
++fn spawn_event_reader(base_url: &str, server_password: &str, sender: &mpsc::Sender<IoEvent>) {
 +    let base_url = base_url.to_string();
++    let authorization = authorization_header(server_password);
 +    let sender = sender.clone();
 +    thread::spawn(move || {
 +        let result = ureq::get(format!("{base_url}/event"))
++            .header("Authorization", authorization)
 +            .header("Accept", "text/event-stream")
 +            .call();
 +        let Ok(response) = result else {
@@ -1843,6 +1854,14 @@ index 0000000000..cf5ede17b0
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    #[test]
++    fn authenticates_local_opencode_requests() {
++        assert_eq!(
++            authorization_header("secret-password"),
++            "Basic b3BlbmNvZGU6c2VjcmV0LXBhc3N3b3Jk"
++        );
++    }
 +
 +    #[test]
 +    fn normalizes_only_connected_opencode_models() {

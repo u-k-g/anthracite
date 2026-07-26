@@ -40,7 +40,39 @@ run: build
     mkdir -p "{{ profile_dir }}"
     export FREECAD_USER_HOME="{{ profile_dir }}"
     export QSG_RHI_BACKEND="opengl"
-    exec "$executable"
+
+    supervise_app() (
+        set +m
+        app_pid=""
+        stop_requested=0
+        stop_app() {
+            stop_requested=1
+            if [[ -n "$app_pid" ]] && kill -0 "$app_pid" 2>/dev/null; then
+                kill -TERM "$app_pid" 2>/dev/null || true
+            fi
+        }
+
+        # Keep terminal SIGINT out of FreeCAD's embedded Python, then translate
+        # it into a normal process termination from this development launcher.
+        trap '' INT
+        "$executable" &
+        app_pid=$!
+        trap stop_app INT TERM
+
+        status=0
+        wait "$app_pid" || status=$?
+        if (( stop_requested != 0 )); then
+            wait "$app_pid" 2>/dev/null || true
+            exit 0
+        fi
+        exit "$status"
+    )
+
+    # Give the supervisor its own foreground process group so Ctrl-C reaches it
+    # without also interrupting `just`.
+    set -m
+    supervise_app &
+    fg %1 >/dev/null
 
 # Check that the local machine has the workflow dependencies.
 doctor:
