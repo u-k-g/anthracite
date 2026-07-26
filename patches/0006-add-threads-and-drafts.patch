@@ -1,0 +1,979 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -63,6 +63,9 @@ AgentBridge::AgentBridge(SidebarControll
+     connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
+     connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
+     connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
++    connect(sidebar, &SidebarController::newThreadRequested, this, &AgentBridge::newThread);
++    connect(sidebar, &SidebarController::threadSelected, this, &AgentBridge::selectThread);
++    connect(sidebar, &SidebarController::draftEdited, this, &AgentBridge::draftEdited);
+     connect(sidebar, &SidebarController::approvalResponded, this, &AgentBridge::respondToApproval);
+     connect(sidebar, &SidebarController::userInputResponded, this, &AgentBridge::respondToUserInput);
+     connect(&runtime, &QProcess::started, this, &AgentBridge::processStarted);
+@@ -75,6 +78,15 @@ AgentBridge::AgentBridge(SidebarControll
+         this,
+         &AgentBridge::processFinished
+     );
++    draftTimer.setSingleShot(true);
++    draftTimer.setInterval(250);
++    connect(&draftTimer, &QTimer::timeout, this, &AgentBridge::persistDraft);
++
++    QTimer::singleShot(0, this, [this]() {
++        if (!codexPath().isEmpty() && QFileInfo::exists(runtimePath())) {
++            ensureRuntime();
++        }
++    });
+ }
+ 
+ void AgentBridge::submit(const QString& prompt)
+@@ -114,10 +126,35 @@ void AgentBridge::chooseProvider()
+     sidebar->appendActivity(tr("Codex executable set to %1").arg(selected));
+ 
+     if (runtime.state() != QProcess::NotRunning) {
++        stopping = true;
+         runtime.kill();
+         runtime.waitForFinished(1000);
++        stopping = false;
+     }
+     runtimeReady = false;
++    ensureRuntime();
++}
++
++void AgentBridge::newThread()
++{
++    restartSession(QString(), true);
++}
++
++void AgentBridge::selectThread(const QString& threadId)
++{
++    restartSession(threadId, false);
++}
++
++void AgentBridge::draftEdited(const QString& body)
++{
++    pendingDraft = body;
++    draftDirty = true;
++    draftTimer.start();
++}
++
++void AgentBridge::persistDraft()
++{
++    persistDraftNow();
+ }
+ 
+ void AgentBridge::respondToApproval(const QString& requestId, const QString& decision)
+@@ -139,21 +176,24 @@ void AgentBridge::respondToUserInput(con
+ void AgentBridge::processStarted()
+ {
+     sidebar->updateStatus(tr("Connecting"));
+-    send(
+-        QStringLiteral("session.start"),
++    QJsonObject session {
+         {
+-            {
+-                "provider",
+-                QJsonObject {
+-                    {"kind", "codex"},
+-                    {"binary", codexPath()},
+-                },
++            "provider",
++            QJsonObject {
++                {"kind", "codex"},
++                {"binary", codexPath()},
+             },
+-            {"cwd", workingDirectory()},
+-            {"storagePath", databasePath()},
+-            {"document", documentContext()},
+-        }
+-    );
++        },
++        {"cwd", workingDirectory()},
++        {"storagePath", databasePath()},
++        {"document", documentContext()},
++        {"createThread", createNewThread},
++    };
++    if (!selectedLocalThreadId.isEmpty()) {
++        session.insert(QStringLiteral("localThreadId"), selectedLocalThreadId);
++    }
++    send(QStringLiteral("session.start"), session);
++    createNewThread = false;
+ }
+ 
+ void AgentBridge::readStandardOutput()
+@@ -232,6 +272,51 @@ void AgentBridge::ensureRuntime()
+     runtime.start();
+ }
+ 
++void AgentBridge::restartSession(const QString& threadId, bool createThread)
++{
++    draftTimer.stop();
++    if (draftDirty && runtimeReady) {
++        restartPending = true;
++        pendingRestartThreadId = threadId;
++        pendingRestartCreateThread = createThread;
++        pendingRestartSaveId = persistDraftNow();
++        return;
++    }
++    performSessionRestart(threadId, createThread);
++}
++
++void AgentBridge::performSessionRestart(const QString& threadId, bool createThread)
++{
++    restartPending = false;
++    pendingRestartSaveId = 0;
++    selectedLocalThreadId = threadId;
++    createNewThread = createThread;
++    assistantMessageStarted = false;
++    documentRevision.reset();
++    standardOutputBuffer.clear();
++    sidebar->clearInteraction();
++
++    if (runtime.state() != QProcess::NotRunning) {
++        stopping = true;
++        runtime.kill();
++        runtime.waitForFinished(1000);
++        stopping = false;
++    }
++    runtimeReady = false;
++    ensureRuntime();
++}
++
++qint64 AgentBridge::persistDraftNow()
++{
++    if (!draftDirty || !runtimeReady) {
++        return 0;
++    }
++    const qint64 saveId = nextDraftSaveId++;
++    send(QStringLiteral("draft.save"), {{"body", pendingDraft}, {"saveId", saveId}});
++    draftDirty = false;
++    return saveId;
++}
++
+ void AgentBridge::send(const QString& type, const QJsonObject& payload)
+ {
+     if (runtime.state() == QProcess::NotRunning) {
+@@ -250,32 +335,52 @@ void AgentBridge::handleMessage(const QJ
+ {
+     const QString type = message.value("type").toString();
+     const QJsonObject payload = message.value("payload").toObject();
+-    if (type == QLatin1String("history.snapshot")) {
++    if (type == QLatin1String("thread.local.ready")) {
++        selectedLocalThreadId = payload.value("localThreadId").toString();
++    }
++    else if (type == QLatin1String("thread.list")) {
++        sidebar->updateThreads(
++            payload.value("currentThreadId").toString(),
++            payload.value("threads").toArray().toVariantList()
++        );
++    }
++    else if (type == QLatin1String("history.snapshot")) {
+         const QJsonArray events = payload.value("events").toArray();
+-        if (!events.isEmpty()) {
+-            sidebar->resetHistory();
+-            assistantMessageStarted = false;
+-            for (const auto& value : events) {
+-                const QJsonObject event = value.toObject();
+-                if (event.value("type").toString() == QLatin1String("content.user")) {
+-                    sidebar->appendUserMessage(
+-                        event.value("payload").toObject().value("text").toString()
+-                    );
+-                    assistantMessageStarted = false;
+-                }
+-                else {
+-                    handleMessage(event);
+-                }
++        sidebar->resetHistory();
++        assistantMessageStarted = false;
++        for (const auto& value : events) {
++            const QJsonObject event = value.toObject();
++            if (event.value("type").toString() == QLatin1String("content.user")) {
++                sidebar->appendUserMessage(event.value("payload").toObject().value("text").toString());
++                assistantMessageStarted = false;
+             }
+-            if (!queuedPrompt.isEmpty()) {
+-                sidebar->appendUserMessage(queuedPrompt);
++            else {
++                handleMessage(event);
+             }
+         }
++        if (events.isEmpty()) {
++            sidebar->showWelcome();
++        }
++        if (!queuedPrompt.isEmpty()) {
++            sidebar->appendUserMessage(queuedPrompt);
++        }
++    }
++    else if (type == QLatin1String("draft.loaded")) {
++        pendingDraft = payload.value("body").toString();
++        draftDirty = false;
++        sidebar->loadDraft(pendingDraft);
++    }
++    else if (type == QLatin1String("draft.saved")) {
++        const qint64 saveId = payload.value("saveId").toInteger();
++        if (restartPending && saveId == pendingRestartSaveId) {
++            performSessionRestart(pendingRestartThreadId, pendingRestartCreateThread);
++        }
+     }
+     else if (type == QLatin1String("runtime.ready")) {
+         runtimeReady = true;
+         sidebar->appendActivity(tr("Codex connected"));
+-        sidebar->updateStatus(tr("Thinking"));
++        sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
++        persistDraft();
+         if (!queuedPrompt.isEmpty()) {
+             send(QStringLiteral("turn.start"), {{"prompt", queuedPrompt}});
+             queuedPrompt.clear();
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -7,6 +7,7 @@
+ #include <QJsonObject>
+ #include <QObject>
+ #include <QProcess>
++#include <QTimer>
+ #include <QVariantMap>
+ 
+ #include <optional>
+@@ -27,6 +28,10 @@ private Q_SLOTS:
+     void submit(const QString& prompt);
+     void stop();
+     void chooseProvider();
++    void newThread();
++    void selectThread(const QString& threadId);
++    void draftEdited(const QString& body);
++    void persistDraft();
+     void respondToApproval(const QString& requestId, const QString& decision);
+     void respondToUserInput(const QString& requestId, const QVariantMap& answers);
+     void processStarted();
+@@ -37,6 +42,9 @@ private Q_SLOTS:
+ 
+ private:
+     void ensureRuntime();
++    void restartSession(const QString& threadId, bool createThread);
++    void performSessionRestart(const QString& threadId, bool createThread);
++    qint64 persistDraftNow();
+     void send(const QString& type, const QJsonObject& payload = {});
+     void handleMessage(const QJsonObject& message);
+     void runFreeCADTool(const QJsonObject& payload);
+@@ -55,8 +63,18 @@ private:
+     bool runtimeReady = false;
+     bool assistantMessageStarted = false;
+     bool stopping = false;
++    bool createNewThread = false;
++    bool draftDirty = false;
++    bool restartPending = false;
+     QString unsavedDocumentName;
+     QString unsavedDocumentKey;
++    QString selectedLocalThreadId;
++    QString pendingDraft;
++    QString pendingRestartThreadId;
++    bool pendingRestartCreateThread = false;
++    qint64 nextDraftSaveId = 1;
++    qint64 pendingRestartSaveId = 0;
++    QTimer draftTimer;
+     std::optional<int> documentRevision;
+ };
+ }  // namespace AnthraciteGui
+--- a/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
++++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+@@ -24,39 +24,82 @@ Pane {
+ 
+         Rectangle {
+             Layout.fillWidth: true
+-            Layout.preferredHeight: 52
++            Layout.preferredHeight: 78
+             color: systemPalette.window
+ 
+-            RowLayout {
++            ColumnLayout {
+                 anchors.fill: parent
+                 anchors.leftMargin: 14
+                 anchors.rightMargin: 14
++                anchors.topMargin: 8
++                anchors.bottomMargin: 8
++                spacing: 4
++
++                RowLayout {
++                    Layout.fillWidth: true
+ 
+-                Label {
+-                    text: qsTr("Anthracite")
+-                    font.pixelSize: 16
+-                    font.weight: Font.DemiBold
+-                    color: systemPalette.windowText
++                    Label {
++                        text: qsTr("Anthracite")
++                        font.pixelSize: 16
++                        font.weight: Font.DemiBold
++                        color: systemPalette.windowText
++                    }
++
++                    Item {
++                        Layout.fillWidth: true
++                    }
++
++                    Rectangle {
++                        implicitWidth: statusLabel.implicitWidth + 16
++                        implicitHeight: 24
++                        radius: 12
++                        color: anthraciteController.busy
++                               ? Qt.rgba(0.30, 0.52, 0.95, 0.18)
++                               : Qt.rgba(0.50, 0.50, 0.50, 0.14)
++
++                        Label {
++                            id: statusLabel
++                            anchors.centerIn: parent
++                            text: anthraciteController.status
++                            font.pixelSize: 11
++                            color: systemPalette.windowText
++                        }
++                    }
+                 }
+ 
+-                Item {
++                RowLayout {
+                     Layout.fillWidth: true
+-                }
+ 
+-                Rectangle {
+-                    implicitWidth: statusLabel.implicitWidth + 16
+-                    implicitHeight: 24
+-                    radius: 12
+-                    color: anthraciteController.busy
+-                           ? Qt.rgba(0.30, 0.52, 0.95, 0.18)
+-                           : Qt.rgba(0.50, 0.50, 0.50, 0.14)
++                    ComboBox {
++                        id: threadPicker
++                        objectName: "AnthraciteThreadPicker"
++                        Layout.fillWidth: true
++                        model: anthraciteController.threads
++                        textRole: "title"
++                        enabled: !anthraciteController.busy && count > 0
++
++                        currentIndex: {
++                            for (let index = 0; index < count; ++index) {
++                                if (model[index].id === anthraciteController.currentThreadId) {
++                                    return index
++                                }
++                            }
++                            return count > 0 ? 0 : -1
++                        }
+ 
+-                    Label {
+-                        id: statusLabel
+-                        anchors.centerIn: parent
+-                        text: anthraciteController.status
+-                        font.pixelSize: 11
+-                        color: systemPalette.windowText
++                        onActivated: function(index) {
++                            anthraciteController.selectThread(model[index].id)
++                        }
++                    }
++
++                    ToolButton {
++                        id: newThreadButton
++                        objectName: "AnthraciteNewThread"
++                        text: "+"
++                        enabled: !anthraciteController.busy
++                        ToolTip.visible: hovered
++                        ToolTip.text: qsTr("New conversation")
++                        onClicked: anthraciteController.newThread()
+                     }
+                 }
+             }
+@@ -298,11 +341,13 @@ Pane {
+ 
+                 TextArea {
+                     id: composer
++                    objectName: "AnthraciteComposer"
+                     Layout.fillWidth: true
+                     Layout.preferredHeight: Math.max(70, Math.min(140, implicitHeight))
+                     placeholderText: qsTr("Describe what you want to make or change…")
+                     wrapMode: TextEdit.Wrap
+                     enabled: !anthraciteController.busy
++                    onTextChanged: anthraciteController.setDraft(text)
+ 
+                     Keys.onPressed: function(event) {
+                         if ((event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))
+@@ -312,6 +357,16 @@ Pane {
+                         }
+                     }
+                 }
++
++                Connections {
++                    target: anthraciteController
++
++                    function onDraftChanged() {
++                        if (composer.text !== anthraciteController.draft) {
++                            composer.text = anthraciteController.draft
++                        }
++                    }
++                }
+ 
+                 RowLayout {
+                     Layout.fillWidth: true
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -24,6 +24,11 @@ SidebarController::SidebarController(QOb
+     , conversation(this)
+     , currentStatus(QStringLiteral("Ready"))
+ {
++    showWelcome();
++}
++
++void SidebarController::showWelcome()
++{
+     conversation.append(
+         QStringLiteral("Anthracite"),
+         QStringLiteral("Connect an existing agent and describe what you want to make in FreeCAD."),
+@@ -90,6 +95,21 @@ bool SidebarController::inputComplete()
+     return true;
+ }
+ 
++QVariantList SidebarController::threads() const
++{
++    return availableThreads;
++}
++
++QString SidebarController::currentThreadId() const
++{
++    return activeThreadId;
++}
++
++QString SidebarController::draft() const
++{
++    return currentDraft;
++}
++
+ void SidebarController::submit(const QString& prompt)
+ {
+     const QString text = prompt.trimmed();
+@@ -100,6 +120,11 @@ void SidebarController::submit(const QSt
+     conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
+     conversation.beginTurn();
+     clearInteraction();
++    if (!currentDraft.isEmpty()) {
++        currentDraft.clear();
++        Q_EMIT draftChanged();
++        Q_EMIT draftEdited(currentDraft);
++    }
+     setBusy(true);
+     setStatus(QStringLiteral("Starting agent"));
+     Q_EMIT promptSubmitted(text);
+@@ -118,6 +143,30 @@ void SidebarController::chooseProvider()
+     Q_EMIT chooseProviderRequested();
+ }
+ 
++void SidebarController::newThread()
++{
++    if (!turnBusy) {
++        Q_EMIT newThreadRequested();
++    }
++}
++
++void SidebarController::selectThread(const QString& threadId)
++{
++    if (!turnBusy && !threadId.isEmpty() && threadId != activeThreadId) {
++        Q_EMIT threadSelected(threadId);
++    }
++}
++
++void SidebarController::setDraft(const QString& body)
++{
++    if (currentDraft == body) {
++        return;
++    }
++    currentDraft = body;
++    Q_EMIT draftChanged();
++    Q_EMIT draftEdited(currentDraft);
++}
++
+ void SidebarController::respondToApproval(const QString& decision)
+ {
+     if (pendingInteractionKind != QLatin1String("approval") || pendingRequestId.isEmpty()) {
+@@ -275,6 +324,22 @@ void SidebarController::updateStatus(con
+     setStatus(status);
+ }
+ 
++void SidebarController::updateThreads(const QString& currentThreadId, const QVariantList& threads)
++{
++    activeThreadId = currentThreadId;
++    availableThreads = threads;
++    Q_EMIT threadsChanged();
++}
++
++void SidebarController::loadDraft(const QString& body)
++{
++    if (currentDraft == body) {
++        return;
++    }
++    currentDraft = body;
++    Q_EMIT draftChanged();
++}
++
+ void SidebarController::setStatus(QString status)
+ {
+     if (currentStatus == status) {
+--- a/src/Mod/Anthracite/Gui/Sidebar.h
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -29,6 +29,9 @@ class SidebarController: public QObject
+     Q_PROPERTY(bool interactionAllowSession READ interactionAllowSession NOTIFY interactionChanged)
+     Q_PROPERTY(QVariantList interactionQuestions READ interactionQuestions NOTIFY interactionChanged)
+     Q_PROPERTY(bool inputComplete READ inputComplete NOTIFY interactionChanged)
++    Q_PROPERTY(QVariantList threads READ threads NOTIFY threadsChanged)
++    Q_PROPERTY(QString currentThreadId READ currentThreadId NOTIFY threadsChanged)
++    Q_PROPERTY(QString draft READ draft NOTIFY draftChanged)
+ 
+ public:
+     explicit SidebarController(QObject* parent = nullptr);
+@@ -43,10 +46,16 @@ public:
+     bool interactionAllowSession() const;
+     QVariantList interactionQuestions() const;
+     bool inputComplete() const;
++    QVariantList threads() const;
++    QString currentThreadId() const;
++    QString draft() const;
+ 
+     Q_INVOKABLE void submit(const QString& prompt);
+     Q_INVOKABLE void stop();
+     Q_INVOKABLE void chooseProvider();
++    Q_INVOKABLE void newThread();
++    Q_INVOKABLE void selectThread(const QString& threadId);
++    Q_INVOKABLE void setDraft(const QString& body);
+     Q_INVOKABLE void respondToApproval(const QString& decision);
+     Q_INVOKABLE void setInputAnswer(const QString& questionId, const QString& answer);
+     Q_INVOKABLE QString inputAnswer(const QString& questionId) const;
+@@ -54,6 +63,7 @@ public:
+ 
+     void appendActivity(const QString& text);
+     void resetHistory();
++    void showWelcome();
+     void appendUserMessage(const QString& text);
+     void beginAssistantMessage();
+     void appendAssistantDelta(const QString& delta);
+@@ -69,16 +79,23 @@ public:
+     void completeTurn();
+     void failTurn(const QString& error);
+     void updateStatus(const QString& status);
++    void updateThreads(const QString& currentThreadId, const QVariantList& threads);
++    void loadDraft(const QString& body);
+ 
+ Q_SIGNALS:
+     void promptSubmitted(const QString& prompt);
+     void stopRequested();
+     void chooseProviderRequested();
++    void newThreadRequested();
++    void threadSelected(const QString& threadId);
++    void draftEdited(const QString& body);
+     void approvalResponded(const QString& requestId, const QString& decision);
+     void userInputResponded(const QString& requestId, const QVariantMap& answers);
+     void statusChanged();
+     void busyChanged();
+     void interactionChanged();
++    void threadsChanged();
++    void draftChanged();
+ 
+ private:
+     void setStatus(QString status);
+@@ -92,6 +109,9 @@ private:
+     QString pendingInteractionDetail;
+     QVariantList pendingQuestions;
+     QVariantMap pendingAnswers;
++    QVariantList availableThreads;
++    QString activeThreadId;
++    QString currentDraft;
+     bool pendingAllowSession = false;
+     bool turnBusy = false;
+ };
+--- a/src/Mod/Anthracite/Runtime/src/main.rs
++++ b/src/Mod/Anthracite/Runtime/src/main.rs
+@@ -50,6 +50,11 @@ fn handle_host_message(
+                 database_path,
+                 payload.get("document").unwrap_or(&Value::Null),
+                 kind,
++                payload.get("localThreadId").and_then(Value::as_str),
++                payload
++                    .get("createThread")
++                    .and_then(Value::as_bool)
++                    .unwrap_or(false),
+             )
+             .and_then(|store| providers::start(kind, binary, cwd, sender, store))
+             .map(|started| *provider = Some(started))
+@@ -100,6 +105,15 @@ fn handle_host_message(
+                     payload.get("answers").unwrap_or(&Value::Null),
+                 )
+             }),
++        "draft.save" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .map(|provider| {
++                provider.save_draft(
++                    payload.get("body").and_then(Value::as_str).unwrap_or(""),
++                    payload.get("saveId").unwrap_or(&Value::Null),
++                );
++            }),
+         "turn.interrupt" => provider
+             .as_mut()
+             .ok_or_else(|| "Provider is not running.".to_string())
+--- a/src/Mod/Anthracite/Runtime/src/protocol.rs
++++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
+@@ -48,10 +48,15 @@ impl Emitter {
+     pub fn new(store: Store) -> Self {
+         let emitter = Self { store };
+         emit_raw("thread.local.ready", emitter.store.summary());
++        emitter.emit_thread_list();
+         match emitter.store.history() {
+             Ok(events) => emit_raw("history.snapshot", json!({"events": events})),
+             Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
+         }
++        match emitter.store.draft() {
++            Ok(body) => emit_raw("draft.loaded", json!({"body": body})),
++            Err(error) => emit_warning(format!("Could not load composer draft: {error}")),
++        }
+         emitter
+     }
+ 
+@@ -66,6 +71,9 @@ impl Emitter {
+         if let Err(error) = self.store.record(message_type, payload) {
+             emit_warning(format!("Could not persist runtime event: {error}"));
+         }
++        if message_type == "content.user" {
++            self.emit_thread_list();
++        }
+     }
+ 
+     pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
+@@ -77,6 +85,26 @@ impl Emitter {
+             emit_warning(format!("Could not persist provider thread id: {error}"));
+         }
+     }
++
++    pub fn save_draft(&self, body: &str, save_id: &Value) {
++        match self.store.save_draft(body) {
++            Ok(()) => emit_raw("draft.saved", json!({"saveId": save_id})),
++            Err(error) => emit_warning(format!("Could not persist composer draft: {error}")),
++        }
++    }
++
++    fn emit_thread_list(&self) {
++        match self.store.threads() {
++            Ok(threads) => emit_raw(
++                "thread.list",
++                json!({
++                    "currentThreadId": self.store.local_thread_id(),
++                    "threads": threads
++                }),
++            ),
++            Err(error) => emit_warning(format!("Could not list conversations: {error}")),
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+--- a/src/Mod/Anthracite/Runtime/src/providers/codex.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+@@ -617,6 +617,10 @@ impl ProviderAdapter for CodexAdapter {
+         Ok(())
+     }
+ 
++    fn save_draft(&mut self, body: &str, save_id: &Value) {
++        self.emitter.save_draft(body, save_id);
++    }
++
+     fn interrupt(&mut self) -> Result<(), String> {
+         if let (Some(thread_id), Some(turn_id)) = (self.thread_id.clone(), self.turn_id.clone()) {
+             self.request(
+--- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -17,6 +17,7 @@ pub trait ProviderAdapter {
+     ) -> Result<(), String>;
+     fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String>;
+     fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String>;
++    fn save_draft(&mut self, body: &str, save_id: &Value);
+     fn interrupt(&mut self) -> Result<(), String>;
+     fn handle_message(&mut self, message: Value) -> Result<(), String>;
+ }
+--- a/src/Mod/Anthracite/Runtime/src/store.rs
++++ b/src/Mod/Anthracite/Runtime/src/store.rs
+@@ -112,7 +112,13 @@ pub struct Store {
+ }
+ 
+ impl Store {
+-    pub fn open(database_path: &str, document: &Value, provider: &str) -> Result<Self, String> {
++    pub fn open(
++        database_path: &str,
++        document: &Value,
++        provider: &str,
++        requested_thread_id: Option<&str>,
++        create_thread: bool,
++    ) -> Result<Self, String> {
+         let path = PathBuf::from(database_path);
+         if let Some(parent) = path.parent() {
+             std::fs::create_dir_all(parent).map_err(|error| {
+@@ -144,7 +150,7 @@ impl Store {
+             provider: provider.to_owned(),
+         };
+         store.document_id = store.resolve_document(document)?;
+-        store.thread_id = store.resolve_thread()?;
++        store.thread_id = store.resolve_thread(requested_thread_id, create_thread)?;
+         Ok(store)
+     }
+ 
+@@ -267,16 +273,42 @@ impl Store {
+         Ok(id)
+     }
+ 
+-    fn resolve_thread(&self) -> Result<String, String> {
+-        if let Some(id) = self.query_string(
+-            "SELECT id
+-             FROM threads
+-             WHERE document_id = ?1 AND provider = ?2 AND archived = 0
+-             ORDER BY updated_at_ms DESC
+-             LIMIT 1",
+-            params![self.document_id.clone(), self.provider.clone()],
+-        )? {
+-            return Ok(id);
++    fn resolve_thread(
++        &self,
++        requested_thread_id: Option<&str>,
++        create_thread: bool,
++    ) -> Result<String, String> {
++        if !create_thread {
++            if let Some(requested_thread_id) = requested_thread_id.filter(|value| !value.is_empty())
++            {
++                return self
++                    .query_string(
++                        "SELECT id
++                         FROM threads
++                         WHERE id = ?1 AND document_id = ?2
++                           AND provider = ?3 AND archived = 0
++                         LIMIT 1",
++                        params![
++                            requested_thread_id,
++                            self.document_id.clone(),
++                            self.provider.clone()
++                        ],
++                    )?
++                    .ok_or_else(|| {
++                        "The selected conversation does not belong to this document.".to_string()
++                    });
++            }
++
++            if let Some(id) = self.query_string(
++                "SELECT id
++                 FROM threads
++                 WHERE document_id = ?1 AND provider = ?2 AND archived = 0
++                 ORDER BY updated_at_ms DESC
++                 LIMIT 1",
++                params![self.document_id.clone(), self.provider.clone()],
++            )? {
++                return Ok(id);
++            }
+         }
+ 
+         let id = new_id("thread");
+@@ -303,6 +335,34 @@ impl Store {
+         &self.thread_id
+     }
+ 
++    pub fn threads(&self) -> Result<Vec<Value>, String> {
++        self.runtime
++            .block_on(async {
++                let mut rows = self
++                    .connection
++                    .query(
++                        "SELECT id, title, updated_at_ms
++                         FROM threads
++                         WHERE document_id = ?1 AND provider = ?2 AND archived = 0
++                         ORDER BY updated_at_ms DESC",
++                        params![self.document_id.clone(), self.provider.clone()],
++                    )
++                    .await?;
++                let mut threads = Vec::new();
++                while let Some(row) = rows.next().await? {
++                    let id = row.get::<String>(0)?;
++                    threads.push(json!({
++                        "id": id,
++                        "title": row.get::<String>(1)?,
++                        "updatedAtMs": row.get::<i64>(2)?,
++                        "current": id == self.thread_id
++                    }));
++                }
++                Ok::<_, turso::Error>(threads)
++            })
++            .map_err(|error| error.to_string())
++    }
++
+     pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
+         self.query_string(
+             "SELECT provider_thread_id
+@@ -324,6 +384,38 @@ impl Store {
+         Ok(())
+     }
+ 
++    pub fn draft(&self) -> Result<String, String> {
++        Ok(self
++            .query_string(
++                "SELECT body FROM drafts WHERE thread_id = ?1 LIMIT 1",
++                params![self.thread_id.clone()],
++            )?
++            .unwrap_or_default())
++    }
++
++    pub fn save_draft(&self, body: &str) -> Result<(), String> {
++        if body.is_empty() {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "DELETE FROM drafts WHERE thread_id = ?1",
++                    params![self.thread_id.clone()],
++                ))
++                .map_err(|error| error.to_string())?;
++        } else {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "INSERT INTO drafts(thread_id, body, updated_at_ms)
++                     VALUES (?1, ?2, ?3)
++                     ON CONFLICT(thread_id) DO UPDATE SET
++                         body = excluded.body,
++                         updated_at_ms = excluded.updated_at_ms",
++                    params![self.thread_id.clone(), body, now_ms()],
++                ))
++                .map_err(|error| error.to_string())?;
++        }
++        Ok(())
++    }
++
+     pub fn record(&self, event_type: &str, payload: &Value) -> Result<(), String> {
+         let turn_id = payload
+             .get("turnId")
+@@ -428,7 +520,14 @@ mod tests {
+             "sessionKey": "not-used-for-saved-documents"
+         });
+ 
+-        let store = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        let store = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
+         let first_thread = store.local_thread_id().to_owned();
+         store
+             .record("content.user", &json!({"text": "Make a bracket"}))
+@@ -441,7 +540,14 @@ mod tests {
+             .unwrap();
+         drop(store);
+ 
+-        let reopened = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        let reopened = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
+         assert_eq!(reopened.local_thread_id(), first_thread);
+         assert_eq!(reopened.history().unwrap().len(), 2);
+         assert_eq!(
+@@ -458,6 +564,8 @@ mod tests {
+             database_path.to_str().unwrap(),
+             &json!({"sessionKey": "unsaved-one", "displayName": "Untitled"}),
+             "codex",
++            None,
++            false,
+         )
+         .unwrap();
+         let first_thread = first.local_thread_id().to_owned();
+@@ -467,6 +575,8 @@ mod tests {
+             database_path.to_str().unwrap(),
+             &json!({"sessionKey": "unsaved-two", "displayName": "Untitled"}),
+             "codex",
++            None,
++            false,
+         )
+         .unwrap();
+         assert_ne!(second.local_thread_id(), first_thread);
+@@ -480,6 +590,8 @@ mod tests {
+             database_path.to_str().unwrap(),
+             &json!({"sessionKey": "same-session", "displayName": "Untitled"}),
+             "codex",
++            None,
++            false,
+         )
+         .unwrap();
+         let unsaved_thread = unsaved.local_thread_id().to_owned();
+@@ -495,9 +607,57 @@ mod tests {
+                 "displayName": "saved.FCStd"
+             }),
+             "codex",
++            None,
++            false,
+         )
+         .unwrap();
+ 
+         assert_ne!(saved.local_thread_id(), unsaved_thread);
+     }
++
++    #[test]
++    fn creates_selects_and_lists_document_threads_with_separate_drafts() {
++        let directory = tempfile::tempdir().unwrap();
++        let database_path = directory.path().join("anthracite.db");
++        let document = json!({"sessionKey": "threaded-document", "displayName": "Untitled"});
++        let first = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
++        let first_thread = first.local_thread_id().to_owned();
++        first
++            .record("content.user", &json!({"text": "First conversation"}))
++            .unwrap();
++        first.save_draft("first draft").unwrap();
++        drop(first);
++
++        let second = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            None,
++            true,
++        )
++        .unwrap();
++        let second_thread = second.local_thread_id().to_owned();
++        assert_ne!(second_thread, first_thread);
++        second.save_draft("second draft").unwrap();
++        assert_eq!(second.threads().unwrap().len(), 2);
++        drop(second);
++
++        let selected = Store::open(
++            database_path.to_str().unwrap(),
++            &document,
++            "codex",
++            Some(&first_thread),
++            false,
++        )
++        .unwrap();
++        assert_eq!(selected.local_thread_id(), first_thread);
++        assert_eq!(selected.draft().unwrap(), "first draft");
++    }
+ }
+--- a/src/Mod/Anthracite/TestAnthraciteGui.py
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -25,6 +25,12 @@ def run_smoke_test():
+         raise AssertionError("Anthracite QML does not expose the interaction card.")
+     if root.findChild(QtCore.QObject, "AnthraciteRequestedInput") is None:
+         raise AssertionError("Anthracite QML does not expose requested-input controls.")
++    if root.findChild(QtCore.QObject, "AnthraciteThreadPicker") is None:
++        raise AssertionError("Anthracite QML does not expose the conversation picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteNewThread") is None:
++        raise AssertionError("Anthracite QML does not expose the new-conversation control.")
++    if root.findChild(QtCore.QObject, "AnthraciteComposer") is None:
++        raise AssertionError("Anthracite QML does not expose the persistent composer.")
+     print("ANTHRACITE_GUI_SMOKE_OK")
+ 
+ 

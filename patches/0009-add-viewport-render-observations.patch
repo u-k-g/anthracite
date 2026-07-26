@@ -1,0 +1,401 @@
+--- a/src/Mod/Anthracite/AnthraciteExecutor.py
++++ b/src/Mod/Anthracite/AnthraciteExecutor.py
+@@ -5,9 +5,12 @@
+ from __future__ import annotations
+ 
+ import ast
++import base64
+ import contextlib
+ import io
+ import json
++import os
++import tempfile
+ import traceback
+ from typing import Any
+ 
+@@ -21,6 +24,9 @@ except ImportError:
+ 
+ _MAX_TEXT = 12_000
+ _MAX_VALUE = 500
++_MAX_RENDER_DIMENSION = 2_048
++_MAX_RENDER_PIXELS = 4_194_304
++_MAX_RENDER_BYTES = 8_000_000
+ _revisions: dict[str, int] = {}
+ _executing_docs: set[str] = set()
+ 
+@@ -224,6 +230,88 @@ def _invalid_objects(doc: Any) -> list[d
+     return invalid
+ 
+ 
++def _render_spec(
++    width: int,
++    height: int,
++    view: str,
++    fit: bool,
++) -> dict[str, Any]:
++    width = int(width)
++    height = int(height)
++    view = str(view).lower()
++    supported_views = {
++        "current",
++        "axonometric",
++        "front",
++        "rear",
++        "left",
++        "right",
++        "top",
++        "bottom",
++    }
++    if width < 64 or height < 64:
++        raise ValueError("Render dimensions must each be at least 64 pixels.")
++    if width > _MAX_RENDER_DIMENSION or height > _MAX_RENDER_DIMENSION:
++        raise ValueError(
++            f"Render dimensions cannot exceed {_MAX_RENDER_DIMENSION} pixels."
++        )
++    if width * height > _MAX_RENDER_PIXELS:
++        raise ValueError(
++            f"Render area cannot exceed {_MAX_RENDER_PIXELS} pixels."
++        )
++    if view not in supported_views:
++        raise ValueError(
++            f"Unsupported render view {view!r}; expected one of "
++            f"{', '.join(sorted(supported_views))}."
++        )
++    return {"width": width, "height": height, "view": view, "fit": bool(fit)}
++
++
++def _render_view(spec: dict[str, Any]) -> dict[str, Any]:
++    if Gui is None or Gui.activeDocument() is None:
++        raise RuntimeError("Viewport rendering requires the FreeCAD GUI.")
++
++    active_view = Gui.activeDocument().activeView()
++    view_method = {
++        "axonometric": "viewAxonometric",
++        "front": "viewFront",
++        "rear": "viewRear",
++        "left": "viewLeft",
++        "right": "viewRight",
++        "top": "viewTop",
++        "bottom": "viewBottom",
++    }.get(spec["view"])
++    if view_method is not None:
++        getattr(active_view, view_method)()
++    if spec["fit"]:
++        active_view.fitAll()
++
++    descriptor, path = tempfile.mkstemp(prefix="anthracite-view-", suffix=".png")
++    os.close(descriptor)
++    try:
++        active_view.saveImage(path, spec["width"], spec["height"], "Current")
++        with open(path, "rb") as image_file:
++            image = image_file.read(_MAX_RENDER_BYTES + 1)
++    finally:
++        try:
++            os.unlink(path)
++        except FileNotFoundError:
++            pass
++
++    if not image:
++        raise RuntimeError("FreeCAD did not produce a viewport image.")
++    if len(image) > _MAX_RENDER_BYTES:
++        raise RuntimeError(
++            f"Viewport image exceeded the {_MAX_RENDER_BYTES}-byte limit."
++        )
++    return {
++        **spec,
++        "mimeType": "image/png",
++        "dataUrl": "data:image/png;base64,"
++        + base64.b64encode(image).decode("ascii"),
++    }
++
++
+ def _compile(source: str):
+     tree = ast.parse(source, filename="<anthracite-freecad>", mode="exec")
+     if tree.body and isinstance(tree.body[-1], ast.Expr):
+@@ -241,6 +329,7 @@ class Cad:
+     def __init__(self, doc: Any):
+         self.doc = doc
+         self.events: list[dict[str, Any]] = []
++        self.render_request: dict[str, Any] | None = None
+ 
+     def find(
+         self,
+@@ -288,6 +377,19 @@ class Cad:
+             Gui.activeDocument().activeView().viewAxonometric()
+             Gui.activeDocument().activeView().fitAll()
+ 
++    def render(
++        self,
++        *,
++        width: int = 960,
++        height: int = 720,
++        view: str = "axonometric",
++        fit: bool = True,
++    ) -> dict[str, Any]:
++        """Attach one bounded viewport render to this tool observation."""
++
++        self.render_request = _render_spec(width, height, view, fit)
++        return {"scheduled": True, **self.render_request}
++
+ 
+ def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
+     """Execute source once, returning a structured result suitable for an LLM."""
+@@ -347,6 +449,11 @@ def execute(source: str, expected_revisi
+         doc.recompute()
+         cad.assert_valid()
+         after = _document_snapshot(doc)
++        rendered = (
++            _render_view(cad.render_request)
++            if cad.render_request is not None
++            else None
++        )
+         doc.commitTransaction()
+     except Exception as error:
+         error_traceback = traceback.format_exc()
+@@ -375,14 +482,24 @@ def execute(source: str, expected_revisi
+     revision += 1
+     _revisions[doc.Name] = revision
+     _executing_docs.discard(doc.Name)
++    observation = _observation(doc, before, after)
++    images = []
++    if rendered is not None:
++        observation["render"] = {
++            key: value
++            for key, value in rendered.items()
++            if key != "dataUrl"
++        }
++        images.append(rendered["dataUrl"])
+     return {
+         "ok": True,
+         "revision": revision,
+         "stdout": _bounded(stdout.getvalue()),
+         "stderr": _bounded(stderr.getvalue()),
+         "result": _json_safe(namespace.get("_result")),
+-        "observation": _observation(doc, before, after),
++        "observation": observation,
+         "events": cad.events,
++        "images": images,
+     }
+ 
+ 
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -511,11 +511,15 @@ void AgentBridge::runFreeCADTool(const Q
+     sidebar->appendActivity(tr("Running FreeCAD Python"));
+ 
+     bool success = false;
+-    const QString result
++    QString result
+         = executePython(payload.value("arguments").toObject().value("code").toString(), success);
+-    const auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
++    auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
++    QJsonArray images;
+     if (resultDocument.isObject()) {
+-        const auto resultObject = resultDocument.object();
++        auto resultObject = resultDocument.object();
++        images = resultObject.take(QStringLiteral("images")).toArray();
++        resultDocument.setObject(resultObject);
++        result = QString::fromUtf8(resultDocument.toJson(QJsonDocument::Compact));
+         if (resultObject.value("revision").isDouble()) {
+             documentRevision = resultObject.value("revision").toInt();
+         }
+@@ -526,6 +530,9 @@ void AgentBridge::runFreeCADTool(const Q
+         sidebar->appendActivity(
+             tr("FreeCAD: %1 created, %2 changed, %3 deleted").arg(created).arg(changed).arg(deleted)
+         );
++        if (!images.isEmpty()) {
++            sidebar->appendActivity(tr("Attached %n viewport render(s)", nullptr, images.size()));
++        }
+     }
+ 
+     send(
+@@ -534,6 +541,7 @@ void AgentBridge::runFreeCADTool(const Q
+             {"requestId", payload.value("requestId")},
+             {"result", result},
+             {"success", success},
++            {"images", images},
+         }
+     );
+ }
+--- a/src/Mod/Anthracite/Runtime/src/main.rs
++++ b/src/Mod/Anthracite/Runtime/src/main.rs
+@@ -80,6 +80,7 @@ fn handle_host_message(
+                         .get("success")
+                         .and_then(Value::as_bool)
+                         .unwrap_or(false),
++                    payload.get("images").unwrap_or(&Value::Null),
+                 )
+             }),
+         "request.resolve" => provider
+--- a/src/Mod/Anthracite/Runtime/src/providers/codex.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+@@ -98,7 +98,8 @@ impl CodexAdapter {
+             "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
+             "Prefer parametric, named objects and constraints. Inspect before editing. ",
+             "A tool call is one undoable transaction: failures roll back automatically. ",
+-            "Read the returned observation, fix errors, and verify the finished model."
++            "Read the returned observation, fix errors, and verify the finished model. ",
++            "Use cad.render() when a viewport image would materially improve verification."
+         )
+     }
+ 
+@@ -110,7 +111,8 @@ impl CodexAdapter {
+                 "Execute ordinary Python inside the active FreeCAD GUI. ",
+                 "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
+                 "The complete source runs as one transaction, recomputes and validates, ",
+-                "then returns result/stdout plus created, changed, and deleted objects."
++                "then returns result/stdout plus created, changed, and deleted objects. ",
++                "Call cad.render() to attach a viewport image for visual verification."
+             ),
+             "inputSchema": {
+                 "type": "object",
+@@ -642,6 +644,20 @@ impl CodexAdapter {
+         }
+         Value::Object(result)
+     }
++
++    fn tool_content_items(result: &str, images: &Value) -> Vec<Value> {
++        let mut items = vec![json!({"type": "inputText", "text": result})];
++        items.extend(
++            images
++                .as_array()
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str)
++                .filter(|image| image.starts_with("data:image/"))
++                .map(|image| json!({"type": "inputImage", "imageUrl": image})),
++        );
++        items
++    }
+ }
+ 
+ impl ProviderAdapter for CodexAdapter {
+@@ -679,15 +695,21 @@ impl ProviderAdapter for CodexAdapter {
+         request_id: Value,
+         result: &str,
+         success: bool,
++        images: &Value,
+     ) -> Result<(), String> {
+         self.emitter.record(
+             "tool.result",
+-            &json!({"requestId": request_id, "result": result, "success": success}),
++            &json!({
++                "requestId": request_id,
++                "result": result,
++                "success": success,
++                "imageCount": images.as_array().map_or(0, Vec::len)
++            }),
+         );
+         self.send(&json!({
+             "id": request_id,
+             "result": {
+-                "contentItems": [{"type": "inputText", "text": result}],
++                "contentItems": Self::tool_content_items(result, images),
+                 "success": success
+             }
+         }))
+@@ -879,4 +901,24 @@ mod tests {
+             })]
+         );
+     }
++
++    #[test]
++    fn attaches_local_render_data_to_dynamic_tool_results() {
++        assert_eq!(
++            CodexAdapter::tool_content_items(
++                r#"{"ok":true}"#,
++                &json!([
++                    "data:image/png;base64,AAAA",
++                    "https://example.com/not-allowed.png"
++                ])
++            ),
++            vec![
++                json!({"type": "inputText", "text": r#"{"ok":true}"#}),
++                json!({
++                    "type": "inputImage",
++                    "imageUrl": "data:image/png;base64,AAAA"
++                })
++            ]
++        );
++    }
+ }
+--- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -14,6 +14,7 @@ pub trait ProviderAdapter {
+         request_id: Value,
+         result: &str,
+         success: bool,
++        images: &Value,
+     ) -> Result<(), String>;
+     fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String>;
+     fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String>;
+--- a/src/Mod/Anthracite/TestAnthracite.py
++++ b/src/Mod/Anthracite/TestAnthracite.py
+@@ -83,6 +83,30 @@ class ExecutorTest(unittest.TestCase):
+         self.assertGreater(stale["revision"], first["revision"])
+         self.assertIsNone(self.doc.getObject("NeverCreated"))
+ 
++    def test_render_request_is_bounded_and_keeps_one_final_view(self):
++        cad = AnthraciteExecutor.Cad(self.doc)
++        scheduled = cad.render(
++            width=800,
++            height=600,
++            view="front",
++            fit=False,
++        )
++
++        self.assertEqual(
++            scheduled,
++            {
++                "scheduled": True,
++                "width": 800,
++                "height": 600,
++                "view": "front",
++                "fit": False,
++            },
++        )
++        with self.assertRaises(ValueError):
++            cad.render(width=4096, height=4096)
++        with self.assertRaises(ValueError):
++            cad.render(view="invented")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+--- a/src/Mod/Anthracite/TestAnthraciteGui.py
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -5,6 +5,7 @@ import FreeCADGui as Gui
+ from PySide import QtCore, QtWidgets
+ from PySide6 import QtQuickWidgets
+ 
++import AnthraciteExecutor
+ import AnthraciteGui  # noqa: F401 - importing registers the dock window
+ 
+ 
+@@ -39,6 +40,26 @@ def run_smoke_test():
+     if root.findChild(QtCore.QObject, "AnthraciteEffortPicker") is None:
+         raise AssertionError("Anthracite QML does not expose the reasoning-effort picker.")
+ 
++    render_document = App.newDocument("AnthraciteRender")
++    render_result = AnthraciteExecutor.execute(
++        "\n".join(
++            [
++                "box = doc.addObject('Part::Box', 'RenderBox')",
++                "box.Length = 12",
++                "box.Width = 8",
++                "box.Height = 5",
++                "cad.render(width=256, height=192)",
++            ]
++        )
++    )
++    if not render_result["ok"]:
++        raise AssertionError(f"Viewport observation failed: {render_result}")
++    if not render_result["images"][0].startswith("data:image/png;base64,"):
++        raise AssertionError("Viewport observation did not return an inline PNG.")
++    if render_result["observation"]["render"]["width"] != 256:
++        raise AssertionError("Viewport observation metadata is incomplete.")
++    App.closeDocument(render_document.Name)
++
+     first = App.newDocument("AnthraciteContextOne")
+     second = App.newDocument("AnthraciteContextTwo")
+     App.setActiveDocument(first.Name)

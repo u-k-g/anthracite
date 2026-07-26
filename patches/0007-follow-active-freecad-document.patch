@@ -1,0 +1,415 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -82,6 +82,16 @@ AgentBridge::AgentBridge(SidebarControll
+     draftTimer.setInterval(250);
+     connect(&draftTimer, &QTimer::timeout, this, &AgentBridge::persistDraft);
+ 
++    activeDocumentConnection = App::GetApplication().signalActiveDocument.connect(
++        [this](const App::Document&) { scheduleDocumentSync(); }
++    );
++    savedDocumentConnection = App::GetApplication().signalSaveDocument.connect(
++        [this](const App::Document&) { scheduleDocumentSync(); }
++    );
++    deletedDocumentConnection = App::GetApplication().signalDeleteDocument.connect(
++        [this](const App::Document& document) { documentDeleted(document); }
++    );
++
+     QTimer::singleShot(0, this, [this]() {
+         if (!codexPath().isEmpty() && QFileInfo::exists(runtimePath())) {
+             ensureRuntime();
+@@ -176,6 +186,7 @@ void AgentBridge::respondToUserInput(con
+ void AgentBridge::processStarted()
+ {
+     sidebar->updateStatus(tr("Connecting"));
++    runtimeDocumentIdentity = documentIdentity();
+     QJsonObject session {
+         {
+             "provider",
+@@ -443,6 +454,22 @@ void AgentBridge::handleMessage(const QJ
+ void AgentBridge::runFreeCADTool(const QJsonObject& payload)
+ {
+     Q_ASSERT(QThread::currentThread() == qApp->thread());
++    if (documentSyncPending || documentIdentity() != runtimeDocumentIdentity) {
++        send(
++            QStringLiteral("tool.result"),
++            {
++                {"requestId", payload.value("requestId")},
++                {
++                    "result",
++                    QStringLiteral(
++                        R"({"ok":false,"error":{"type":"DocumentContextChanged","message":"The active FreeCAD document changed before this call could run."}})"
++                    ),
++                },
++                {"success", false},
++            }
++        );
++        return;
++    }
+     sidebar->updateStatus(tr("Editing"));
+     sidebar->appendActivity(tr("Running FreeCAD Python"));
+ 
+@@ -563,30 +590,88 @@ QString AgentBridge::databasePath() cons
+ QJsonObject AgentBridge::documentContext()
+ {
+     const auto* document = App::GetApplication().getActiveDocument();
++    const QString name = document ? QString::fromUtf8(document->getName()) : QStringLiteral("none");
++    const QString contextKey = document ? QStringLiteral("document:%1").arg(name)
++                                        : QStringLiteral("no-document");
++    QString sessionKey = documentSessionKeys.value(contextKey);
++    if (sessionKey.isEmpty()) {
++        sessionKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
++        documentSessionKeys.insert(contextKey, sessionKey);
++    }
++
+     if (!document) {
+-        if (unsavedDocumentKey.isEmpty()) {
+-            unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
+-        }
+         return {
+             {"displayName", tr("Unsaved FreeCAD document")},
+-            {"sessionKey", unsavedDocumentKey},
++            {"sessionKey", sessionKey},
+         };
+     }
+ 
+-    const QString name = QString::fromUtf8(document->getName());
+-    if (name != unsavedDocumentName || unsavedDocumentKey.isEmpty()) {
+-        unsavedDocumentName = name;
+-        unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
+-    }
+-
+     const QString fileName = QString::fromStdString(document->getFileName());
+     return {
+         {"path", fileName},
+         {"displayName", fileName.isEmpty() ? name : QFileInfo(fileName).fileName()},
+-        {"sessionKey", unsavedDocumentKey},
++        {"sessionKey", sessionKey},
+     };
+ }
+ 
++QString AgentBridge::documentIdentity() const
++{
++    if (const auto* document = App::GetApplication().getActiveDocument()) {
++        return QStringLiteral("%1\n%2").arg(
++            QString::fromUtf8(document->getName()),
++            QString::fromStdString(document->getFileName())
++        );
++    }
++    return QStringLiteral("<no-active-document>");
++}
++
++void AgentBridge::scheduleDocumentSync()
++{
++    if (documentSyncPending) {
++        return;
++    }
++    documentSyncPending = true;
++    QTimer::singleShot(0, this, [this]() {
++        documentSyncPending = false;
++        synchronizeDocumentContext();
++    });
++}
++
++void AgentBridge::synchronizeDocumentContext()
++{
++    const QString currentIdentity = documentIdentity();
++    if (currentIdentity == runtimeDocumentIdentity) {
++        return;
++    }
++
++    queuedPrompt.clear();
++    draftTimer.stop();
++    draftDirty = false;
++    restartPending = false;
++    pendingRestartSaveId = 0;
++    pendingDraft.clear();
++    sidebar->documentContextChanged();
++    const QString providerPath = codexPath();
++    if (runtime.state() == QProcess::NotRunning
++        && (providerPath.isEmpty() || !QFileInfo::exists(providerPath)
++            || !QFileInfo::exists(runtimePath()))) {
++        runtimeDocumentIdentity = currentIdentity;
++        selectedLocalThreadId.clear();
++        runtimeReady = false;
++        sidebar->updateStatus(tr("Ready"));
++        return;
++    }
++    performSessionRestart(QString(), false);
++}
++
++void AgentBridge::documentDeleted(const App::Document& document)
++{
++    documentSessionKeys.remove(
++        QStringLiteral("document:%1").arg(QString::fromUtf8(document.getName()))
++    );
++    scheduleDocumentSync();
++}
++
+ void AgentBridge::fail(const QString& message)
+ {
+     queuedPrompt.clear();
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -5,6 +5,7 @@
+ 
+ #include <QJsonValue>
+ #include <QJsonObject>
++#include <QHash>
+ #include <QObject>
+ #include <QProcess>
+ #include <QTimer>
+@@ -12,6 +13,12 @@
+ 
+ #include <optional>
+ 
++#include <boost/signals2/connection.hpp>
++
++namespace App
++{
++class Document;
++}
+ 
+ namespace AnthraciteGui
+ {
+@@ -54,6 +61,10 @@ private:
+     QString workingDirectory() const;
+     QString databasePath() const;
+     QJsonObject documentContext();
++    QString documentIdentity() const;
++    void scheduleDocumentSync();
++    void synchronizeDocumentContext();
++    void documentDeleted(const App::Document& document);
+     void fail(const QString& message);
+ 
+     SidebarController* sidebar;
+@@ -66,8 +77,7 @@ private:
+     bool createNewThread = false;
+     bool draftDirty = false;
+     bool restartPending = false;
+-    QString unsavedDocumentName;
+-    QString unsavedDocumentKey;
++    QHash<QString, QString> documentSessionKeys;
+     QString selectedLocalThreadId;
+     QString pendingDraft;
+     QString pendingRestartThreadId;
+@@ -75,6 +85,11 @@ private:
+     qint64 nextDraftSaveId = 1;
+     qint64 pendingRestartSaveId = 0;
+     QTimer draftTimer;
++    QString runtimeDocumentIdentity;
++    bool documentSyncPending = false;
++    boost::signals2::scoped_connection activeDocumentConnection;
++    boost::signals2::scoped_connection savedDocumentConnection;
++    boost::signals2::scoped_connection deletedDocumentConnection;
+     std::optional<int> documentRevision;
+ };
+ }  // namespace AnthraciteGui
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -340,6 +340,17 @@ void SidebarController::loadDraft(const
+     Q_EMIT draftChanged();
+ }
+ 
++void SidebarController::documentContextChanged()
++{
++    clearInteraction();
++    setBusy(false);
++    resetHistory();
++    showWelcome();
++    updateThreads(QString(), {});
++    loadDraft(QString());
++    setStatus(QStringLiteral("Connecting"));
++}
++
+ void SidebarController::setStatus(QString status)
+ {
+     if (currentStatus == status) {
+--- a/src/Mod/Anthracite/Gui/Sidebar.h
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -81,6 +81,7 @@ public:
+     void updateStatus(const QString& status);
+     void updateThreads(const QString& currentThreadId, const QVariantList& threads);
+     void loadDraft(const QString& body);
++    void documentContextChanged();
+ 
+ Q_SIGNALS:
+     void promptSubmitted(const QString& prompt);
+--- a/src/Mod/Anthracite/Runtime/src/store.rs
++++ b/src/Mod/Anthracite/Runtime/src/store.rs
+@@ -173,21 +173,24 @@ impl Store {
+     fn resolve_document(&self, document: &Value) -> Result<String, String> {
+         let raw_path = document.get("path").and_then(Value::as_str).unwrap_or("");
+         let path = canonical_path(raw_path);
+-        let session_key = if path.is_none() {
+-            document
+-                .get("sessionKey")
+-                .and_then(Value::as_str)
+-                .filter(|value| !value.is_empty())
+-                .map(str::to_owned)
+-        } else {
+-            None
+-        };
++        let session_key = document
++            .get("sessionKey")
++            .and_then(Value::as_str)
++            .filter(|value| !value.is_empty())
++            .map(str::to_owned);
+         let display_name = document
+             .get("displayName")
+             .and_then(Value::as_str)
+             .filter(|value| !value.is_empty())
+             .unwrap_or("Unsaved FreeCAD document");
+         let file_fingerprint = path.as_deref().and_then(fingerprint);
++        let session_document_id = match &session_key {
++            Some(session_key) => self.query_string(
++                "SELECT id FROM documents WHERE session_key = ?1 LIMIT 1",
++                params![session_key.as_str()],
++            )?,
++            None => None,
++        };
+ 
+         if let Some(path) = &path
+             && let Some(id) = self.query_string(
+@@ -195,24 +198,52 @@ impl Store {
+                 params![path.as_str()],
+             )?
+         {
++            if let Some(session_document_id) = &session_document_id
++                && session_document_id != &id
++            {
++                self.runtime
++                    .block_on(self.connection.execute(
++                        "UPDATE documents SET session_key = NULL WHERE id = ?1",
++                        params![session_document_id.as_str()],
++                    ))
++                    .map_err(|error| error.to_string())?;
++            }
+             self.runtime
+                 .block_on(self.connection.execute(
+                     "UPDATE documents
+-                     SET fingerprint = ?1, display_name = ?2, updated_at_ms = ?3
+-                     WHERE id = ?4",
+-                    params![file_fingerprint, display_name, now_ms(), id.clone()],
++                     SET session_key = ?1, fingerprint = ?2,
++                         display_name = ?3, updated_at_ms = ?4
++                     WHERE id = ?5",
++                    params![
++                        session_key,
++                        file_fingerprint,
++                        display_name,
++                        now_ms(),
++                        id.clone()
++                    ],
+                 ))
+                 .map_err(|error| error.to_string())?;
+             return Ok(id);
+         }
+ 
+-        if path.is_none()
+-            && let Some(session_key) = &session_key
+-            && let Some(id) = self.query_string(
+-                "SELECT id FROM documents WHERE session_key = ?1 LIMIT 1",
+-                params![session_key.as_str()],
+-            )?
+-        {
++        if let Some(id) = session_document_id {
++            if let Some(path) = &path {
++                self.runtime
++                    .block_on(self.connection.execute(
++                        "UPDATE documents
++                         SET canonical_path = ?1, fingerprint = ?2,
++                             display_name = ?3, updated_at_ms = ?4
++                         WHERE id = ?5",
++                        params![
++                            path.as_str(),
++                            file_fingerprint,
++                            display_name,
++                            now_ms(),
++                            id.clone()
++                        ],
++                    ))
++                    .map_err(|error| error.to_string())?;
++            }
+             return Ok(id);
+         }
+ 
+@@ -242,9 +273,16 @@ impl Store {
+                 self.runtime
+                     .block_on(self.connection.execute(
+                         "UPDATE documents
+-                         SET canonical_path = ?1, display_name = ?2, updated_at_ms = ?3
+-                         WHERE id = ?4",
+-                        params![path.as_str(), display_name, now_ms(), id.clone()],
++                         SET canonical_path = ?1, session_key = ?2,
++                             display_name = ?3, updated_at_ms = ?4
++                         WHERE id = ?5",
++                        params![
++                            path.as_str(),
++                            session_key,
++                            display_name,
++                            now_ms(),
++                            id.clone()
++                        ],
+                     ))
+                     .map_err(|error| error.to_string())?;
+                 return Ok(id);
+@@ -583,7 +621,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn saved_documents_do_not_reuse_unsaved_session_keys() {
++    fn saving_an_unsaved_document_preserves_its_conversations() {
+         let directory = tempfile::tempdir().unwrap();
+         let database_path = directory.path().join("anthracite.db");
+         let unsaved = Store::open(
+@@ -612,7 +650,23 @@ mod tests {
+         )
+         .unwrap();
+ 
+-        assert_ne!(saved.local_thread_id(), unsaved_thread);
++        assert_eq!(saved.local_thread_id(), unsaved_thread);
++
++        let moved_path = directory.path().join("saved-as.FCStd");
++        std::fs::write(&moved_path, b"saved-freecad-data").unwrap();
++        let saved_as = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({
++                "path": moved_path,
++                "sessionKey": "same-session",
++                "displayName": "saved-as.FCStd"
++            }),
++            "codex",
++            None,
++            false,
++        )
++        .unwrap();
++        assert_eq!(saved_as.local_thread_id(), unsaved_thread);
+     }
+ 
+     #[test]
+--- a/src/Mod/Anthracite/TestAnthraciteGui.py
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: LGPL-2.1-or-later
+ 
++import FreeCAD as App
+ import FreeCADGui as Gui
+ from PySide import QtCore, QtWidgets
+ from PySide6 import QtQuickWidgets
+@@ -31,6 +32,16 @@ def run_smoke_test():
+         raise AssertionError("Anthracite QML does not expose the new-conversation control.")
+     if root.findChild(QtCore.QObject, "AnthraciteComposer") is None:
+         raise AssertionError("Anthracite QML does not expose the persistent composer.")
++
++    first = App.newDocument("AnthraciteContextOne")
++    second = App.newDocument("AnthraciteContextTwo")
++    App.setActiveDocument(first.Name)
++    QtWidgets.QApplication.processEvents()
++    App.setActiveDocument(second.Name)
++    QtWidgets.QApplication.processEvents()
++    App.closeDocument(first.Name)
++    App.closeDocument(second.Name)
++    QtWidgets.QApplication.processEvents()
+     print("ANTHRACITE_GUI_SMOKE_OK")
+ 
+ 

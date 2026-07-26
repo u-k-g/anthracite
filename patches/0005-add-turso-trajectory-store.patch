@@ -1,0 +1,3472 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -15,6 +15,7 @@
+ #include <QJsonObject>
+ #include <QStandardPaths>
+ #include <QThread>
++#include <QUuid>
+ 
+ #include <App/Application.h>
+ #include <App/Document.h>
+@@ -149,6 +150,8 @@ void AgentBridge::processStarted()
+                 },
+             },
+             {"cwd", workingDirectory()},
++            {"storagePath", databasePath()},
++            {"document", documentContext()},
+         }
+     );
+ }
+@@ -247,7 +250,29 @@ void AgentBridge::handleMessage(const QJ
+ {
+     const QString type = message.value("type").toString();
+     const QJsonObject payload = message.value("payload").toObject();
+-    if (type == QLatin1String("runtime.ready")) {
++    if (type == QLatin1String("history.snapshot")) {
++        const QJsonArray events = payload.value("events").toArray();
++        if (!events.isEmpty()) {
++            sidebar->resetHistory();
++            assistantMessageStarted = false;
++            for (const auto& value : events) {
++                const QJsonObject event = value.toObject();
++                if (event.value("type").toString() == QLatin1String("content.user")) {
++                    sidebar->appendUserMessage(
++                        event.value("payload").toObject().value("text").toString()
++                    );
++                    assistantMessageStarted = false;
++                }
++                else {
++                    handleMessage(event);
++                }
++            }
++            if (!queuedPrompt.isEmpty()) {
++                sidebar->appendUserMessage(queuedPrompt);
++            }
++        }
++    }
++    else if (type == QLatin1String("runtime.ready")) {
+         runtimeReady = true;
+         sidebar->appendActivity(tr("Codex connected"));
+         sidebar->updateStatus(tr("Thinking"));
+@@ -424,6 +449,39 @@ QString AgentBridge::workingDirectory()
+     return QDir::currentPath();
+ }
+ 
++QString AgentBridge::databasePath() const
++{
++    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
++        .filePath(QStringLiteral("Anthracite/anthracite.db"));
++}
++
++QJsonObject AgentBridge::documentContext()
++{
++    const auto* document = App::GetApplication().getActiveDocument();
++    if (!document) {
++        if (unsavedDocumentKey.isEmpty()) {
++            unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
++        }
++        return {
++            {"displayName", tr("Unsaved FreeCAD document")},
++            {"sessionKey", unsavedDocumentKey},
++        };
++    }
++
++    const QString name = QString::fromUtf8(document->getName());
++    if (name != unsavedDocumentName || unsavedDocumentKey.isEmpty()) {
++        unsavedDocumentName = name;
++        unsavedDocumentKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
++    }
++
++    const QString fileName = QString::fromStdString(document->getFileName());
++    return {
++        {"path", fileName},
++        {"displayName", fileName.isEmpty() ? name : QFileInfo(fileName).fileName()},
++        {"sessionKey", unsavedDocumentKey},
++    };
++}
++
+ void AgentBridge::fail(const QString& message)
+ {
+     queuedPrompt.clear();
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -44,6 +44,8 @@ private:
+     QString runtimePath() const;
+     QString codexPath() const;
+     QString workingDirectory() const;
++    QString databasePath() const;
++    QJsonObject documentContext();
+     void fail(const QString& message);
+ 
+     SidebarController* sidebar;
+@@ -53,6 +55,8 @@ private:
+     bool runtimeReady = false;
+     bool assistantMessageStarted = false;
+     bool stopping = false;
++    QString unsavedDocumentName;
++    QString unsavedDocumentKey;
+     std::optional<int> documentRevision;
+ };
+ }  // namespace AnthraciteGui
+--- a/src/Mod/Anthracite/Gui/CMakeLists.txt
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -7,6 +7,7 @@ find_package(
+ )
+ 
+ find_program(CARGO_EXECUTABLE cargo REQUIRED)
++find_package(ZLIB REQUIRED)
+ 
+ set(AnthraciteRuntime_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime)
+ set(AnthraciteRuntime_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/runtime-target)
+@@ -16,10 +17,23 @@ set(AnthraciteRuntime_BUILD_BINARY
+ set(AnthraciteRuntime_BINARY
+     ${CMAKE_BINARY_DIR}/Mod/Anthracite/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
+ )
++get_filename_component(AnthraciteRuntime_LIBRARY_DIR ${ZLIB_LIBRARY} DIRECTORY)
++set(AnthraciteRuntime_CARGO_ENV)
++if(UNIX)
++    # Turso's native build dependencies use zlib and iconv. Build and run
++    # against the same native library directory as FreeCAD.
++    set(
++        AnthraciteRuntime_CARGO_ENV
++        "LIBRARY_PATH=${AnthraciteRuntime_LIBRARY_DIR}"
++        "RUSTFLAGS=-C link-arg=-Wl,-rpath,${AnthraciteRuntime_LIBRARY_DIR}"
++    )
++endif()
+ 
+ add_custom_command(
+     OUTPUT ${AnthraciteRuntime_BINARY}
+     COMMAND
++        ${CMAKE_COMMAND} -E env
++        ${AnthraciteRuntime_CARGO_ENV}
+         ${CARGO_EXECUTABLE} build
+         --locked
+         --release
+@@ -35,6 +49,7 @@ add_custom_command(
+         ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
+     COMMENT "Building Anthracite agent runtime"
+--- a/src/Mod/Anthracite/Gui/ConversationModel.cpp
++++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
+@@ -52,6 +52,15 @@ void ConversationModel::append(QString a
+     endInsertRows();
+ }
+ 
++void ConversationModel::clear()
++{
++    beginResetModel();
++    messages.clear();
++    assistantRow = -1;
++    planRow = -1;
++    endResetModel();
++}
++
+ void ConversationModel::beginTurn()
+ {
+     assistantRow = -1;
+--- a/src/Mod/Anthracite/Gui/ConversationModel.h
++++ b/src/Mod/Anthracite/Gui/ConversationModel.h
+@@ -29,6 +29,7 @@ public:
+     QHash<int, QByteArray> roleNames() const override;
+ 
+     void append(QString author, QString body, QString kind);
++    void clear();
+     void beginTurn();
+     void beginAssistantMessage();
+     void appendAssistantDelta(const QString& delta);
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -171,6 +171,17 @@ void SidebarController::appendActivity(c
+     conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
+ }
+ 
++void SidebarController::resetHistory()
++{
++    conversation.clear();
++}
++
++void SidebarController::appendUserMessage(const QString& text)
++{
++    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
++    conversation.beginTurn();
++}
++
+ void SidebarController::beginAssistantMessage()
+ {
+     conversation.beginAssistantMessage();
+--- a/src/Mod/Anthracite/Gui/Sidebar.h
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -53,6 +53,8 @@ public:
+     Q_INVOKABLE void submitInputAnswers();
+ 
+     void appendActivity(const QString& text);
++    void resetHistory();
++    void appendUserMessage(const QString& text);
+     void beginAssistantMessage();
+     void appendAssistantDelta(const QString& delta);
+     void updatePlan(const QString& explanation, const QVariantList& steps);
+--- a/src/Mod/Anthracite/Runtime/Cargo.lock
++++ b/src/Mod/Anthracite/Runtime/Cargo.lock
+@@ -3,10 +3,791 @@
+ version = 4
+ 
+ [[package]]
++name = "aead"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
++dependencies = [
++ "crypto-common",
++ "generic-array",
++]
++
++[[package]]
++name = "aegis"
++version = "0.9.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "58541132f980da31e9aa99f7bdee69bc84bf1e168b9b91ef2dbe8abb7b4ce5dd"
++dependencies = [
++ "cc",
++ "softaes",
++]
++
++[[package]]
++name = "aes"
++version = "0.8.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
++dependencies = [
++ "cfg-if",
++ "cipher",
++ "cpufeatures 0.2.17",
++]
++
++[[package]]
++name = "aes-gcm"
++version = "0.10.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
++dependencies = [
++ "aead",
++ "aes",
++ "cipher",
++ "ctr",
++ "ghash",
++ "subtle",
++]
++
++[[package]]
++name = "aho-corasick"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
++dependencies = [
++ "memchr",
++]
++
++[[package]]
++name = "android_system_properties"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
++dependencies = [
++ "libc",
++]
++
++[[package]]
+ name = "anthracite-runtime"
+ version = "0.1.0"
+ dependencies = [
+  "serde_json",
++ "sha2",
++ "tempfile",
++ "tokio",
++ "turso",
++ "uuid",
++]
++
++[[package]]
++name = "anyhow"
++version = "1.0.104"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
++
++[[package]]
++name = "arc-swap"
++version = "1.9.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
++dependencies = [
++ "rustversion",
++]
++
++[[package]]
++name = "autocfg"
++version = "1.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
++
++[[package]]
++name = "base64"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
++
++[[package]]
++name = "bindgen"
++version = "0.69.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
++dependencies = [
++ "bitflags",
++ "cexpr",
++ "clang-sys",
++ "itertools 0.12.1",
++ "lazy_static",
++ "lazycell",
++ "log",
++ "prettyplease",
++ "proc-macro2",
++ "quote",
++ "regex",
++ "rustc-hash 1.1.0",
++ "shlex 1.3.0",
++ "syn 2.0.119",
++ "which",
++]
++
++[[package]]
++name = "bitflags"
++version = "2.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
++
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
++[[package]]
++name = "branches"
++version = "0.4.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8fba76cd916045514e3064707df9ed5282b94419444c2753a6c62ecaf458e56"
++dependencies = [
++ "rustc_version",
++]
++
++[[package]]
++name = "built"
++version = "0.7.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
++dependencies = [
++ "chrono",
++ "git2",
++]
++
++[[package]]
++name = "bumpalo"
++version = "3.20.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
++
++[[package]]
++name = "bytemuck"
++version = "1.25.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
++dependencies = [
++ "bytemuck_derive",
++]
++
++[[package]]
++name = "bytemuck_derive"
++version = "1.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f65693059b6b9c588b9f62fed1cedbf0a8b805631457ea162d68f0de186f3de5"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "byteorder"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
++
++[[package]]
++name = "bytes"
++version = "1.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
++
++[[package]]
++name = "cc"
++version = "1.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
++dependencies = [
++ "find-msvc-tools",
++ "jobserver",
++ "libc",
++ "shlex 2.0.1",
++]
++
++[[package]]
++name = "cexpr"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
++dependencies = [
++ "nom",
++]
++
++[[package]]
++name = "cfg-if"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
++
++[[package]]
++name = "cfg_block"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "18758054972164c3264f7c8386f5fc6da6114cb46b619fd365d4e3b2dc3ae487"
++
++[[package]]
++name = "chacha20"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.0",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "chrono"
++version = "0.4.45"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
++dependencies = [
++ "iana-time-zone",
++ "js-sys",
++ "num-traits",
++ "wasm-bindgen",
++ "windows-link",
++]
++
++[[package]]
++name = "cipher"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
++dependencies = [
++ "crypto-common",
++ "inout",
++]
++
++[[package]]
++name = "clang-sys"
++version = "1.8.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
++dependencies = [
++ "glob",
++ "libc",
++ "libloading",
++]
++
++[[package]]
++name = "concurrent-queue"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "core-foundation-sys"
++version = "0.8.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
++
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "cpufeatures"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "crossbeam-channel"
++version = "0.5.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-skiplist"
++version = "0.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.22"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
++
++[[package]]
++name = "crypto-common"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
++dependencies = [
++ "generic-array",
++ "rand_core 0.6.4",
++ "typenum",
++]
++
++[[package]]
++name = "ctr"
++version = "0.9.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
++dependencies = [
++ "cipher",
++]
++
++[[package]]
++name = "deranged"
++version = "0.5.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
++
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer",
++ "crypto-common",
++]
++
++[[package]]
++name = "displaydoc"
++version = "0.2.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "either"
++version = "1.17.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
++
++[[package]]
++name = "env_filter"
++version = "2.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
++dependencies = [
++ "log",
++ "regex",
++]
++
++[[package]]
++name = "env_logger"
++version = "0.11.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
++dependencies = [
++ "env_filter",
++ "log",
++]
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "fallible-iterator"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
++
++[[package]]
++name = "fastbloom"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
++dependencies = [
++ "getrandom 0.3.4",
++ "libm",
++ "rand 0.9.5",
++ "siphasher",
++]
++
++[[package]]
++name = "fastrand"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
++
++[[package]]
++name = "find-msvc-tools"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
++
++[[package]]
++name = "form_urlencoded"
++version = "1.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
++dependencies = [
++ "percent-encoding",
++]
++
++[[package]]
++name = "futures-core"
++version = "0.3.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
++
++[[package]]
++name = "futures-task"
++version = "0.3.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b231ed28831efb4a61a08580c4bc233ec56bc009f4cd8f52da2c3cb97df0c109"
++
++[[package]]
++name = "futures-util"
++version = "0.3.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
++dependencies = [
++ "futures-core",
++ "futures-task",
++ "pin-project-lite",
++ "slab",
++]
++
++[[package]]
++name = "genawaiter"
++version = "0.99.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c86bd0361bcbde39b13475e6e36cb24c329964aa2611be285289d1e4b751c1a0"
++dependencies = [
++ "genawaiter-macro",
++]
++
++[[package]]
++name = "genawaiter-macro"
++version = "0.99.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
++
++[[package]]
++name = "generic-array"
++version = "0.14.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
++dependencies = [
++ "typenum",
++ "version_check",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "wasi",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.3.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 5.3.0",
++ "wasip2",
++]
++
++[[package]]
++name = "getrandom"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi 6.0.0",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "ghash"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
++dependencies = [
++ "opaque-debug",
++ "polyval",
++]
++
++[[package]]
++name = "git2"
++version = "0.20.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
++dependencies = [
++ "bitflags",
++ "libc",
++ "libgit2-sys",
++ "log",
++ "url",
++]
++
++[[package]]
++name = "glob"
++version = "0.3.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
++
++[[package]]
++name = "heck"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
++
++[[package]]
++name = "hermit-abi"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
++
++[[package]]
++name = "hex"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
++
++[[package]]
++name = "home"
++version = "0.5.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "http"
++version = "1.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
++dependencies = [
++ "bytes",
++ "itoa",
++]
++
++[[package]]
++name = "iana-time-zone"
++version = "0.1.65"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
++dependencies = [
++ "android_system_properties",
++ "core-foundation-sys",
++ "iana-time-zone-haiku",
++ "js-sys",
++ "log",
++ "wasm-bindgen",
++ "windows-core",
++]
++
++[[package]]
++name = "iana-time-zone-haiku"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
++dependencies = [
++ "cc",
++]
++
++[[package]]
++name = "icu_collections"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c"
++dependencies = [
++ "displaydoc",
++ "potential_utf",
++ "utf8_iter",
++ "yoke",
++ "zerofrom",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_locale_core"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92219b62b3e2b4d88ac5119f8904c10f8f61bf7e95b640d25ba3075e6cac2c29"
++dependencies = [
++ "displaydoc",
++ "litemap",
++ "tinystr",
++ "writeable",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_normalizer"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c56e5ee99d6e3d33bd91c5d85458b6005a22140021cc324cea84dd0e72cff3b4"
++dependencies = [
++ "icu_collections",
++ "icu_normalizer_data",
++ "icu_properties",
++ "icu_provider",
++ "smallvec",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_normalizer_data"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da3be0ae77ea334f4da67c12f149704f19f81d1adf7c51cf482943e84a2bad38"
++
++[[package]]
++name = "icu_properties"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bee3b67d0ea5c2cca5003417989af8996f8604e34fb9ddf96208a033901e70de"
++dependencies = [
++ "icu_collections",
++ "icu_locale_core",
++ "icu_properties_data",
++ "icu_provider",
++ "zerotrie",
++ "zerovec",
++]
++
++[[package]]
++name = "icu_properties_data"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8e2bbb201e0c04f7b4b3e14382af113e17ba4f63e2c9d2ee626b720cbce54a14"
++
++[[package]]
++name = "icu_provider"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
++dependencies = [
++ "displaydoc",
++ "icu_locale_core",
++ "writeable",
++ "yoke",
++ "zerofrom",
++ "zerotrie",
++ "zerovec",
++]
++
++[[package]]
++name = "idna"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
++dependencies = [
++ "idna_adapter",
++ "smallvec",
++ "utf8_iter",
++]
++
++[[package]]
++name = "idna_adapter"
++version = "1.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
++dependencies = [
++ "icu_normalizer",
++ "icu_properties",
++]
++
++[[package]]
++name = "inout"
++version = "0.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
++dependencies = [
++ "generic-array",
++]
++
++[[package]]
++name = "intrusive-collections"
++version = "0.9.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
++dependencies = [
++ "memoffset",
++]
++
++[[package]]
++name = "io-uring"
++version = "0.7.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
++dependencies = [
++ "bitflags",
++ "cfg-if",
++ "libc",
++]
++
++[[package]]
++name = "itertools"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
++dependencies = [
++ "either",
++]
++
++[[package]]
++name = "itertools"
++version = "0.14.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
++dependencies = [
++ "either",
+ ]
+ 
+ [[package]]
+@@ -16,12 +797,332 @@ source = "registry+https://github.com/ru
+ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+ 
+ [[package]]
++name = "jobserver"
++version = "0.1.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
++dependencies = [
++ "getrandom 0.4.3",
++ "libc",
++]
++
++[[package]]
++name = "js-sys"
++version = "0.3.103"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102"
++dependencies = [
++ "cfg-if",
++ "futures-util",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "lazy_static"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
++
++[[package]]
++name = "lazycell"
++version = "1.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
++
++[[package]]
++name = "libc"
++version = "0.2.189"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
++
++[[package]]
++name = "libgit2-sys"
++version = "0.18.7+1.9.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23c7391e4b9f4ffab1a624223cc1d7385ff9a678f490768add717de7ea2f4d89"
++dependencies = [
++ "cc",
++ "libc",
++ "libz-sys",
++ "pkg-config",
++]
++
++[[package]]
++name = "libloading"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
++dependencies = [
++ "cfg-if",
++ "windows-link",
++]
++
++[[package]]
++name = "libm"
++version = "0.2.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
++
++[[package]]
++name = "libz-sys"
++version = "1.1.29"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
++dependencies = [
++ "cc",
++ "libc",
++ "pkg-config",
++ "vcpkg",
++]
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.4.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "litemap"
++version = "0.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
++
++[[package]]
++name = "lock_api"
++version = "0.4.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
++dependencies = [
++ "scopeguard",
++]
++
++[[package]]
++name = "log"
++version = "0.4.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
++
++[[package]]
++name = "matchers"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
++dependencies = [
++ "regex-automata",
++]
++
++[[package]]
+ name = "memchr"
+ version = "2.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+ 
+ [[package]]
++name = "memoffset"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "miette"
++version = "7.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
++dependencies = [
++ "cfg-if",
++ "miette-derive",
++ "unicode-width",
++]
++
++[[package]]
++name = "miette-derive"
++version = "7.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "minimal-lexical"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
++
++[[package]]
++name = "nom"
++version = "7.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
++dependencies = [
++ "memchr",
++ "minimal-lexical",
++]
++
++[[package]]
++name = "nu-ansi-term"
++version = "0.50.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "num-conv"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
++
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "opaque-debug"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
++
++[[package]]
++name = "pack1"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3b7bb0ecf2e447b1f20ee94ee79ef6eed1e9d4b3c36ce1903b9dea3bf205523"
++dependencies = [
++ "bytemuck",
++]
++
++[[package]]
++name = "parking_lot"
++version = "0.12.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
++dependencies = [
++ "lock_api",
++ "parking_lot_core",
++]
++
++[[package]]
++name = "parking_lot_core"
++version = "0.9.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "redox_syscall",
++ "smallvec",
++ "windows-link",
++]
++
++[[package]]
++name = "paste"
++version = "1.0.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
++
++[[package]]
++name = "percent-encoding"
++version = "2.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
++
++[[package]]
++name = "pin-project-lite"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
++
++[[package]]
++name = "pkg-config"
++version = "0.3.33"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
++
++[[package]]
++name = "polling"
++version = "3.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d0e4f59085d47d8241c88ead0f274e8a0cb551f3625263c05eb8dd897c34218"
++dependencies = [
++ "cfg-if",
++ "concurrent-queue",
++ "hermit-abi",
++ "pin-project-lite",
++ "rustix 1.1.4",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "polyval"
++version = "0.6.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.2.17",
++ "opaque-debug",
++ "universal-hash",
++]
++
++[[package]]
++name = "potential_utf"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
++dependencies = [
++ "zerovec",
++]
++
++[[package]]
++name = "powerfmt"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
++
++[[package]]
++name = "ppv-lite86"
++version = "0.2.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
++dependencies = [
++ "zerocopy",
++]
++
++[[package]]
++name = "prettyplease"
++version = "0.2.37"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
++dependencies = [
++ "proc-macro2",
++ "syn 2.0.119",
++]
++
++[[package]]
+ name = "proc-macro2"
+ version = "1.0.107"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -31,6 +1132,29 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "prost"
++version = "0.14.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
++dependencies = [
++ "bytes",
++ "prost-derive",
++]
++
++[[package]]
++name = "prost-derive"
++version = "0.14.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
++dependencies = [
++ "anyhow",
++ "itertools 0.14.0",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
+ name = "quote"
+ version = "1.0.47"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -40,12 +1164,208 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "r-efi"
++version = "5.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
++
++[[package]]
++name = "r-efi"
++version = "6.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
++
++[[package]]
++name = "rand"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
++dependencies = [
++ "rand_chacha",
++ "rand_core 0.9.5",
++]
++
++[[package]]
++name = "rand"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
++dependencies = [
++ "chacha20",
++ "getrandom 0.4.3",
++ "rand_core 0.10.1",
++]
++
++[[package]]
++name = "rand_chacha"
++version = "0.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
++dependencies = [
++ "ppv-lite86",
++ "rand_core 0.9.5",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.6.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
++dependencies = [
++ "getrandom 0.2.17",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
++dependencies = [
++ "getrandom 0.3.4",
++]
++
++[[package]]
++name = "rand_core"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
++
++[[package]]
++name = "rapidhash"
++version = "4.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
++dependencies = [
++ "rustversion",
++]
++
++[[package]]
++name = "redox_syscall"
++version = "0.5.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
++dependencies = [
++ "bitflags",
++]
++
++[[package]]
++name = "regex"
++version = "1.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-automata",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-automata"
++version = "0.4.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
++dependencies = [
++ "aho-corasick",
++ "memchr",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-syntax"
++version = "0.8.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
++
++[[package]]
++name = "roaring"
++version = "0.11.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1dedc5658c6ecb3bdb5ef5f3295bb9253f42dcf3fd1402c03f6b1f7659c3c4a9"
++dependencies = [
++ "bytemuck",
++ "byteorder",
++]
++
++[[package]]
++name = "rustc-hash"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
++
++[[package]]
++name = "rustc-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
++
++[[package]]
++name = "rustc_version"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
++dependencies = [
++ "semver",
++]
++
++[[package]]
++name = "rustix"
++version = "0.38.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.4.15",
++ "windows-sys 0.59.0",
++]
++
++[[package]]
++name = "rustix"
++version = "1.1.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys 0.12.1",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "rustversion"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
++
++[[package]]
++name = "ryu"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
++
++[[package]]
++name = "scopeguard"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
++
++[[package]]
++name = "semver"
++version = "1.0.28"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
++
++[[package]]
+ name = "serde"
+ version = "1.0.229"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+ dependencies = [
+  "serde_core",
++ "serde_derive",
+ ]
+ 
+ [[package]]
+@@ -65,7 +1385,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06b
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn",
++ "syn 3.0.3",
+ ]
+ 
+ [[package]]
+@@ -82,6 +1402,128 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "sha1_smol"
++version = "1.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
++
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.2.17",
++ "digest",
++]
++
++[[package]]
++name = "sharded-slab"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
++dependencies = [
++ "lazy_static",
++]
++
++[[package]]
++name = "shlex"
++version = "1.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
++
++[[package]]
++name = "shlex"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
++
++[[package]]
++name = "simsimd"
++version = "6.5.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f4fb3bc3cdce07a7d7d4caa4c54f8aa967f6be41690482b54b24100a2253fa70"
++dependencies = [
++ "cc",
++]
++
++[[package]]
++name = "siphasher"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
++
++[[package]]
++name = "slab"
++version = "0.4.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
++
++[[package]]
++name = "smallvec"
++version = "1.15.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
++
++[[package]]
++name = "softaes"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "45e14297decde697ddf377c25752aead0927d5cfc89c2684d2af96901a4ceeea"
++
++[[package]]
++name = "stable_deref_trait"
++version = "1.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
++
++[[package]]
++name = "strum"
++version = "0.26.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
++dependencies = [
++ "strum_macros",
++]
++
++[[package]]
++name = "strum_macros"
++version = "0.26.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
++dependencies = [
++ "heck",
++ "proc-macro2",
++ "quote",
++ "rustversion",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "subtle"
++version = "2.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
++
++[[package]]
++name = "symlink"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
+ name = "syn"
+ version = "3.0.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -93,12 +1535,770 @@ dependencies = [
+ ]
+ 
+ [[package]]
++name = "synstructure"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "tempfile"
++version = "3.27.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
++dependencies = [
++ "fastrand",
++ "getrandom 0.4.3",
++ "once_cell",
++ "rustix 1.1.4",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "thiserror"
++version = "2.0.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
++dependencies = [
++ "thiserror-impl",
++]
++
++[[package]]
++name = "thiserror-impl"
++version = "2.0.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.3",
++]
++
++[[package]]
++name = "thread_local"
++version = "1.1.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
++dependencies = [
++ "cfg-if",
++]
++
++[[package]]
++name = "time"
++version = "0.3.54"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
++dependencies = [
++ "deranged",
++ "num-conv",
++ "powerfmt",
++ "serde_core",
++ "time-core",
++ "time-macros",
++]
++
++[[package]]
++name = "time-core"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
++
++[[package]]
++name = "time-macros"
++version = "0.2.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
++dependencies = [
++ "num-conv",
++ "time-core",
++]
++
++[[package]]
++name = "tinystr"
++version = "0.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
++dependencies = [
++ "displaydoc",
++ "zerovec",
++]
++
++[[package]]
++name = "tokio"
++version = "1.53.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
++dependencies = [
++ "pin-project-lite",
++]
++
++[[package]]
++name = "tracing"
++version = "0.1.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
++dependencies = [
++ "pin-project-lite",
++ "tracing-attributes",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-appender"
++version = "0.2.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
++dependencies = [
++ "crossbeam-channel",
++ "symlink",
++ "thiserror",
++ "time",
++ "tracing-subscriber",
++]
++
++[[package]]
++name = "tracing-attributes"
++version = "0.1.31"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "tracing-core"
++version = "0.1.36"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
++dependencies = [
++ "once_cell",
++ "valuable",
++]
++
++[[package]]
++name = "tracing-log"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
++dependencies = [
++ "log",
++ "once_cell",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-subscriber"
++version = "0.3.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
++dependencies = [
++ "matchers",
++ "nu-ansi-term",
++ "once_cell",
++ "regex-automata",
++ "sharded-slab",
++ "smallvec",
++ "thread_local",
++ "tracing",
++ "tracing-core",
++ "tracing-log",
++]
++
++[[package]]
++name = "turso"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1f2fe423c2c954948babb36edda12b737e321d8541d4eae519694f7d512ecab6"
++dependencies = [
++ "thiserror",
++ "tracing",
++ "tracing-subscriber",
++ "turso_sdk_kit",
++ "turso_sync_sdk_kit",
++]
++
++[[package]]
++name = "turso_core"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7a8b54994ee025964459322bcdb4f6f78c5dba82643863dabfac680f16c8afa8"
++dependencies = [
++ "aegis",
++ "aes",
++ "aes-gcm",
++ "arc-swap",
++ "bitflags",
++ "branches",
++ "built",
++ "bumpalo",
++ "bytemuck",
++ "cfg_block",
++ "chrono",
++ "crossbeam-skiplist",
++ "either",
++ "fallible-iterator",
++ "fastbloom",
++ "hex",
++ "intrusive-collections",
++ "io-uring",
++ "libc",
++ "libloading",
++ "libm",
++ "miette",
++ "pack1",
++ "parking_lot",
++ "paste",
++ "polling",
++ "rand 0.9.5",
++ "rapidhash",
++ "regex",
++ "regex-syntax",
++ "roaring",
++ "rustc-hash 2.1.3",
++ "rustix 1.1.4",
++ "ryu",
++ "simsimd",
++ "strum",
++ "strum_macros",
++ "tempfile",
++ "thiserror",
++ "tracing",
++ "tracing-subscriber",
++ "turso_ext",
++ "turso_macros",
++ "turso_parser",
++ "twox-hash",
++ "uncased",
++ "uuid",
++]
++
++[[package]]
++name = "turso_ext"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2de917b4c5881bfb34ccbb1dcf4992773bc39853eacf248955f2ece7e3cb3049"
++dependencies = [
++ "chrono",
++ "getrandom 0.3.4",
++ "turso_macros",
++]
++
++[[package]]
++name = "turso_macros"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc2f62bb271d4cf202bc2acbeb8e2c3f764ec754924f144e704cdcba2e5b0c84"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "turso_parser"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92ad89caa1c4888756bd027485499d1dc4c8420d15887ab32aa28b707c411221"
++dependencies = [
++ "bitflags",
++ "memchr",
++ "miette",
++ "strum",
++ "strum_macros",
++ "thiserror",
++ "turso_macros",
++]
++
++[[package]]
++name = "turso_sdk_kit"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "00ff5b2cadd6c8b749511648d50c95f69bfa52efc5d88cc2e2deedd0beeb6c89"
++dependencies = [
++ "bindgen",
++ "env_logger",
++ "tracing",
++ "tracing-appender",
++ "tracing-subscriber",
++ "turso_core",
++ "turso_sdk_kit_macros",
++]
++
++[[package]]
++name = "turso_sdk_kit_macros"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "289f7ea7499419e6670363ca18e954ed53397bb1e03ab7eabbb267d9b05ab836"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "turso_sync_engine"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ea9860c615a7d8df43fc6ac4293636e9d743c1693513c81be22f0e9388624f58"
++dependencies = [
++ "base64",
++ "bytes",
++ "genawaiter",
++ "http",
++ "libc",
++ "prost",
++ "roaring",
++ "serde",
++ "serde_json",
++ "thiserror",
++ "tracing",
++ "turso_core",
++ "turso_parser",
++ "uuid",
++]
++
++[[package]]
++name = "turso_sync_sdk_kit"
++version = "0.4.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b669b19a5f4bfa7cfdf5045af36ca4a2087431c0d2844ec539ddcf951b5c9d2"
++dependencies = [
++ "bindgen",
++ "env_logger",
++ "genawaiter",
++ "parking_lot",
++ "tracing",
++ "tracing-appender",
++ "tracing-subscriber",
++ "turso_core",
++ "turso_sdk_kit",
++ "turso_sdk_kit_macros",
++ "turso_sync_engine",
++]
++
++[[package]]
++name = "twox-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
++dependencies = [
++ "rand 0.10.2",
++]
++
++[[package]]
++name = "typenum"
++version = "1.20.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
++
++[[package]]
++name = "uncased"
++version = "0.9.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
++dependencies = [
++ "version_check",
++]
++
++[[package]]
+ name = "unicode-ident"
+ version = "1.0.24"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+ 
+ [[package]]
++name = "unicode-width"
++version = "0.1.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
++
++[[package]]
++name = "universal-hash"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
++dependencies = [
++ "crypto-common",
++ "subtle",
++]
++
++[[package]]
++name = "url"
++version = "2.5.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
++dependencies = [
++ "form_urlencoded",
++ "idna",
++ "percent-encoding",
++ "serde",
++]
++
++[[package]]
++name = "utf8_iter"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
++
++[[package]]
++name = "uuid"
++version = "1.24.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
++dependencies = [
++ "getrandom 0.4.3",
++ "js-sys",
++ "sha1_smol",
++ "wasm-bindgen",
++]
++
++[[package]]
++name = "valuable"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
++
++[[package]]
++name = "vcpkg"
++version = "0.2.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "wasi"
++version = "0.11.1+wasi-snapshot-preview1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
++
++[[package]]
++name = "wasip2"
++version = "1.0.4+wasi-0.2.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
++dependencies = [
++ "wit-bindgen",
++]
++
++[[package]]
++name = "wasm-bindgen"
++version = "0.2.126"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "rustversion",
++ "wasm-bindgen-macro",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-macro"
++version = "0.2.126"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
++dependencies = [
++ "quote",
++ "wasm-bindgen-macro-support",
++]
++
++[[package]]
++name = "wasm-bindgen-macro-support"
++version = "0.2.126"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
++dependencies = [
++ "bumpalo",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "wasm-bindgen-shared",
++]
++
++[[package]]
++name = "wasm-bindgen-shared"
++version = "0.2.126"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "which"
++version = "4.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "87ba24419a2078cd2b0f2ede2691b6c66d8e47836da3b6db8265ebad47afbfc7"
++dependencies = [
++ "either",
++ "home",
++ "once_cell",
++ "rustix 0.38.44",
++]
++
++[[package]]
++name = "windows-core"
++version = "0.62.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
++dependencies = [
++ "windows-implement",
++ "windows-interface",
++ "windows-link",
++ "windows-result",
++ "windows-strings",
++]
++
++[[package]]
++name = "windows-implement"
++version = "0.60.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "windows-interface"
++version = "0.59.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-result"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-strings"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.59.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
++dependencies = [
++ "windows-targets",
++]
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "windows-targets"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
++dependencies = [
++ "windows_aarch64_gnullvm",
++ "windows_aarch64_msvc",
++ "windows_i686_gnu",
++ "windows_i686_gnullvm",
++ "windows_i686_msvc",
++ "windows_x86_64_gnu",
++ "windows_x86_64_gnullvm",
++ "windows_x86_64_msvc",
++]
++
++[[package]]
++name = "windows_aarch64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
++
++[[package]]
++name = "windows_aarch64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
++
++[[package]]
++name = "windows_i686_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
++
++[[package]]
++name = "windows_i686_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
++
++[[package]]
++name = "windows_i686_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
++
++[[package]]
++name = "windows_x86_64_gnu"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
++
++[[package]]
++name = "windows_x86_64_gnullvm"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
++
++[[package]]
++name = "windows_x86_64_msvc"
++version = "0.52.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
++
++[[package]]
++name = "wit-bindgen"
++version = "0.57.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
++
++[[package]]
++name = "writeable"
++version = "0.6.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
++
++[[package]]
++name = "yoke"
++version = "0.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
++dependencies = [
++ "stable_deref_trait",
++ "yoke-derive",
++ "zerofrom",
++]
++
++[[package]]
++name = "yoke-derive"
++version = "0.8.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "synstructure",
++]
++
++[[package]]
++name = "zerocopy"
++version = "0.8.55"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.55"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "zerofrom"
++version = "0.1.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
++dependencies = [
++ "zerofrom-derive",
++]
++
++[[package]]
++name = "zerofrom-derive"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "synstructure",
++]
++
++[[package]]
++name = "zerotrie"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf"
++dependencies = [
++ "displaydoc",
++ "yoke",
++ "zerofrom",
++]
++
++[[package]]
++name = "zerovec"
++version = "0.11.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239"
++dependencies = [
++ "yoke",
++ "zerofrom",
++ "zerovec-derive",
++]
++
++[[package]]
++name = "zerovec-derive"
++version = "0.11.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
+ name = "zmij"
+ version = "1.0.23"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+--- a/src/Mod/Anthracite/Runtime/Cargo.toml
++++ b/src/Mod/Anthracite/Runtime/Cargo.toml
+@@ -8,3 +8,10 @@ license = "LGPL-2.1-or-later"
+ 
+ [dependencies]
+ serde_json = "1.0"
++sha2 = "0.10"
++tokio = { version = "1.0", features = ["rt"] }
++turso = { version = "=0.4.4", default-features = false }
++uuid = { version = "1.0", features = ["v4"] }
++
++[dev-dependencies]
++tempfile = "3"
+--- a/src/Mod/Anthracite/Runtime/src/main.rs
++++ b/src/Mod/Anthracite/Runtime/src/main.rs
+@@ -3,11 +3,13 @@
+ mod process;
+ mod protocol;
+ mod providers;
++mod store;
+ 
+ use process::IoEvent;
+ use providers::ProviderAdapter;
+ use serde_json::Value;
+ use std::sync::mpsc;
++use store::Store;
+ 
+ fn handle_host_message(
+     message: Value,
+@@ -36,7 +38,21 @@ fn handle_host_message(
+                 .and_then(Value::as_str)
+                 .unwrap_or("");
+             let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or(".");
+-            providers::start(kind, binary, cwd, sender).map(|started| *provider = Some(started))
++            let database_path = payload
++                .get("storagePath")
++                .and_then(Value::as_str)
++                .unwrap_or("");
++            if database_path.is_empty() {
++                protocol::emit_error("Anthracite storage path is empty.");
++                return true;
++            }
++            Store::open(
++                database_path,
++                payload.get("document").unwrap_or(&Value::Null),
++                kind,
++            )
++            .and_then(|store| providers::start(kind, binary, cwd, sender, store))
++            .map(|started| *provider = Some(started))
+         }
+         "turn.start" => provider
+             .as_mut()
+--- a/src/Mod/Anthracite/Runtime/src/protocol.rs
++++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
+@@ -3,6 +3,8 @@
+ use serde_json::{Value, json};
+ use std::io::{self, Write};
+ 
++use crate::store::Store;
++
+ pub const VERSION: u64 = 1;
+ 
+ pub fn message_type(message: &Value) -> &str {
+@@ -13,7 +15,7 @@ pub fn payload(message: &Value) -> &Valu
+     message.get("payload").unwrap_or(&Value::Null)
+ }
+ 
+-pub fn emit(message_type: &str, payload: Value) {
++pub fn emit_raw(message_type: &str, payload: Value) {
+     let stdout = io::stdout();
+     let mut output = stdout.lock();
+     let value = json!({
+@@ -28,14 +30,53 @@ pub fn emit(message_type: &str, payload:
+ }
+ 
+ pub fn emit_error(message: impl Into<String>) {
+-    emit(
++    emit_raw(
+         "runtime.error",
+         json!({"class": "provider_error", "message": message.into()}),
+     );
+ }
+ 
+ pub fn emit_warning(message: impl Into<String>) {
+-    emit("runtime.warning", json!({"message": message.into()}));
++    emit_raw("runtime.warning", json!({"message": message.into()}));
++}
++
++pub struct Emitter {
++    store: Store,
++}
++
++impl Emitter {
++    pub fn new(store: Store) -> Self {
++        let emitter = Self { store };
++        emit_raw("thread.local.ready", emitter.store.summary());
++        match emitter.store.history() {
++            Ok(events) => emit_raw("history.snapshot", json!({"events": events})),
++            Err(error) => emit_warning(format!("Could not load conversation history: {error}")),
++        }
++        emitter
++    }
++
++    pub fn emit(&self, message_type: &str, payload: Value) {
++        if let Err(error) = self.store.record(message_type, &payload) {
++            emit_warning(format!("Could not persist runtime event: {error}"));
++        }
++        emit_raw(message_type, payload);
++    }
++
++    pub fn record(&self, message_type: &str, payload: &Value) {
++        if let Err(error) = self.store.record(message_type, payload) {
++            emit_warning(format!("Could not persist runtime event: {error}"));
++        }
++    }
++
++    pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
++        self.store.provider_thread_id()
++    }
++
++    pub fn set_provider_thread_id(&self, provider_thread_id: &str) {
++        if let Err(error) = self.store.set_provider_thread_id(provider_thread_id) {
++            emit_warning(format!("Could not persist provider thread id: {error}"));
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+--- a/src/Mod/Anthracite/Runtime/src/providers/codex.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+@@ -2,13 +2,15 @@
+ 
+ use super::ProviderAdapter;
+ use crate::process::{IoEvent, LineProcess};
+-use crate::protocol;
++use crate::protocol::{self, Emitter};
++use crate::store::Store;
+ use serde_json::{Map, Value, json};
+ use std::collections::HashMap;
+ use std::sync::mpsc;
+ 
+ const INITIALIZE_ID: u64 = 1;
+ const THREAD_START_ID: u64 = 2;
++const THREAD_FALLBACK_ID: u64 = 3;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ enum PendingKind {
+@@ -31,20 +33,31 @@ pub struct CodexAdapter {
+     next_interaction_id: u64,
+     thread_id: Option<String>,
+     turn_id: Option<String>,
++    resume_thread_id: Option<String>,
+     pending: HashMap<String, PendingRequest>,
++    emitter: Emitter,
+ }
+ 
+ impl CodexAdapter {
+-    pub fn start(binary: &str, cwd: &str, sender: &mpsc::Sender<IoEvent>) -> Result<Self, String> {
++    pub fn start(
++        binary: &str,
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++        store: Store,
++    ) -> Result<Self, String> {
+         let process = LineProcess::start(binary, &["app-server"], cwd, sender)?;
++        let emitter = Emitter::new(store);
++        let resume_thread_id = emitter.provider_thread_id()?;
+         let adapter = Self {
+             process,
+             cwd: cwd.to_owned(),
+-            next_request_id: 3,
++            next_request_id: 4,
+             next_interaction_id: 1,
+             thread_id: None,
+             turn_id: None,
++            resume_thread_id,
+             pending: HashMap::new(),
++            emitter,
+         };
+         adapter.process.send(&json!({
+             "id": INITIALIZE_ID,
+@@ -74,44 +87,64 @@ impl CodexAdapter {
+         Ok(id)
+     }
+ 
+-    fn start_thread(&self) -> Result<(), String> {
+-        self.send(&json!({
+-            "id": THREAD_START_ID,
+-            "method": "thread/start",
+-            "params": {
+-                "cwd": self.cwd,
+-                "serviceName": "anthracite_freecad",
+-                "developerInstructions": concat!(
+-                    "You are operating inside FreeCAD through Anthracite. ",
+-                    "Use the freecad tool for CAD inspection and every CAD mutation. ",
+-                    "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
+-                    "Prefer parametric, named objects and constraints. Inspect before editing. ",
+-                    "A tool call is one undoable transaction: failures roll back automatically. ",
+-                    "Read the returned observation, fix errors, and verify the finished model."
+-                ),
+-                "dynamicTools": [{
+-                    "type": "function",
+-                    "name": "freecad",
+-                    "description": concat!(
+-                        "Execute ordinary Python inside the active FreeCAD GUI. ",
+-                        "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
+-                        "The complete source runs as one transaction, recomputes and validates, ",
+-                        "then returns result/stdout plus created, changed, and deleted objects."
+-                    ),
+-                    "inputSchema": {
+-                        "type": "object",
+-                        "properties": {
+-                            "code": {
+-                                "type": "string",
+-                                "description": "Complete ordinary FreeCAD Python source."
+-                            }
+-                        },
+-                        "required": ["code"],
+-                        "additionalProperties": false
++    fn developer_instructions() -> &'static str {
++        concat!(
++            "You are operating inside FreeCAD through Anthracite. ",
++            "Use the freecad tool for CAD inspection and every CAD mutation. ",
++            "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
++            "Prefer parametric, named objects and constraints. Inspect before editing. ",
++            "A tool call is one undoable transaction: failures roll back automatically. ",
++            "Read the returned observation, fix errors, and verify the finished model."
++        )
++    }
++
++    fn freecad_tool() -> Value {
++        json!({
++            "type": "function",
++            "name": "freecad",
++            "description": concat!(
++                "Execute ordinary Python inside the active FreeCAD GUI. ",
++                "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++                "The complete source runs as one transaction, recomputes and validates, ",
++                "then returns result/stdout plus created, changed, and deleted objects."
++            ),
++            "inputSchema": {
++                "type": "object",
++                "properties": {
++                    "code": {
++                        "type": "string",
++                        "description": "Complete ordinary FreeCAD Python source."
+                     }
+-                }]
++                },
++                "required": ["code"],
++                "additionalProperties": false
+             }
+-        }))
++        })
++    }
++
++    fn open_thread(&self, request_id: u64) -> Result<(), String> {
++        if let Some(thread_id) = &self.resume_thread_id {
++            self.send(&json!({
++                "id": request_id,
++                "method": "thread/resume",
++                "params": {
++                    "threadId": thread_id,
++                    "cwd": self.cwd,
++                    "developerInstructions": Self::developer_instructions()
++                }
++            }))
++        } else {
++            self.send(&json!({
++                "id": request_id,
++                "method": "thread/start",
++                "params": {
++                    "cwd": self.cwd,
++                    "serviceName": "anthracite_freecad",
++                    "developerInstructions": Self::developer_instructions(),
++                    "dynamicTools": [Self::freecad_tool()]
++                }
++            }))
++        }
+     }
+ 
+     fn response_id(message: &Value) -> Option<u64> {
+@@ -158,7 +191,7 @@ impl CodexAdapter {
+             PendingKind::UserInput => unreachable!(),
+         };
+ 
+-        protocol::emit(
++        self.emitter.emit(
+             "request.opened",
+             json!({
+                 "requestId": request_id,
+@@ -181,7 +214,7 @@ impl CodexAdapter {
+ 
+     fn open_user_input(&mut self, server_id: Value, params: Value) {
+         let request_id = self.next_pending_id();
+-        protocol::emit(
++        self.emitter.emit(
+             "user_input.requested",
+             json!({
+                 "requestId": request_id,
+@@ -223,7 +256,7 @@ impl CodexAdapter {
+                     }))?;
+                     return Ok(());
+                 }
+-                protocol::emit(
++                self.emitter.emit(
+                     "tool.call",
+                     json!({
+                         "requestId": server_id,
+@@ -307,14 +340,14 @@ impl CodexAdapter {
+                     .pointer("/turn/id")
+                     .and_then(Value::as_str)
+                     .map(str::to_owned);
+-                protocol::emit(
++                self.emitter.emit(
+                     "turn.started",
+                     json!({"turnId": self.turn_id, "provider": "codex"}),
+                 );
+             }
+             "item/agentMessage/delta" => {
+                 if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+-                    protocol::emit(
++                    self.emitter.emit(
+                         "content.delta",
+                         json!({"streamKind": "assistant_text", "text": delta}),
+                     );
+@@ -323,7 +356,7 @@ impl CodexAdapter {
+             "item/started" | "item/completed" => {
+                 let item = params.get("item").unwrap_or(&Value::Null);
+                 if let Some((kind, title, detail)) = Self::item_description(item) {
+-                    protocol::emit(
++                    self.emitter.emit(
+                         if method == "item/started" {
+                             "item.started"
+                         } else {
+@@ -339,7 +372,7 @@ impl CodexAdapter {
+                 }
+             }
+             "turn/plan/updated" => {
+-                protocol::emit(
++                self.emitter.emit(
+                     "plan.updated",
+                     json!({
+                         "explanation": params.get("explanation"),
+@@ -348,7 +381,7 @@ impl CodexAdapter {
+                 );
+             }
+             "thread/tokenUsage/updated" => {
+-                protocol::emit(
++                self.emitter.emit(
+                     "usage.updated",
+                     params
+                         .get("tokenUsage")
+@@ -365,7 +398,8 @@ impl CodexAdapter {
+                     .pointer("/turn/error/message")
+                     .and_then(Value::as_str);
+                 self.turn_id = None;
+-                protocol::emit("turn.completed", json!({"status": status, "error": error}));
++                self.emitter
++                    .emit("turn.completed", json!({"status": status, "error": error}));
+             }
+             "error" => {
+                 let text = params
+@@ -373,7 +407,10 @@ impl CodexAdapter {
+                     .or_else(|| params.get("message"))
+                     .and_then(Value::as_str)
+                     .unwrap_or("Codex reported an unknown error.");
+-                protocol::emit_error(text);
++                self.emitter.emit(
++                    "runtime.error",
++                    json!({"class": "provider_error", "message": text}),
++                );
+             }
+             _ => {}
+         }
+@@ -381,20 +418,36 @@ impl CodexAdapter {
+ 
+     fn handle_response(&mut self, message: &Value) -> Result<(), String> {
+         if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            if Self::response_id(message) == Some(THREAD_START_ID)
++                && self.resume_thread_id.is_some()
++            {
++                self.emitter.emit(
++                    "runtime.warning",
++                    json!({
++                        "message": format!(
++                            "Could not resume the previous Codex thread; starting a new one: {error}"
++                        )
++                    }),
++                );
++                self.resume_thread_id = None;
++                self.open_thread(THREAD_FALLBACK_ID)?;
++                return Ok(());
++            }
+             return Err(format!("Codex protocol error: {error}"));
+         }
+         match Self::response_id(message) {
+             Some(INITIALIZE_ID) => {
+                 self.send(&json!({"method": "initialized"}))?;
+-                self.start_thread()?;
++                self.open_thread(THREAD_START_ID)?;
+             }
+-            Some(THREAD_START_ID) => {
++            Some(THREAD_START_ID | THREAD_FALLBACK_ID) => {
+                 self.thread_id = message
+                     .pointer("/result/thread/id")
+                     .and_then(Value::as_str)
+                     .map(str::to_owned);
+                 if let Some(thread_id) = &self.thread_id {
+-                    protocol::emit(
++                    self.emitter.set_provider_thread_id(thread_id);
++                    self.emitter.emit(
+                         "runtime.ready",
+                         json!({
+                             "provider": "codex",
+@@ -497,7 +550,10 @@ impl ProviderAdapter for CodexAdapter {
+                 }]
+             }),
+         )?;
+-        protocol::emit("session.state", json!({"state": "running"}));
++        self.emitter
++            .record("content.user", &json!({"text": prompt}));
++        self.emitter
++            .emit("session.state", json!({"state": "running"}));
+         Ok(())
+     }
+ 
+@@ -507,6 +563,10 @@ impl ProviderAdapter for CodexAdapter {
+         result: &str,
+         success: bool,
+     ) -> Result<(), String> {
++        self.emitter.record(
++            "tool.result",
++            &json!({"requestId": request_id, "result": result, "success": success}),
++        );
+         self.send(&json!({
+             "id": request_id,
+             "result": {
+@@ -529,7 +589,7 @@ impl ProviderAdapter for CodexAdapter {
+             }
+         };
+         self.send(&json!({"id": pending.server_id, "result": result}))?;
+-        protocol::emit(
++        self.emitter.emit(
+             "request.resolved",
+             json!({"requestId": request_id, "decision": decision}),
+         );
+@@ -550,7 +610,7 @@ impl ProviderAdapter for CodexAdapter {
+             "id": pending.server_id,
+             "result": {"answers": provider_answers}
+         }))?;
+-        protocol::emit(
++        self.emitter.emit(
+             "user_input.resolved",
+             json!({"requestId": request_id, "answers": answers}),
+         );
+--- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -3,6 +3,7 @@
+ mod codex;
+ 
+ use crate::process::IoEvent;
++use crate::store::Store;
+ use serde_json::Value;
+ use std::sync::mpsc;
+ 
+@@ -25,9 +26,12 @@ pub fn start(
+     binary: &str,
+     cwd: &str,
+     sender: &mpsc::Sender<IoEvent>,
++    store: Store,
+ ) -> Result<Box<dyn ProviderAdapter>, String> {
+     match kind {
+-        "codex" => Ok(Box::new(codex::CodexAdapter::start(binary, cwd, sender)?)),
++        "codex" => Ok(Box::new(codex::CodexAdapter::start(
++            binary, cwd, sender, store,
++        )?)),
+         _ => Err(format!("Unsupported provider adapter: {kind}")),
+     }
+ }
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/store.rs
+@@ -0,0 +1,503 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::fs::File;
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::time::{SystemTime, UNIX_EPOCH};
++use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
++use turso::{Builder, Connection, params};
++use uuid::Uuid;
++
++const MIGRATION: &str = r#"
++CREATE TABLE IF NOT EXISTS anthracite_schema (
++    version INTEGER NOT NULL
++);
++INSERT INTO anthracite_schema(version)
++SELECT 1
++WHERE NOT EXISTS (SELECT 1 FROM anthracite_schema);
++
++CREATE TABLE IF NOT EXISTS documents (
++    id TEXT PRIMARY KEY,
++    canonical_path TEXT,
++    session_key TEXT,
++    fingerprint TEXT,
++    display_name TEXT NOT NULL,
++    created_at_ms INTEGER NOT NULL,
++    updated_at_ms INTEGER NOT NULL
++);
++CREATE UNIQUE INDEX IF NOT EXISTS documents_canonical_path
++    ON documents(canonical_path);
++CREATE UNIQUE INDEX IF NOT EXISTS documents_session_key
++    ON documents(session_key);
++CREATE INDEX IF NOT EXISTS documents_fingerprint
++    ON documents(fingerprint);
++
++CREATE TABLE IF NOT EXISTS threads (
++    id TEXT PRIMARY KEY,
++    document_id TEXT NOT NULL,
++    provider TEXT NOT NULL,
++    provider_thread_id TEXT,
++    title TEXT NOT NULL,
++    archived INTEGER NOT NULL DEFAULT 0,
++    created_at_ms INTEGER NOT NULL,
++    updated_at_ms INTEGER NOT NULL
++);
++CREATE INDEX IF NOT EXISTS threads_document_updated
++    ON threads(document_id, provider, archived, updated_at_ms);
++
++CREATE TABLE IF NOT EXISTS events (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    thread_id TEXT NOT NULL,
++    turn_id TEXT,
++    event_type TEXT NOT NULL,
++    payload_json TEXT NOT NULL,
++    created_at_ms INTEGER NOT NULL
++);
++CREATE INDEX IF NOT EXISTS events_thread_id
++    ON events(thread_id, id);
++
++CREATE TABLE IF NOT EXISTS drafts (
++    thread_id TEXT PRIMARY KEY,
++    body TEXT NOT NULL,
++    updated_at_ms INTEGER NOT NULL
++);
++"#;
++
++fn now_ms() -> i64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis()
++        .try_into()
++        .unwrap_or(i64::MAX)
++}
++
++fn new_id(prefix: &str) -> String {
++    format!("{prefix}-{}", Uuid::new_v4())
++}
++
++fn canonical_path(path: &str) -> Option<String> {
++    if path.is_empty() {
++        return None;
++    }
++    let path = Path::new(path);
++    path.canonicalize()
++        .ok()
++        .or_else(|| Some(path.to_path_buf()))
++        .map(|path| path.to_string_lossy().into_owned())
++}
++
++fn fingerprint(path: &str) -> Option<String> {
++    let mut file = File::open(path).ok()?;
++    let mut digest = Sha256::new();
++    let mut buffer = [0_u8; 64 * 1024];
++    loop {
++        let count = file.read(&mut buffer).ok()?;
++        if count == 0 {
++            break;
++        }
++        digest.update(&buffer[..count]);
++    }
++    Some(format!("{:x}", digest.finalize()))
++}
++
++pub struct Store {
++    runtime: Runtime,
++    connection: Connection,
++    document_id: String,
++    thread_id: String,
++    provider: String,
++}
++
++impl Store {
++    pub fn open(database_path: &str, document: &Value, provider: &str) -> Result<Self, String> {
++        let path = PathBuf::from(database_path);
++        if let Some(parent) = path.parent() {
++            std::fs::create_dir_all(parent).map_err(|error| {
++                format!(
++                    "Could not create Anthracite data directory {}: {error}",
++                    parent.display()
++                )
++            })?;
++        }
++
++        let runtime = RuntimeBuilder::new_current_thread()
++            .build()
++            .map_err(|error| format!("Could not start Turso runtime: {error}"))?;
++        let database = runtime
++            .block_on(Builder::new_local(database_path).build())
++            .map_err(|error| format!("Could not open Anthracite Turso database: {error}"))?;
++        let connection = database
++            .connect()
++            .map_err(|error| format!("Could not connect to Anthracite Turso database: {error}"))?;
++        runtime
++            .block_on(connection.execute_batch(MIGRATION))
++            .map_err(|error| format!("Could not migrate Anthracite Turso database: {error}"))?;
++
++        let mut store = Self {
++            runtime,
++            connection,
++            document_id: String::new(),
++            thread_id: String::new(),
++            provider: provider.to_owned(),
++        };
++        store.document_id = store.resolve_document(document)?;
++        store.thread_id = store.resolve_thread()?;
++        Ok(store)
++    }
++
++    fn query_string(
++        &self,
++        sql: &str,
++        parameters: impl turso::IntoParams,
++    ) -> Result<Option<String>, String> {
++        self.runtime
++            .block_on(async {
++                let mut rows = self.connection.query(sql, parameters).await?;
++                Ok::<_, turso::Error>(match rows.next().await? {
++                    Some(row) => Some(row.get::<String>(0)?),
++                    None => None,
++                })
++            })
++            .map_err(|error| error.to_string())
++    }
++
++    fn resolve_document(&self, document: &Value) -> Result<String, String> {
++        let raw_path = document.get("path").and_then(Value::as_str).unwrap_or("");
++        let path = canonical_path(raw_path);
++        let session_key = if path.is_none() {
++            document
++                .get("sessionKey")
++                .and_then(Value::as_str)
++                .filter(|value| !value.is_empty())
++                .map(str::to_owned)
++        } else {
++            None
++        };
++        let display_name = document
++            .get("displayName")
++            .and_then(Value::as_str)
++            .filter(|value| !value.is_empty())
++            .unwrap_or("Unsaved FreeCAD document");
++        let file_fingerprint = path.as_deref().and_then(fingerprint);
++
++        if let Some(path) = &path
++            && let Some(id) = self.query_string(
++                "SELECT id FROM documents WHERE canonical_path = ?1 LIMIT 1",
++                params![path.as_str()],
++            )?
++        {
++            self.runtime
++                .block_on(self.connection.execute(
++                    "UPDATE documents
++                     SET fingerprint = ?1, display_name = ?2, updated_at_ms = ?3
++                     WHERE id = ?4",
++                    params![file_fingerprint, display_name, now_ms(), id.clone()],
++                ))
++                .map_err(|error| error.to_string())?;
++            return Ok(id);
++        }
++
++        if path.is_none()
++            && let Some(session_key) = &session_key
++            && let Some(id) = self.query_string(
++                "SELECT id FROM documents WHERE session_key = ?1 LIMIT 1",
++                params![session_key.as_str()],
++            )?
++        {
++            return Ok(id);
++        }
++
++        if let (Some(path), Some(file_fingerprint)) = (&path, &file_fingerprint) {
++            let matches = self
++                .runtime
++                .block_on(async {
++                    let mut rows = self
++                        .connection
++                        .query(
++                            "SELECT id, canonical_path
++                             FROM documents
++                             WHERE fingerprint = ?1
++                             LIMIT 2",
++                            params![file_fingerprint.as_str()],
++                        )
++                        .await?;
++                    let mut matches = Vec::new();
++                    while let Some(row) = rows.next().await? {
++                        matches.push((row.get::<String>(0)?, row.get::<String>(1)?));
++                    }
++                    Ok::<_, turso::Error>(matches)
++                })
++                .map_err(|error| error.to_string())?;
++            if matches.len() == 1 && !Path::new(&matches[0].1).exists() {
++                let id = matches[0].0.clone();
++                self.runtime
++                    .block_on(self.connection.execute(
++                        "UPDATE documents
++                         SET canonical_path = ?1, display_name = ?2, updated_at_ms = ?3
++                         WHERE id = ?4",
++                        params![path.as_str(), display_name, now_ms(), id.clone()],
++                    ))
++                    .map_err(|error| error.to_string())?;
++                return Ok(id);
++            }
++        }
++
++        let id = new_id("document");
++        let timestamp = now_ms();
++        self.runtime
++            .block_on(self.connection.execute(
++                "INSERT INTO documents(
++                    id, canonical_path, session_key, fingerprint, display_name,
++                    created_at_ms, updated_at_ms
++                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
++                params![
++                    id.clone(),
++                    path,
++                    session_key,
++                    file_fingerprint,
++                    display_name,
++                    timestamp,
++                    timestamp
++                ],
++            ))
++            .map_err(|error| error.to_string())?;
++        Ok(id)
++    }
++
++    fn resolve_thread(&self) -> Result<String, String> {
++        if let Some(id) = self.query_string(
++            "SELECT id
++             FROM threads
++             WHERE document_id = ?1 AND provider = ?2 AND archived = 0
++             ORDER BY updated_at_ms DESC
++             LIMIT 1",
++            params![self.document_id.clone(), self.provider.clone()],
++        )? {
++            return Ok(id);
++        }
++
++        let id = new_id("thread");
++        let timestamp = now_ms();
++        self.runtime
++            .block_on(self.connection.execute(
++                "INSERT INTO threads(
++                    id, document_id, provider, title, created_at_ms, updated_at_ms
++                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
++                params![
++                    id.clone(),
++                    self.document_id.clone(),
++                    self.provider.clone(),
++                    "New conversation",
++                    timestamp,
++                    timestamp
++                ],
++            ))
++            .map_err(|error| error.to_string())?;
++        Ok(id)
++    }
++
++    pub fn local_thread_id(&self) -> &str {
++        &self.thread_id
++    }
++
++    pub fn provider_thread_id(&self) -> Result<Option<String>, String> {
++        self.query_string(
++            "SELECT provider_thread_id
++             FROM threads
++             WHERE id = ?1 AND provider_thread_id IS NOT NULL",
++            params![self.thread_id.clone()],
++        )
++    }
++
++    pub fn set_provider_thread_id(&self, provider_thread_id: &str) -> Result<(), String> {
++        self.runtime
++            .block_on(self.connection.execute(
++                "UPDATE threads
++                 SET provider_thread_id = ?1, updated_at_ms = ?2
++                 WHERE id = ?3",
++                params![provider_thread_id, now_ms(), self.thread_id.clone()],
++            ))
++            .map_err(|error| error.to_string())?;
++        Ok(())
++    }
++
++    pub fn record(&self, event_type: &str, payload: &Value) -> Result<(), String> {
++        let turn_id = payload
++            .get("turnId")
++            .and_then(Value::as_str)
++            .map(str::to_owned);
++        self.runtime
++            .block_on(self.connection.execute(
++                "INSERT INTO events(
++                    thread_id, turn_id, event_type, payload_json, created_at_ms
++                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
++                params![
++                    self.thread_id.clone(),
++                    turn_id,
++                    event_type,
++                    payload.to_string(),
++                    now_ms()
++                ],
++            ))
++            .map_err(|error| error.to_string())?;
++        if event_type == "content.user"
++            && let Some(text) = payload.get("text").and_then(Value::as_str)
++        {
++            let title = text.chars().take(80).collect::<String>();
++            self.runtime
++                .block_on(self.connection.execute(
++                    "UPDATE threads
++                     SET title = ?1
++                     WHERE id = ?2 AND title = 'New conversation'",
++                    params![title, self.thread_id.clone()],
++                ))
++                .map_err(|error| error.to_string())?;
++        }
++        self.runtime
++            .block_on(self.connection.execute(
++                "UPDATE threads SET updated_at_ms = ?1 WHERE id = ?2",
++                params![now_ms(), self.thread_id.clone()],
++            ))
++            .map_err(|error| error.to_string())?;
++        Ok(())
++    }
++
++    pub fn history(&self) -> Result<Vec<Value>, String> {
++        let mut events = self
++            .runtime
++            .block_on(async {
++                let mut rows = self
++                    .connection
++                    .query(
++                        "SELECT event_type, payload_json
++                         FROM events
++                         WHERE thread_id = ?1
++                           AND event_type IN (
++                               'content.user',
++                               'content.delta',
++                               'item.started',
++                               'plan.updated',
++                               'runtime.warning'
++                           )
++                         ORDER BY id DESC
++                         LIMIT 500",
++                        params![self.thread_id.clone()],
++                    )
++                    .await?;
++                let mut events = Vec::new();
++                while let Some(row) = rows.next().await? {
++                    let event_type = row.get::<String>(0)?;
++                    let payload = row.get::<String>(1)?;
++                    events.push(json!({
++                        "type": event_type,
++                        "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null)
++                    }));
++                }
++                Ok::<_, turso::Error>(events)
++            })
++            .map_err(|error| error.to_string())?;
++        events.reverse();
++        Ok(events)
++    }
++
++    pub fn summary(&self) -> Value {
++        json!({
++            "localThreadId": self.local_thread_id(),
++            "documentId": self.document_id,
++            "provider": self.provider
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn persists_trajectory_without_writing_to_the_freecad_document() {
++        let directory = tempfile::tempdir().unwrap();
++        let document_path = directory.path().join("model.FCStd");
++        std::fs::write(&document_path, b"upstream-compatible-freecad-data").unwrap();
++        let database_path = directory.path().join("anthracite.db");
++        let document = json!({
++            "path": document_path,
++            "displayName": "model.FCStd",
++            "sessionKey": "not-used-for-saved-documents"
++        });
++
++        let store = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        let first_thread = store.local_thread_id().to_owned();
++        store
++            .record("content.user", &json!({"text": "Make a bracket"}))
++            .unwrap();
++        store
++            .record(
++                "content.delta",
++                &json!({"streamKind": "assistant_text", "text": "Done"}),
++            )
++            .unwrap();
++        drop(store);
++
++        let reopened = Store::open(database_path.to_str().unwrap(), &document, "codex").unwrap();
++        assert_eq!(reopened.local_thread_id(), first_thread);
++        assert_eq!(reopened.history().unwrap().len(), 2);
++        assert_eq!(
++            std::fs::read(document_path).unwrap(),
++            b"upstream-compatible-freecad-data"
++        );
++    }
++
++    #[test]
++    fn keeps_unsaved_documents_separate_by_external_session_key() {
++        let directory = tempfile::tempdir().unwrap();
++        let database_path = directory.path().join("anthracite.db");
++        let first = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({"sessionKey": "unsaved-one", "displayName": "Untitled"}),
++            "codex",
++        )
++        .unwrap();
++        let first_thread = first.local_thread_id().to_owned();
++        drop(first);
++
++        let second = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({"sessionKey": "unsaved-two", "displayName": "Untitled"}),
++            "codex",
++        )
++        .unwrap();
++        assert_ne!(second.local_thread_id(), first_thread);
++    }
++
++    #[test]
++    fn saved_documents_do_not_reuse_unsaved_session_keys() {
++        let directory = tempfile::tempdir().unwrap();
++        let database_path = directory.path().join("anthracite.db");
++        let unsaved = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({"sessionKey": "same-session", "displayName": "Untitled"}),
++            "codex",
++        )
++        .unwrap();
++        let unsaved_thread = unsaved.local_thread_id().to_owned();
++        drop(unsaved);
++
++        let document_path = directory.path().join("saved.FCStd");
++        std::fs::write(&document_path, b"saved-freecad-data").unwrap();
++        let saved = Store::open(
++            database_path.to_str().unwrap(),
++            &json!({
++                "path": document_path,
++                "sessionKey": "same-session",
++                "displayName": "saved.FCStd"
++            }),
++            "codex",
++        )
++        .unwrap();
++
++        assert_ne!(saved.local_thread_id(), unsaved_thread);
++    }
++}

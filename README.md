@@ -12,7 +12,7 @@ Anthracite puts a complete agent experience inside FreeCAD.
 
 - a native, dockable QML sidebar alongside the 3D viewport
 - existing coding-agent installations instead of a new agent harness
-- streaming chat and CAD activity, with durable threads, plans, approvals and drafts to follow
+- streaming chat and CAD activity with approvals, requested input, plans and durable replay
 - transactional, undoable changes with recompute, validation and structured diagnostics
 
 FreeCAD's normal selection, commands, properties, task panels and viewport remain first class.
@@ -24,17 +24,30 @@ interface.
 <details open>
 <summary><strong>status</strong></summary>
 
-The first working vertical slice is implemented in three ordered patches:
+The working vertical slice is implemented in eleven ordered patches:
 
 - a persistent native FreeCAD dock with a QML chat timeline and composer
 - a transactional `freecad` Python executor with rollback, recompute, validation, structured
   change observations and external-edit revision checks
 - a Rust process bridge for the existing Codex `app-server`, including streaming, interruption
   and dynamic tool calls
+- a provider-neutral, line-delimited interaction protocol for approvals, requested input, plans,
+  usage, activity and robust interleaved streaming
+- embedded Turso persistence for external document identities, normalized event history and
+  resuming the same Codex thread across FreeCAD sessions
+- document-scoped conversation creation and navigation with per-thread persistent drafts
+- safe session switching when the active FreeCAD document changes, including Save and Save As
+- live Codex model/effort controls, per-thread selection persistence and compact expandable
+  activity rows
+- bounded viewport renders attached to the same transactional `freecad` tool observation for
+  visual model verification
+- a normalized context-window usage meter in the composer
+- structured active-workbench and selected object/face/edge context, including geometry summaries
+  for momentary topology references
 
-Codex is the first complete provider adapter. Claude Code and OpenCode adapters, approvals, durable
-Turso-backed threads and richer CAD observations remain follow-on work behind the same narrow
-runtime protocol.
+Codex is the complete provider adapter. OpenCode support and deeper workbench-specific observation
+quality remain follow-on work behind the same narrow runtime protocol. Claude Code is deliberately
+not near-term work.
 
 </details>
 
@@ -80,10 +93,9 @@ Anthracite changes are explicit GNU Quilt patches under `patches/`, applied in t
   that keeps the FreeCAD patch stack simple.
 - C++/Qt owns FreeCAD registration, docking, GUI-thread scheduling and narrow native bridges.
 - Python remains the model-facing FreeCAD action language.
-- Embedded [Turso](https://github.com/tursodatabase/turso) will store conversations, sessions, tool
-  activity, drafts, CAD action history and document/session associations outside `.FCStd` by
-  default. Any future in-document metadata must use upstream-supported FreeCAD mechanisms and
-  round-trip safely through unmodified FreeCAD.
+- Embedded [Turso](https://github.com/tursodatabase/turso) stores conversation events, provider
+  thread state and document/session associations outside `.FCStd`. Any future in-document metadata
+  must use upstream-supported FreeCAD mechanisms and round-trip safely through unmodified FreeCAD.
 
 Keep new product code concentrated in `src/Mod/Anthracite`. Patch FreeCAD core only for narrow,
 proven integration gaps.
@@ -142,8 +154,8 @@ prompt in the dockable QML sidebar
   → streamed result in the sidebar
 ```
 
-This path is implemented. Additional providers can adapt to the same runtime event protocol without
-changing the FreeCAD executor or QML surface.
+This path is implemented for Codex. A future provider can adapt to the same runtime event protocol
+without changing the FreeCAD executor or QML surface.
 
 </details>
 

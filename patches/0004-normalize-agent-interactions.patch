@@ -1,0 +1,2290 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -62,6 +62,8 @@ AgentBridge::AgentBridge(SidebarControll
+     connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit);
+     connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
+     connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
++    connect(sidebar, &SidebarController::approvalResponded, this, &AgentBridge::respondToApproval);
++    connect(sidebar, &SidebarController::userInputResponded, this, &AgentBridge::respondToUserInput);
+     connect(&runtime, &QProcess::started, this, &AgentBridge::processStarted);
+     connect(&runtime, &QProcess::readyReadStandardOutput, this, &AgentBridge::readStandardOutput);
+     connect(&runtime, &QProcess::readyReadStandardError, this, &AgentBridge::readStandardError);
+@@ -81,7 +83,7 @@ void AgentBridge::submit(const QString&
+     stopping = false;
+ 
+     if (runtimeReady) {
+-        send({{"type", "turn"}, {"prompt", queuedPrompt}});
++        send(QStringLiteral("turn.start"), {{"prompt", queuedPrompt}});
+         queuedPrompt.clear();
+         return;
+     }
+@@ -92,7 +94,7 @@ void AgentBridge::submit(const QString&
+ void AgentBridge::stop()
+ {
+     stopping = true;
+-    send({{"type", "interrupt"}});
++    send(QStringLiteral("turn.interrupt"));
+ }
+ 
+ void AgentBridge::chooseProvider()
+@@ -117,15 +119,38 @@ void AgentBridge::chooseProvider()
+     runtimeReady = false;
+ }
+ 
++void AgentBridge::respondToApproval(const QString& requestId, const QString& decision)
++{
++    send(QStringLiteral("request.resolve"), {{"requestId", requestId}, {"decision", decision}});
++}
++
++void AgentBridge::respondToUserInput(const QString& requestId, const QVariantMap& answers)
++{
++    send(
++        QStringLiteral("user_input.resolve"),
++        {
++            {"requestId", requestId},
++            {"answers", QJsonObject::fromVariantMap(answers)},
++        }
++    );
++}
++
+ void AgentBridge::processStarted()
+ {
+     sidebar->updateStatus(tr("Connecting"));
+-    send({
+-        {"type", "start"},
+-        {"provider", "codex"},
+-        {"binary", codexPath()},
+-        {"cwd", workingDirectory()},
+-    });
++    send(
++        QStringLiteral("session.start"),
++        {
++            {
++                "provider",
++                QJsonObject {
++                    {"kind", "codex"},
++                    {"binary", codexPath()},
++                },
++            },
++            {"cwd", workingDirectory()},
++        }
++    );
+ }
+ 
+ void AgentBridge::readStandardOutput()
+@@ -204,11 +229,16 @@ void AgentBridge::ensureRuntime()
+     runtime.start();
+ }
+ 
+-void AgentBridge::send(const QJsonObject& message)
++void AgentBridge::send(const QString& type, const QJsonObject& payload)
+ {
+     if (runtime.state() == QProcess::NotRunning) {
+         return;
+     }
++    const QJsonObject message {
++        {"protocolVersion", 1},
++        {"type", type},
++        {"payload", payload},
++    };
+     runtime.write(QJsonDocument(message).toJson(QJsonDocument::Compact));
+     runtime.write("\n");
+ }
+@@ -216,45 +246,79 @@ void AgentBridge::send(const QJsonObject
+ void AgentBridge::handleMessage(const QJsonObject& message)
+ {
+     const QString type = message.value("type").toString();
+-    if (type == QLatin1String("ready")) {
++    const QJsonObject payload = message.value("payload").toObject();
++    if (type == QLatin1String("runtime.ready")) {
+         runtimeReady = true;
+         sidebar->appendActivity(tr("Codex connected"));
+         sidebar->updateStatus(tr("Thinking"));
+         if (!queuedPrompt.isEmpty()) {
+-            send({{"type", "turn"}, {"prompt", queuedPrompt}});
++            send(QStringLiteral("turn.start"), {{"prompt", queuedPrompt}});
+             queuedPrompt.clear();
+         }
+     }
+-    else if (type == QLatin1String("assistant_delta")) {
++    else if (type == QLatin1String("content.delta")
++             && payload.value("streamKind").toString() == QLatin1String("assistant_text")) {
+         sidebar->updateStatus(tr("Responding"));
+         if (!assistantMessageStarted) {
+             sidebar->beginAssistantMessage();
+             assistantMessageStarted = true;
+         }
+-        sidebar->appendAssistantDelta(message.value("text").toString());
++        sidebar->appendAssistantDelta(payload.value("text").toString());
+     }
+-    else if (type == QLatin1String("activity")) {
+-        sidebar->appendActivity(message.value("text").toString());
++    else if (type == QLatin1String("item.started")) {
++        const QString title = payload.value("title").toString();
++        const QString detail = payload.value("detail").toString();
++        sidebar->appendActivity(detail.isEmpty() ? title : tr("%1: %2").arg(title, detail));
++    }
++    else if (type == QLatin1String("tool.call")) {
++        runFreeCADTool(payload);
++    }
++    else if (type == QLatin1String("request.opened")) {
++        sidebar->showApproval(
++            payload.value("requestId").toString(),
++            payload.value("title").toString(tr("Approval needed")),
++            payload.value("detail").toString(),
++            payload.value("allowSession").toBool()
++        );
+     }
+-    else if (type == QLatin1String("tool_call")) {
+-        runFreeCADTool(message);
++    else if (type == QLatin1String("user_input.requested")) {
++        sidebar->showUserInput(
++            payload.value("requestId").toString(),
++            payload.value("questions").toArray().toVariantList()
++        );
+     }
+-    else if (type == QLatin1String("turn_completed")) {
+-        sidebar->completeTurn();
++    else if (type == QLatin1String("plan.updated")) {
++        sidebar->updatePlan(
++            payload.value("explanation").toString(),
++            payload.value("steps").toArray().toVariantList()
++        );
+     }
+-    else if (type == QLatin1String("error")) {
+-        fail(message.value("message").toString(tr("Unknown agent error.")));
++    else if (type == QLatin1String("runtime.warning")) {
++        sidebar->appendActivity(payload.value("message").toString());
++    }
++    else if (type == QLatin1String("turn.completed")) {
++        const QString status = payload.value("status").toString();
++        if (status == QLatin1String("failed")) {
++            fail(payload.value("error").toString(tr("The provider turn failed.")));
++        }
++        else {
++            sidebar->completeTurn();
++        }
++    }
++    else if (type == QLatin1String("runtime.error")) {
++        fail(payload.value("message").toString(tr("Unknown agent error.")));
+     }
+ }
+ 
+-void AgentBridge::runFreeCADTool(const QJsonObject& message)
++void AgentBridge::runFreeCADTool(const QJsonObject& payload)
+ {
+     Q_ASSERT(QThread::currentThread() == qApp->thread());
+     sidebar->updateStatus(tr("Editing"));
+     sidebar->appendActivity(tr("Running FreeCAD Python"));
+ 
+     bool success = false;
+-    const QString result = executePython(message.value("code").toString(), success);
++    const QString result
++        = executePython(payload.value("arguments").toObject().value("code").toString(), success);
+     const auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
+     if (resultDocument.isObject()) {
+         const auto resultObject = resultDocument.object();
+@@ -270,12 +334,14 @@ void AgentBridge::runFreeCADTool(const Q
+         );
+     }
+ 
+-    send({
+-        {"type", "tool_result"},
+-        {"requestId", message.value("requestId")},
+-        {"result", result},
+-        {"success", success},
+-    });
++    send(
++        QStringLiteral("tool.result"),
++        {
++            {"requestId", payload.value("requestId")},
++            {"result", result},
++            {"success", success},
++        }
++    );
+ }
+ 
+ QString AgentBridge::executePython(const QString& source, bool& success)
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -7,6 +7,7 @@
+ #include <QJsonObject>
+ #include <QObject>
+ #include <QProcess>
++#include <QVariantMap>
+ 
+ #include <optional>
+ 
+@@ -26,6 +27,8 @@ private Q_SLOTS:
+     void submit(const QString& prompt);
+     void stop();
+     void chooseProvider();
++    void respondToApproval(const QString& requestId, const QString& decision);
++    void respondToUserInput(const QString& requestId, const QVariantMap& answers);
+     void processStarted();
+     void readStandardOutput();
+     void readStandardError();
+@@ -34,9 +37,9 @@ private Q_SLOTS:
+ 
+ private:
+     void ensureRuntime();
+-    void send(const QJsonObject& message);
++    void send(const QString& type, const QJsonObject& payload = {});
+     void handleMessage(const QJsonObject& message);
+-    void runFreeCADTool(const QJsonObject& message);
++    void runFreeCADTool(const QJsonObject& payload);
+     QString executePython(const QString& source, bool& success);
+     QString runtimePath() const;
+     QString codexPath() const;
+--- a/src/Mod/Anthracite/Gui/CMakeLists.txt
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -33,6 +33,10 @@ add_custom_command(
+         ${AnthraciteRuntime_SOURCE_DIR}/Cargo.lock
+         ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
+         ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
+     COMMENT "Building Anthracite agent runtime"
+     VERBATIM
+ )
+--- a/src/Mod/Anthracite/Gui/ConversationModel.cpp
++++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
+@@ -52,18 +52,39 @@ void ConversationModel::append(QString a
+     endInsertRows();
+ }
+ 
++void ConversationModel::beginTurn()
++{
++    assistantRow = -1;
++    planRow = -1;
++}
++
+ void ConversationModel::beginAssistantMessage()
+ {
++    if (assistantRow >= 0) {
++        return;
++    }
++    assistantRow = static_cast<int>(messages.size());
+     append(QStringLiteral("Anthracite"), {}, QStringLiteral("assistant"));
+ }
+ 
+ void ConversationModel::appendAssistantDelta(const QString& delta)
+ {
+-    if (messages.empty() || messages.back().kind != QLatin1String("assistant")) {
++    if (assistantRow < 0) {
+         beginAssistantMessage();
+     }
+ 
+-    messages.back().body += delta;
+-    const int row = static_cast<int>(messages.size()) - 1;
+-    Q_EMIT dataChanged(index(row), index(row), {BodyRole});
++    messages.at(static_cast<std::size_t>(assistantRow)).body += delta;
++    Q_EMIT dataChanged(index(assistantRow), index(assistantRow), {BodyRole});
++}
++
++void ConversationModel::upsertPlan(const QString& body)
++{
++    if (planRow < 0) {
++        planRow = static_cast<int>(messages.size());
++        append(QStringLiteral("Plan"), body, QStringLiteral("plan"));
++        return;
++    }
++
++    messages.at(static_cast<std::size_t>(planRow)).body = body;
++    Q_EMIT dataChanged(index(planRow), index(planRow), {BodyRole});
+ }
+--- a/src/Mod/Anthracite/Gui/ConversationModel.h
++++ b/src/Mod/Anthracite/Gui/ConversationModel.h
+@@ -29,8 +29,10 @@ public:
+     QHash<int, QByteArray> roleNames() const override;
+ 
+     void append(QString author, QString body, QString kind);
++    void beginTurn();
+     void beginAssistantMessage();
+     void appendAssistantDelta(const QString& delta);
++    void upsertPlan(const QString& body);
+ 
+ private:
+     struct Message
+@@ -41,6 +43,8 @@ private:
+     };
+ 
+     std::vector<Message> messages;
++    int assistantRow = -1;
++    int planRow = -1;
+ };
+ }  // namespace AnthraciteGui
+ 
+--- a/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
++++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+@@ -92,8 +92,10 @@ Pane {
+                     radius: 8
+                     color: kind === "user"
+                            ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
+-                           : kind === "error"
++                             : kind === "error"
+                              ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
++                             : kind === "plan"
++                               ? Qt.rgba(0.38, 0.63, 0.42, 0.14)
+                              : kind === "activity"
+                                ? Qt.rgba(0.50, 0.50, 0.50, 0.10)
+                                : Qt.rgba(0.50, 0.50, 0.50, 0.07)
+@@ -129,6 +131,152 @@ Pane {
+         }
+ 
+         Rectangle {
++            id: interactionCard
++            objectName: "AnthraciteInteractionCard"
++            visible: anthraciteController.interactionPending
++            Layout.fillWidth: true
++            Layout.leftMargin: 10
++            Layout.rightMargin: 10
++            Layout.bottomMargin: 8
++            Layout.preferredHeight: Math.min(320, interactionContent.implicitHeight + 22)
++            radius: 8
++            color: Qt.rgba(0.78, 0.57, 0.18, 0.13)
++            border.color: Qt.rgba(0.78, 0.57, 0.18, 0.48)
++
++            ScrollView {
++                id: interactionScroll
++                anchors.fill: parent
++                anchors.margins: 10
++                clip: true
++
++                ColumnLayout {
++                    id: interactionContent
++                    width: interactionScroll.availableWidth
++                    spacing: 9
++
++                    Label {
++                        Layout.fillWidth: true
++                        text: anthraciteController.interactionTitle
++                        font.weight: Font.DemiBold
++                        color: systemPalette.windowText
++                    }
++
++                    Label {
++                        visible: text.length > 0
++                        Layout.fillWidth: true
++                        text: anthraciteController.interactionDetail
++                        wrapMode: Text.Wrap
++                        color: systemPalette.windowText
++                    }
++
++                    RowLayout {
++                        visible: anthraciteController.interactionKind === "approval"
++                        Layout.fillWidth: true
++
++                        Button {
++                            text: qsTr("Decline")
++                            onClicked: anthraciteController.respondToApproval("decline")
++                        }
++
++                        Item {
++                            Layout.fillWidth: true
++                        }
++
++                        Button {
++                            text: qsTr("Approve once")
++                            highlighted: true
++                            onClicked: anthraciteController.respondToApproval("approve")
++                        }
++
++                        Button {
++                            visible: anthraciteController.interactionAllowSession
++                            text: qsTr("Approve session")
++                            onClicked: anthraciteController.respondToApproval("approve_session")
++                        }
++                    }
++
++                    ColumnLayout {
++                        id: requestedInput
++                        objectName: "AnthraciteRequestedInput"
++                        visible: anthraciteController.interactionKind === "user_input"
++                        Layout.fillWidth: true
++                        spacing: 12
++
++                        Repeater {
++                            model: anthraciteController.interactionQuestions
++
++                            delegate: ColumnLayout {
++                                property var questionData: modelData
++                                Layout.fillWidth: true
++                                spacing: 5
++
++                                Label {
++                                    Layout.fillWidth: true
++                                    text: questionData.header || ""
++                                    font.pixelSize: 11
++                                    font.weight: Font.DemiBold
++                                    color: systemPalette.windowText
++                                    opacity: 0.72
++                                }
++
++                                Label {
++                                    Layout.fillWidth: true
++                                    text: questionData.question || ""
++                                    wrapMode: Text.Wrap
++                                    color: systemPalette.windowText
++                                }
++
++                                Repeater {
++                                    model: questionData.options || []
++
++                                    delegate: Button {
++                                        property var optionData: modelData
++                                        Layout.fillWidth: true
++                                        text: optionData.label || ""
++                                        checkable: true
++                                        checked: anthraciteController.inputAnswer(
++                                                     questionData.id) === text
++                                        onClicked: anthraciteController.setInputAnswer(
++                                                       questionData.id, text)
++
++                                        ToolTip.visible: hovered
++                                                             && (optionData.description || "").length > 0
++                                        ToolTip.text: optionData.description || ""
++                                    }
++                                }
++
++                                TextField {
++                                    Layout.fillWidth: true
++                                    placeholderText: qsTr("Or type another answer…")
++                                    echoMode: questionData.isSecret
++                                              ? TextInput.Password
++                                              : TextInput.Normal
++                                    onTextEdited: anthraciteController.setInputAnswer(
++                                                      questionData.id, text)
++                                }
++                            }
++                        }
++
++                        RowLayout {
++                            Layout.fillWidth: true
++
++                            Item {
++                                Layout.fillWidth: true
++                            }
++
++                            Button {
++                                text: qsTr("Answer")
++                                highlighted: true
++                                enabled: anthraciteController.inputComplete
++                                onClicked: anthraciteController.submitInputAnswers()
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        Rectangle {
+             Layout.fillWidth: true
+             Layout.preferredHeight: composerLayout.implicitHeight + 20
+             color: systemPalette.window
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -10,6 +10,8 @@
+ #include <QUrl>
+ #include <QVBoxLayout>
+ 
++#include <QStringList>
++
+ #include <utility>
+ 
+ #include <Gui/DockWindowManager.h>
+@@ -44,6 +46,50 @@ bool SidebarController::busy() const
+     return turnBusy;
+ }
+ 
++bool SidebarController::interactionPending() const
++{
++    return !pendingInteractionKind.isEmpty();
++}
++
++QString SidebarController::interactionKind() const
++{
++    return pendingInteractionKind;
++}
++
++QString SidebarController::interactionTitle() const
++{
++    return pendingInteractionTitle;
++}
++
++QString SidebarController::interactionDetail() const
++{
++    return pendingInteractionDetail;
++}
++
++bool SidebarController::interactionAllowSession() const
++{
++    return pendingAllowSession;
++}
++
++QVariantList SidebarController::interactionQuestions() const
++{
++    return pendingQuestions;
++}
++
++bool SidebarController::inputComplete() const
++{
++    if (pendingInteractionKind != QLatin1String("user_input") || pendingQuestions.isEmpty()) {
++        return false;
++    }
++    for (const auto& value : pendingQuestions) {
++        const QString id = value.toMap().value(QStringLiteral("id")).toString();
++        if (id.isEmpty() || pendingAnswers.value(id).toString().trimmed().isEmpty()) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ void SidebarController::submit(const QString& prompt)
+ {
+     const QString text = prompt.trimmed();
+@@ -52,6 +98,8 @@ void SidebarController::submit(const QSt
+     }
+ 
+     conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
++    conversation.beginTurn();
++    clearInteraction();
+     setBusy(true);
+     setStatus(QStringLiteral("Starting agent"));
+     Q_EMIT promptSubmitted(text);
+@@ -70,6 +118,54 @@ void SidebarController::chooseProvider()
+     Q_EMIT chooseProviderRequested();
+ }
+ 
++void SidebarController::respondToApproval(const QString& decision)
++{
++    if (pendingInteractionKind != QLatin1String("approval") || pendingRequestId.isEmpty()) {
++        return;
++    }
++    const QString requestId = pendingRequestId;
++    appendActivity(
++        decision.startsWith(QLatin1String("approve")) ? tr("Approved provider request")
++                                                      : tr("Declined provider request")
++    );
++    clearInteraction();
++    setStatus(QStringLiteral("Thinking"));
++    Q_EMIT approvalResponded(requestId, decision);
++}
++
++void SidebarController::setInputAnswer(const QString& questionId, const QString& answer)
++{
++    if (pendingInteractionKind != QLatin1String("user_input") || questionId.isEmpty()) {
++        return;
++    }
++    const QString text = answer.trimmed();
++    if (text.isEmpty()) {
++        pendingAnswers.remove(questionId);
++    }
++    else {
++        pendingAnswers.insert(questionId, text);
++    }
++    Q_EMIT interactionChanged();
++}
++
++QString SidebarController::inputAnswer(const QString& questionId) const
++{
++    return pendingAnswers.value(questionId).toString();
++}
++
++void SidebarController::submitInputAnswers()
++{
++    if (!inputComplete() || pendingRequestId.isEmpty()) {
++        return;
++    }
++    const QString requestId = pendingRequestId;
++    const QVariantMap answers = pendingAnswers;
++    appendActivity(tr("Answered provider question"));
++    clearInteraction();
++    setStatus(QStringLiteral("Thinking"));
++    Q_EMIT userInputResponded(requestId, answers);
++}
++
+ void SidebarController::appendActivity(const QString& text)
+ {
+     conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
+@@ -85,14 +181,79 @@ void SidebarController::appendAssistantD
+     conversation.appendAssistantDelta(delta);
+ }
+ 
++void SidebarController::updatePlan(const QString& explanation, const QVariantList& steps)
++{
++    QStringList lines;
++    if (!explanation.trimmed().isEmpty()) {
++        lines.append(explanation.trimmed());
++        lines.append(QString());
++    }
++    for (const auto& value : steps) {
++        const QVariantMap step = value.toMap();
++        const QString status = step.value(QStringLiteral("status")).toString();
++        const QString marker = status == QLatin1String("completed") ? QStringLiteral("●")
++            : status == QLatin1String("inProgress")                 ? QStringLiteral("◐")
++                                                                    : QStringLiteral("○");
++        lines.append(
++            QStringLiteral("%1 %2").arg(marker, step.value(QStringLiteral("step")).toString())
++        );
++    }
++    conversation.upsertPlan(lines.join(QLatin1Char('\n')));
++}
++
++void SidebarController::showApproval(
++    const QString& requestId,
++    const QString& title,
++    const QString& detail,
++    bool allowSession
++)
++{
++    clearInteraction();
++    pendingRequestId = requestId;
++    pendingInteractionKind = QStringLiteral("approval");
++    pendingInteractionTitle = title;
++    pendingInteractionDetail = detail;
++    pendingAllowSession = allowSession;
++    setStatus(QStringLiteral("Approval needed"));
++    Q_EMIT interactionChanged();
++}
++
++void SidebarController::showUserInput(const QString& requestId, const QVariantList& questions)
++{
++    clearInteraction();
++    pendingRequestId = requestId;
++    pendingInteractionKind = QStringLiteral("user_input");
++    pendingInteractionTitle = tr("Input needed");
++    pendingQuestions = questions;
++    setStatus(QStringLiteral("Input needed"));
++    Q_EMIT interactionChanged();
++}
++
++void SidebarController::clearInteraction()
++{
++    if (!interactionPending() && pendingRequestId.isEmpty()) {
++        return;
++    }
++    pendingRequestId.clear();
++    pendingInteractionKind.clear();
++    pendingInteractionTitle.clear();
++    pendingInteractionDetail.clear();
++    pendingQuestions.clear();
++    pendingAnswers.clear();
++    pendingAllowSession = false;
++    Q_EMIT interactionChanged();
++}
++
+ void SidebarController::completeTurn()
+ {
++    clearInteraction();
+     setBusy(false);
+     setStatus(QStringLiteral("Ready"));
+ }
+ 
+ void SidebarController::failTurn(const QString& error)
+ {
++    clearInteraction();
+     conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
+     setBusy(false);
+     setStatus(QStringLiteral("Error"));
+--- a/src/Mod/Anthracite/Gui/Sidebar.h
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -5,6 +5,8 @@
+ 
+ #include <QPointer>
+ #include <QString>
++#include <QVariantList>
++#include <QVariantMap>
+ #include <QWidget>
+ 
+ #include "ConversationModel.h"
+@@ -20,6 +22,13 @@ class SidebarController: public QObject
+     Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
+     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
+     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
++    Q_PROPERTY(bool interactionPending READ interactionPending NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionKind READ interactionKind NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionTitle READ interactionTitle NOTIFY interactionChanged)
++    Q_PROPERTY(QString interactionDetail READ interactionDetail NOTIFY interactionChanged)
++    Q_PROPERTY(bool interactionAllowSession READ interactionAllowSession NOTIFY interactionChanged)
++    Q_PROPERTY(QVariantList interactionQuestions READ interactionQuestions NOTIFY interactionChanged)
++    Q_PROPERTY(bool inputComplete READ inputComplete NOTIFY interactionChanged)
+ 
+ public:
+     explicit SidebarController(QObject* parent = nullptr);
+@@ -27,14 +36,34 @@ public:
+     QAbstractItemModel* messages();
+     QString status() const;
+     bool busy() const;
++    bool interactionPending() const;
++    QString interactionKind() const;
++    QString interactionTitle() const;
++    QString interactionDetail() const;
++    bool interactionAllowSession() const;
++    QVariantList interactionQuestions() const;
++    bool inputComplete() const;
+ 
+     Q_INVOKABLE void submit(const QString& prompt);
+     Q_INVOKABLE void stop();
+     Q_INVOKABLE void chooseProvider();
++    Q_INVOKABLE void respondToApproval(const QString& decision);
++    Q_INVOKABLE void setInputAnswer(const QString& questionId, const QString& answer);
++    Q_INVOKABLE QString inputAnswer(const QString& questionId) const;
++    Q_INVOKABLE void submitInputAnswers();
+ 
+     void appendActivity(const QString& text);
+     void beginAssistantMessage();
+     void appendAssistantDelta(const QString& delta);
++    void updatePlan(const QString& explanation, const QVariantList& steps);
++    void showApproval(
++        const QString& requestId,
++        const QString& title,
++        const QString& detail,
++        bool allowSession
++    );
++    void showUserInput(const QString& requestId, const QVariantList& questions);
++    void clearInteraction();
+     void completeTurn();
+     void failTurn(const QString& error);
+     void updateStatus(const QString& status);
+@@ -43,8 +72,11 @@ Q_SIGNALS:
+     void promptSubmitted(const QString& prompt);
+     void stopRequested();
+     void chooseProviderRequested();
++    void approvalResponded(const QString& requestId, const QString& decision);
++    void userInputResponded(const QString& requestId, const QVariantMap& answers);
+     void statusChanged();
+     void busyChanged();
++    void interactionChanged();
+ 
+ private:
+     void setStatus(QString status);
+@@ -52,6 +84,13 @@ private:
+ 
+     ConversationModel conversation;
+     QString currentStatus;
++    QString pendingRequestId;
++    QString pendingInteractionKind;
++    QString pendingInteractionTitle;
++    QString pendingInteractionDetail;
++    QVariantList pendingQuestions;
++    QVariantMap pendingAnswers;
++    bool pendingAllowSession = false;
+     bool turnBusy = false;
+ };
+ 
+--- a/src/Mod/Anthracite/Runtime/src/main.rs
++++ b/src/Mod/Anthracite/Runtime/src/main.rs
+@@ -1,509 +1,134 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+-use serde_json::{Value, json};
+-use std::io::{self, BufRead, BufReader, Write};
+-use std::process::{Child, ChildStdin, Command, Stdio};
+-use std::sync::{Arc, Mutex, mpsc};
+-use std::thread;
+-
+-const INITIALIZE_ID: u64 = 1;
+-const THREAD_START_ID: u64 = 2;
+-
+-enum Event {
+-    HostLine(String),
+-    HostClosed,
+-    ServerLine(String),
+-    ServerError(String),
+-    ServerClosed,
+-}
+-
+-struct Provider {
+-    child: Child,
+-    input: Arc<Mutex<ChildStdin>>,
+-    next_request_id: u64,
+-    thread_id: Option<String>,
+-    turn_id: Option<String>,
+-}
+-
+-impl Provider {
+-    fn send(&self, value: &Value) -> Result<(), String> {
+-        let mut input = self
+-            .input
+-            .lock()
+-            .map_err(|_| "Codex input lock was poisoned.".to_string())?;
+-        serde_json::to_writer(&mut *input, value).map_err(|error| error.to_string())?;
+-        input.write_all(b"\n").map_err(|error| error.to_string())?;
+-        input.flush().map_err(|error| error.to_string())
+-    }
+-
+-    fn request(&mut self, method: &str, params: Value) -> Result<u64, String> {
+-        let id = self.next_request_id;
+-        self.next_request_id += 1;
+-        self.send(&json!({"id": id, "method": method, "params": params}))?;
+-        Ok(id)
+-    }
+-}
+-
+-impl Drop for Provider {
+-    fn drop(&mut self) {
+-        let _ = self.child.kill();
+-        let _ = self.child.wait();
+-    }
+-}
+-
+-fn emit(value: Value) {
+-    let stdout = io::stdout();
+-    let mut output = stdout.lock();
+-    if serde_json::to_writer(&mut output, &value).is_ok() {
+-        let _ = output.write_all(b"\n");
+-        let _ = output.flush();
+-    }
+-}
+-
+-fn emit_error(message: impl Into<String>) {
+-    emit(json!({"type": "error", "message": message.into()}));
+-}
+-
+-fn spawn_line_reader<R: io::Read + Send + 'static>(
+-    reader: R,
+-    sender: mpsc::Sender<Event>,
+-    map: fn(String) -> Event,
+-    closed: Option<Event>,
+-) {
+-    thread::spawn(move || {
+-        for line in BufReader::new(reader).lines() {
+-            match line {
+-                Ok(line) => {
+-                    if sender.send(map(line)).is_err() {
+-                        return;
+-                    }
+-                }
+-                Err(error) => {
+-                    let _ = sender.send(Event::ServerError(error.to_string()));
+-                    return;
+-                }
+-            }
+-        }
+-        if let Some(event) = closed {
+-            let _ = sender.send(event);
+-        }
+-    });
+-}
+-
+-fn start_provider(
+-    binary: &str,
+-    cwd: &str,
+-    sender: &mpsc::Sender<Event>,
+-) -> Result<Provider, String> {
+-    let mut child = Command::new(binary)
+-        .arg("app-server")
+-        .current_dir(cwd)
+-        .stdin(Stdio::piped())
+-        .stdout(Stdio::piped())
+-        .stderr(Stdio::piped())
+-        .spawn()
+-        .map_err(|error| format!("Could not start Codex at {binary}: {error}"))?;
+-
+-    let input = child
+-        .stdin
+-        .take()
+-        .ok_or_else(|| "Codex did not expose standard input.".to_string())?;
+-    let output = child
+-        .stdout
+-        .take()
+-        .ok_or_else(|| "Codex did not expose standard output.".to_string())?;
+-    let errors = child
+-        .stderr
+-        .take()
+-        .ok_or_else(|| "Codex did not expose standard error.".to_string())?;
+-
+-    spawn_line_reader(
+-        output,
+-        sender.clone(),
+-        Event::ServerLine,
+-        Some(Event::ServerClosed),
+-    );
+-    spawn_line_reader(errors, sender.clone(), Event::ServerError, None);
+-
+-    let provider = Provider {
+-        child,
+-        input: Arc::new(Mutex::new(input)),
+-        next_request_id: 3,
+-        thread_id: None,
+-        turn_id: None,
+-    };
+-    provider.send(&json!({
+-        "id": INITIALIZE_ID,
+-        "method": "initialize",
+-        "params": {
+-            "clientInfo": {
+-                "name": "anthracite_freecad",
+-                "title": "Anthracite for FreeCAD",
+-                "version": env!("CARGO_PKG_VERSION")
+-            },
+-            "capabilities": {
+-                "experimentalApi": true
+-            }
+-        }
+-    }))?;
+-    Ok(provider)
+-}
+-
+-fn thread_start(provider: &Provider, cwd: &str) -> Result<(), String> {
+-    provider.send(&json!({
+-        "id": THREAD_START_ID,
+-        "method": "thread/start",
+-        "params": {
+-            "cwd": cwd,
+-            "serviceName": "anthracite_freecad",
+-            "developerInstructions": concat!(
+-                "You are operating inside FreeCAD through Anthracite. ",
+-                "Use the freecad tool for CAD inspection and every CAD mutation. ",
+-                "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
+-                "Prefer parametric, named objects and constraints. Inspect before editing. ",
+-                "A tool call is one undoable transaction: failures roll back automatically. ",
+-                "Read the returned observation, fix errors, and verify the finished model."
+-            ),
+-            "dynamicTools": [{
+-                "type": "function",
+-                "name": "freecad",
+-                "description": concat!(
+-                    "Execute ordinary Python inside the active FreeCAD GUI. ",
+-                    "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
+-                    "The complete source runs as one transaction, recomputes and validates, ",
+-                    "then returns result/stdout plus created, changed, and deleted objects."
+-                ),
+-                "inputSchema": {
+-                    "type": "object",
+-                    "properties": {
+-                        "code": {
+-                            "type": "string",
+-                            "description": "Complete ordinary FreeCAD Python source."
+-                        }
+-                    },
+-                    "required": ["code"],
+-                    "additionalProperties": false
+-                }
+-            }]
+-        }
+-    }))
+-}
+-
+-fn start_turn(provider: &mut Provider, prompt: &str) -> Result<(), String> {
+-    let thread_id = provider
+-        .thread_id
+-        .clone()
+-        .ok_or_else(|| "Codex thread is not ready.".to_string())?;
+-    provider.request(
+-        "turn/start",
+-        json!({
+-            "threadId": thread_id,
+-            "input": [{
+-                "type": "text",
+-                "text": prompt,
+-                "textElements": []
+-            }]
+-        }),
+-    )?;
+-    emit(json!({"type": "activity", "text": "Codex is thinking"}));
+-    Ok(())
+-}
++mod process;
++mod protocol;
++mod providers;
++
++use process::IoEvent;
++use providers::ProviderAdapter;
++use serde_json::Value;
++use std::sync::mpsc;
+ 
+ fn handle_host_message(
+     message: Value,
+-    provider: &mut Option<Provider>,
+-    sender: &mpsc::Sender<Event>,
++    provider: &mut Option<Box<dyn ProviderAdapter>>,
++    sender: &mpsc::Sender<IoEvent>,
+ ) -> bool {
+-    let command = message.get("type").and_then(Value::as_str).unwrap_or("");
+-    match command {
+-        "start" => {
+-            let binary = message.get("binary").and_then(Value::as_str).unwrap_or("");
+-            let cwd = message.get("cwd").and_then(Value::as_str).unwrap_or(".");
+-            if message.get("provider").and_then(Value::as_str) != Some("codex") {
+-                emit_error("Only the Codex adapter is implemented in this vertical slice.");
+-                return true;
+-            }
+-            match start_provider(binary, cwd, sender) {
+-                Ok(started) => *provider = Some(started),
+-                Err(error) => emit_error(error),
+-            }
+-        }
+-        "turn" => {
+-            let prompt = message.get("prompt").and_then(Value::as_str).unwrap_or("");
+-            match provider {
+-                Some(provider) => {
+-                    if let Err(error) = start_turn(provider, prompt) {
+-                        emit_error(error);
+-                    }
+-                }
+-                None => emit_error("Codex is not running."),
+-            }
+-        }
+-        "tool_result" => {
+-            let Some(provider) = provider else {
+-                emit_error("Codex is not running.");
+-                return true;
+-            };
+-            let Some(request_id) = message.get("requestId").cloned() else {
+-                emit_error("FreeCAD tool result did not include a request id.");
+-                return true;
+-            };
+-            let result = message.get("result").and_then(Value::as_str).unwrap_or("");
+-            let success = message
+-                .get("success")
+-                .and_then(Value::as_bool)
+-                .unwrap_or(false);
+-            if let Err(error) = provider.send(&json!({
+-                "id": request_id,
+-                "result": {
+-                    "contentItems": [{"type": "inputText", "text": result}],
+-                    "success": success
+-                }
+-            })) {
+-                emit_error(error);
+-            }
+-        }
+-        "interrupt" => {
+-            if let Some(provider) = provider
+-                && let (Some(thread_id), Some(turn_id)) =
+-                    (provider.thread_id.clone(), provider.turn_id.clone())
+-                && let Err(error) = provider.request(
+-                    "turn/interrupt",
+-                    json!({"threadId": thread_id, "turnId": turn_id}),
+-                )
+-            {
+-                emit_error(error);
+-            }
+-        }
+-        "shutdown" => return false,
+-        _ => emit_error(format!("Unknown runtime command: {command}")),
++    if message
++        .get("protocolVersion")
++        .and_then(Value::as_u64)
++        .is_some_and(|version| version != protocol::VERSION)
++    {
++        protocol::emit_error("Unsupported Anthracite runtime protocol version.");
++        return true;
+     }
+-    true
+-}
+-
+-fn response_id(message: &Value) -> Option<u64> {
+-    message.get("id").and_then(Value::as_u64)
+-}
+-
+-fn handle_server_request(message: &Value, provider: &Provider) {
+-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+-    let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+-    if method != "item/tool/call" {
+-        let _ = provider.send(&json!({
+-            "id": request_id,
+-            "error": {
+-                "code": -32601,
+-                "message": format!("Anthracite does not handle server request {method}.")
+-            }
+-        }));
+-        emit_error(format!("Codex requested unsupported interaction: {method}"));
+-        return;
+-    }
+-
+-    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+-    let tool = params.get("tool").and_then(Value::as_str).unwrap_or("");
+-    let code = params
+-        .pointer("/arguments/code")
+-        .and_then(Value::as_str)
+-        .unwrap_or("");
+-    if tool != "freecad" || code.is_empty() {
+-        let _ = provider.send(&json!({
+-            "id": request_id,
+-            "result": {
+-                "contentItems": [{
+-                    "type": "inputText",
+-                    "text": "The FreeCAD tool requires a non-empty code string."
+-                }],
+-                "success": false
+-            }
+-        }));
+-        return;
+-    }
+-
+-    emit(json!({
+-        "type": "tool_call",
+-        "requestId": request_id,
+-        "code": code
+-    }));
+-}
+ 
+-fn handle_notification(message: &Value, provider: &mut Provider) {
+-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+-    let params = message.get("params").unwrap_or(&Value::Null);
+-    match method {
+-        "turn/started" => {
+-            provider.turn_id = params
+-                .pointer("/turn/id")
++    let payload = protocol::payload(&message);
++    let result = match protocol::message_type(&message) {
++        "session.start" => {
++            let provider_config = payload.get("provider").unwrap_or(&Value::Null);
++            let kind = provider_config
++                .get("kind")
+                 .and_then(Value::as_str)
+-                .map(str::to_owned);
+-        }
+-        "item/agentMessage/delta" => {
+-            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+-                emit(json!({"type": "assistant_delta", "text": delta}));
+-            }
+-        }
+-        "item/started" => {
+-            let item = params.get("item").unwrap_or(&Value::Null);
+-            match item.get("type").and_then(Value::as_str) {
+-                Some("dynamicToolCall") => {
+-                    emit(json!({"type": "activity", "text": "Codex called freecad"}));
+-                }
+-                Some("commandExecution") => {
+-                    emit(json!({"type": "activity", "text": "Codex is running a command"}));
+-                }
+-                _ => {}
+-            }
+-        }
+-        "turn/completed" => {
+-            let status = params
+-                .pointer("/turn/status")
++                .unwrap_or("");
++            let binary = provider_config
++                .get("binary")
+                 .and_then(Value::as_str)
+-                .unwrap_or("completed");
+-            provider.turn_id = None;
+-            emit(json!({"type": "turn_completed", "status": status}));
+-        }
+-        "error" => {
+-            let text = params
+-                .pointer("/error/message")
+-                .or_else(|| params.get("message"))
+-                .and_then(Value::as_str)
+-                .unwrap_or("Codex reported an unknown error.");
+-            emit_error(text);
+-        }
+-        _ => {}
+-    }
+-}
+-
+-fn handle_server_message(message: Value, provider: &mut Provider, cwd: &str) {
+-    if message.get("method").is_some() && message.get("id").is_some() {
+-        handle_server_request(&message, provider);
+-        return;
+-    }
+-    if message.get("method").is_some() {
+-        handle_notification(&message, provider);
+-        return;
+-    }
+-    if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
+-        emit_error(format!("Codex protocol error: {error}"));
+-        return;
+-    }
++                .unwrap_or("");
++            let cwd = payload.get("cwd").and_then(Value::as_str).unwrap_or(".");
++            providers::start(kind, binary, cwd, sender).map(|started| *provider = Some(started))
++        }
++        "turn.start" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.start_turn(payload.get("prompt").and_then(Value::as_str).unwrap_or(""))
++            }),
++        "tool.result" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.return_tool_result(
++                    payload.get("requestId").cloned().unwrap_or(Value::Null),
++                    payload.get("result").and_then(Value::as_str).unwrap_or(""),
++                    payload
++                        .get("success")
++                        .and_then(Value::as_bool)
++                        .unwrap_or(false),
++                )
++            }),
++        "request.resolve" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.resolve_request(
++                    payload
++                        .get("requestId")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                    payload
++                        .get("decision")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                )
++            }),
++        "user_input.resolve" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| {
++                provider.resolve_user_input(
++                    payload
++                        .get("requestId")
++                        .and_then(Value::as_str)
++                        .unwrap_or(""),
++                    payload.get("answers").unwrap_or(&Value::Null),
++                )
++            }),
++        "turn.interrupt" => provider
++            .as_mut()
++            .ok_or_else(|| "Provider is not running.".to_string())
++            .and_then(|provider| provider.interrupt()),
++        "session.shutdown" => return false,
++        command => Err(format!("Unknown runtime command: {command}")),
++    };
+ 
+-    match response_id(&message) {
+-        Some(INITIALIZE_ID) => {
+-            if let Err(error) = provider.send(&json!({"method": "initialized"})) {
+-                emit_error(error);
+-                return;
+-            }
+-            if let Err(error) = thread_start(provider, cwd) {
+-                emit_error(error);
+-            }
+-        }
+-        Some(THREAD_START_ID) => {
+-            provider.thread_id = message
+-                .pointer("/result/thread/id")
+-                .and_then(Value::as_str)
+-                .map(str::to_owned);
+-            if let Some(thread_id) = &provider.thread_id {
+-                emit(json!({"type": "ready", "threadId": thread_id}));
+-            } else {
+-                emit_error("Codex thread/start response did not include a thread id.");
+-            }
+-        }
+-        Some(_) => {
+-            if let Some(turn_id) = message
+-                .pointer("/result/turn/id")
+-                .and_then(Value::as_str)
+-                .map(str::to_owned)
+-            {
+-                provider.turn_id = Some(turn_id);
+-            }
+-        }
+-        None => emit_error("Codex returned an unrecognized protocol message."),
++    if let Err(error) = result {
++        protocol::emit_error(error);
+     }
++    true
+ }
+ 
+ fn main() {
+     let (sender, receiver) = mpsc::channel();
+-    let input_sender = sender.clone();
+-    thread::spawn(move || {
+-        for line in io::stdin().lock().lines() {
+-            match line {
+-                Ok(line) => {
+-                    if input_sender.send(Event::HostLine(line)).is_err() {
+-                        return;
+-                    }
+-                }
+-                Err(error) => {
+-                    let _ = input_sender.send(Event::ServerError(error.to_string()));
+-                    return;
+-                }
+-            }
+-        }
+-        let _ = input_sender.send(Event::HostClosed);
+-    });
++    process::spawn_host_reader(sender.clone());
+ 
+-    let mut provider: Option<Provider> = None;
+-    let mut cwd = String::from(".");
++    let mut provider: Option<Box<dyn ProviderAdapter>> = None;
+     while let Ok(event) = receiver.recv() {
+         match event {
+-            Event::HostLine(line) => match serde_json::from_str::<Value>(&line) {
++            IoEvent::HostLine(line) => match serde_json::from_str::<Value>(&line) {
+                 Ok(message) => {
+-                    if message.get("type").and_then(Value::as_str) == Some("start") {
+-                        cwd = message
+-                            .get("cwd")
+-                            .and_then(Value::as_str)
+-                            .unwrap_or(".")
+-                            .to_owned();
+-                    }
+                     if !handle_host_message(message, &mut provider, &sender) {
+                         break;
+                     }
+                 }
+-                Err(error) => emit_error(format!("Invalid host JSON: {error}")),
++                Err(error) => protocol::emit_error(format!("Invalid host JSON: {error}")),
+             },
+-            Event::HostClosed => break,
+-            Event::ServerLine(line) => match serde_json::from_str::<Value>(&line) {
++            IoEvent::HostClosed => break,
++            IoEvent::ProviderLine(line) => match serde_json::from_str::<Value>(&line) {
+                 Ok(message) => {
+-                    if let Some(provider) = &mut provider {
+-                        handle_server_message(message, provider, &cwd);
++                    if let Some(provider) = &mut provider
++                        && let Err(error) = provider.handle_message(message)
++                    {
++                        protocol::emit_error(error);
+                     }
+                 }
+-                Err(error) => emit_error(format!("Invalid Codex JSON: {error}")),
++                Err(error) => protocol::emit_error(format!("Invalid provider JSON: {error}")),
+             },
+-            Event::ServerError(line) => eprintln!("codex: {line}"),
+-            Event::ServerClosed => {
+-                emit_error("Codex app-server closed its output.");
++            IoEvent::ProviderError(line) => eprintln!("provider: {line}"),
++            IoEvent::ProviderClosed => {
++                protocol::emit_error("Provider process closed its output.");
+                 provider = None;
+             }
+         }
+     }
+ }
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn response_ids_accept_integer_ids() {
+-        assert_eq!(response_id(&json!({"id": 42, "result": {}})), Some(42));
+-        assert_eq!(response_id(&json!({"id": "call", "result": {}})), None);
+-    }
+-
+-    #[test]
+-    fn dynamic_tool_code_has_the_expected_shape() {
+-        let message = json!({
+-            "method": "item/tool/call",
+-            "id": 60,
+-            "params": {
+-                "tool": "freecad",
+-                "arguments": {"code": "doc.recompute()"}
+-            }
+-        });
+-        assert_eq!(
+-            message
+-                .pointer("/params/arguments/code")
+-                .and_then(Value::as_str),
+-            Some("doc.recompute()")
+-        );
+-    }
+-}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/process.rs
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use serde_json::Value;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, Command, Stdio};
++use std::sync::{Arc, Mutex, mpsc};
++use std::thread;
++
++pub enum IoEvent {
++    HostLine(String),
++    HostClosed,
++    ProviderLine(String),
++    ProviderError(String),
++    ProviderClosed,
++}
++
++pub fn spawn_host_reader(sender: mpsc::Sender<IoEvent>) {
++    thread::spawn(move || {
++        for line in std::io::stdin().lock().lines() {
++            match line {
++                Ok(line) => {
++                    if sender.send(IoEvent::HostLine(line)).is_err() {
++                        return;
++                    }
++                }
++                Err(error) => {
++                    let _ = sender.send(IoEvent::ProviderError(error.to_string()));
++                    return;
++                }
++            }
++        }
++        let _ = sender.send(IoEvent::HostClosed);
++    });
++}
++
++fn spawn_line_reader<R: std::io::Read + Send + 'static>(
++    reader: R,
++    sender: mpsc::Sender<IoEvent>,
++    map: fn(String) -> IoEvent,
++    closed: Option<IoEvent>,
++) {
++    thread::spawn(move || {
++        for line in BufReader::new(reader).lines() {
++            match line {
++                Ok(line) => {
++                    if sender.send(map(line)).is_err() {
++                        return;
++                    }
++                }
++                Err(error) => {
++                    let _ = sender.send(IoEvent::ProviderError(error.to_string()));
++                    return;
++                }
++            }
++        }
++        if let Some(event) = closed {
++            let _ = sender.send(event);
++        }
++    });
++}
++
++pub struct LineProcess {
++    child: Child,
++    input: Arc<Mutex<ChildStdin>>,
++}
++
++impl LineProcess {
++    pub fn start(
++        binary: &str,
++        arguments: &[&str],
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++    ) -> Result<Self, String> {
++        let mut child = Command::new(binary)
++            .args(arguments)
++            .current_dir(cwd)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .map_err(|error| format!("Could not start provider at {binary}: {error}"))?;
++
++        let input = child
++            .stdin
++            .take()
++            .ok_or_else(|| "Provider did not expose standard input.".to_string())?;
++        let output = child
++            .stdout
++            .take()
++            .ok_or_else(|| "Provider did not expose standard output.".to_string())?;
++        let errors = child
++            .stderr
++            .take()
++            .ok_or_else(|| "Provider did not expose standard error.".to_string())?;
++
++        spawn_line_reader(
++            output,
++            sender.clone(),
++            IoEvent::ProviderLine,
++            Some(IoEvent::ProviderClosed),
++        );
++        spawn_line_reader(errors, sender.clone(), IoEvent::ProviderError, None);
++
++        Ok(Self {
++            child,
++            input: Arc::new(Mutex::new(input)),
++        })
++    }
++
++    pub fn send(&self, value: &Value) -> Result<(), String> {
++        let mut input = self
++            .input
++            .lock()
++            .map_err(|_| "Provider input lock was poisoned.".to_string())?;
++        serde_json::to_writer(&mut *input, value).map_err(|error| error.to_string())?;
++        input.write_all(b"\n").map_err(|error| error.to_string())?;
++        input.flush().map_err(|error| error.to_string())
++    }
++}
++
++impl Drop for LineProcess {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/protocol.rs
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use serde_json::{Value, json};
++use std::io::{self, Write};
++
++pub const VERSION: u64 = 1;
++
++pub fn message_type(message: &Value) -> &str {
++    message.get("type").and_then(Value::as_str).unwrap_or("")
++}
++
++pub fn payload(message: &Value) -> &Value {
++    message.get("payload").unwrap_or(&Value::Null)
++}
++
++pub fn emit(message_type: &str, payload: Value) {
++    let stdout = io::stdout();
++    let mut output = stdout.lock();
++    let value = json!({
++        "protocolVersion": VERSION,
++        "type": message_type,
++        "payload": payload
++    });
++    if serde_json::to_writer(&mut output, &value).is_ok() {
++        let _ = output.write_all(b"\n");
++        let _ = output.flush();
++    }
++}
++
++pub fn emit_error(message: impl Into<String>) {
++    emit(
++        "runtime.error",
++        json!({"class": "provider_error", "message": message.into()}),
++    );
++}
++
++pub fn emit_warning(message: impl Into<String>) {
++    emit("runtime.warning", json!({"message": message.into()}));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn reads_versioned_host_messages() {
++        let message = json!({
++            "protocolVersion": VERSION,
++            "type": "turn.start",
++            "payload": {"prompt": "Make a box"}
++        });
++        assert_eq!(message_type(&message), "turn.start");
++        assert_eq!(
++            payload(&message).get("prompt").and_then(Value::as_str),
++            Some("Make a box")
++        );
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/codex.rs
+@@ -0,0 +1,657 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use super::ProviderAdapter;
++use crate::process::{IoEvent, LineProcess};
++use crate::protocol;
++use serde_json::{Map, Value, json};
++use std::collections::HashMap;
++use std::sync::mpsc;
++
++const INITIALIZE_ID: u64 = 1;
++const THREAD_START_ID: u64 = 2;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum PendingKind {
++    CommandApproval,
++    FileChangeApproval,
++    PermissionApproval,
++    UserInput,
++}
++
++struct PendingRequest {
++    server_id: Value,
++    kind: PendingKind,
++    params: Value,
++}
++
++pub struct CodexAdapter {
++    process: LineProcess,
++    cwd: String,
++    next_request_id: u64,
++    next_interaction_id: u64,
++    thread_id: Option<String>,
++    turn_id: Option<String>,
++    pending: HashMap<String, PendingRequest>,
++}
++
++impl CodexAdapter {
++    pub fn start(binary: &str, cwd: &str, sender: &mpsc::Sender<IoEvent>) -> Result<Self, String> {
++        let process = LineProcess::start(binary, &["app-server"], cwd, sender)?;
++        let adapter = Self {
++            process,
++            cwd: cwd.to_owned(),
++            next_request_id: 3,
++            next_interaction_id: 1,
++            thread_id: None,
++            turn_id: None,
++            pending: HashMap::new(),
++        };
++        adapter.process.send(&json!({
++            "id": INITIALIZE_ID,
++            "method": "initialize",
++            "params": {
++                "clientInfo": {
++                    "name": "anthracite_freecad",
++                    "title": "Anthracite for FreeCAD",
++                    "version": env!("CARGO_PKG_VERSION")
++                },
++                "capabilities": {
++                    "experimentalApi": true
++                }
++            }
++        }))?;
++        Ok(adapter)
++    }
++
++    fn send(&self, value: &Value) -> Result<(), String> {
++        self.process.send(value)
++    }
++
++    fn request(&mut self, method: &str, params: Value) -> Result<u64, String> {
++        let id = self.next_request_id;
++        self.next_request_id += 1;
++        self.send(&json!({"id": id, "method": method, "params": params}))?;
++        Ok(id)
++    }
++
++    fn start_thread(&self) -> Result<(), String> {
++        self.send(&json!({
++            "id": THREAD_START_ID,
++            "method": "thread/start",
++            "params": {
++                "cwd": self.cwd,
++                "serviceName": "anthracite_freecad",
++                "developerInstructions": concat!(
++                    "You are operating inside FreeCAD through Anthracite. ",
++                    "Use the freecad tool for CAD inspection and every CAD mutation. ",
++                    "The tool accepts ordinary FreeCAD Python with App, Gui, doc, and cad available. ",
++                    "Prefer parametric, named objects and constraints. Inspect before editing. ",
++                    "A tool call is one undoable transaction: failures roll back automatically. ",
++                    "Read the returned observation, fix errors, and verify the finished model."
++                ),
++                "dynamicTools": [{
++                    "type": "function",
++                    "name": "freecad",
++                    "description": concat!(
++                        "Execute ordinary Python inside the active FreeCAD GUI. ",
++                        "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++                        "The complete source runs as one transaction, recomputes and validates, ",
++                        "then returns result/stdout plus created, changed, and deleted objects."
++                    ),
++                    "inputSchema": {
++                        "type": "object",
++                        "properties": {
++                            "code": {
++                                "type": "string",
++                                "description": "Complete ordinary FreeCAD Python source."
++                            }
++                        },
++                        "required": ["code"],
++                        "additionalProperties": false
++                    }
++                }]
++            }
++        }))
++    }
++
++    fn response_id(message: &Value) -> Option<u64> {
++        message.get("id").and_then(Value::as_u64)
++    }
++
++    fn next_pending_id(&mut self) -> String {
++        let result = format!("codex-request-{}", self.next_interaction_id);
++        self.next_interaction_id += 1;
++        result
++    }
++
++    fn open_approval(&mut self, server_id: Value, kind: PendingKind, params: Value) {
++        let request_id = self.next_pending_id();
++        let (request_kind, title, detail, allow_session) = match kind {
++            PendingKind::CommandApproval => (
++                "command_execution_approval",
++                "Run command",
++                params
++                    .get("command")
++                    .or_else(|| params.get("reason"))
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested permission to run a command."),
++                true,
++            ),
++            PendingKind::FileChangeApproval => (
++                "file_change_approval",
++                "Change files",
++                params
++                    .get("reason")
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested permission to change files."),
++                true,
++            ),
++            PendingKind::PermissionApproval => (
++                "permission_approval",
++                "Grant additional access",
++                params
++                    .get("reason")
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex requested additional permissions."),
++                true,
++            ),
++            PendingKind::UserInput => unreachable!(),
++        };
++
++        protocol::emit(
++            "request.opened",
++            json!({
++                "requestId": request_id,
++                "requestKind": request_kind,
++                "title": title,
++                "detail": detail,
++                "allowSession": allow_session,
++                "providerArgs": params
++            }),
++        );
++        self.pending.insert(
++            request_id,
++            PendingRequest {
++                server_id,
++                kind,
++                params,
++            },
++        );
++    }
++
++    fn open_user_input(&mut self, server_id: Value, params: Value) {
++        let request_id = self.next_pending_id();
++        protocol::emit(
++            "user_input.requested",
++            json!({
++                "requestId": request_id,
++                "questions": params.get("questions").cloned().unwrap_or_else(|| json!([])),
++                "autoResolutionMs": params.get("autoResolutionMs").cloned().unwrap_or(Value::Null)
++            }),
++        );
++        self.pending.insert(
++            request_id,
++            PendingRequest {
++                server_id,
++                kind: PendingKind::UserInput,
++                params,
++            },
++        );
++    }
++
++    fn handle_server_request(&mut self, message: &Value) -> Result<(), String> {
++        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
++        let server_id = message.get("id").cloned().unwrap_or(Value::Null);
++        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
++        match method {
++            "item/tool/call" => {
++                let tool = params.get("tool").and_then(Value::as_str).unwrap_or("");
++                let code = params
++                    .pointer("/arguments/code")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                if tool != "freecad" || code.is_empty() {
++                    self.send(&json!({
++                        "id": server_id,
++                        "result": {
++                            "contentItems": [{
++                                "type": "inputText",
++                                "text": "The FreeCAD tool requires a non-empty code string."
++                            }],
++                            "success": false
++                        }
++                    }))?;
++                    return Ok(());
++                }
++                protocol::emit(
++                    "tool.call",
++                    json!({
++                        "requestId": server_id,
++                        "tool": "freecad",
++                        "arguments": {"code": code}
++                    }),
++                );
++            }
++            "item/commandExecution/requestApproval" => {
++                self.open_approval(server_id, PendingKind::CommandApproval, params);
++            }
++            "item/fileChange/requestApproval" => {
++                self.open_approval(server_id, PendingKind::FileChangeApproval, params);
++            }
++            "item/permissions/requestApproval" => {
++                self.open_approval(server_id, PendingKind::PermissionApproval, params);
++            }
++            "item/tool/requestUserInput" => {
++                self.open_user_input(server_id, params);
++            }
++            _ => {
++                self.send(&json!({
++                    "id": server_id,
++                    "error": {
++                        "code": -32601,
++                        "message": format!("Anthracite does not handle server request {method}.")
++                    }
++                }))?;
++                protocol::emit_warning(format!(
++                    "Provider requested unsupported interaction: {method}"
++                ));
++            }
++        }
++        Ok(())
++    }
++
++    fn item_description(item: &Value) -> Option<(&'static str, String, Option<String>)> {
++        match item.get("type").and_then(Value::as_str) {
++            Some("dynamicToolCall") => Some((
++                "dynamic_tool_call",
++                format!(
++                    "Calling {}",
++                    item.get("tool").and_then(Value::as_str).unwrap_or("tool")
++                ),
++                None,
++            )),
++            Some("commandExecution") => Some((
++                "command_execution",
++                "Running command".to_string(),
++                item.get("command")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned),
++            )),
++            Some("fileChange") => Some((
++                "file_change",
++                "Changing files".to_string(),
++                item.get("path").and_then(Value::as_str).map(str::to_owned),
++            )),
++            Some("mcpToolCall") => Some((
++                "mcp_tool_call",
++                format!(
++                    "Calling {}",
++                    item.get("tool")
++                        .and_then(Value::as_str)
++                        .unwrap_or("MCP tool")
++                ),
++                item.get("server")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned),
++            )),
++            _ => None,
++        }
++    }
++
++    fn handle_notification(&mut self, message: &Value) {
++        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
++        let params = message.get("params").unwrap_or(&Value::Null);
++        match method {
++            "turn/started" => {
++                self.turn_id = params
++                    .pointer("/turn/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned);
++                protocol::emit(
++                    "turn.started",
++                    json!({"turnId": self.turn_id, "provider": "codex"}),
++                );
++            }
++            "item/agentMessage/delta" => {
++                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
++                    protocol::emit(
++                        "content.delta",
++                        json!({"streamKind": "assistant_text", "text": delta}),
++                    );
++                }
++            }
++            "item/started" | "item/completed" => {
++                let item = params.get("item").unwrap_or(&Value::Null);
++                if let Some((kind, title, detail)) = Self::item_description(item) {
++                    protocol::emit(
++                        if method == "item/started" {
++                            "item.started"
++                        } else {
++                            "item.completed"
++                        },
++                        json!({
++                            "itemId": item.get("id"),
++                            "kind": kind,
++                            "title": title,
++                            "detail": detail
++                        }),
++                    );
++                }
++            }
++            "turn/plan/updated" => {
++                protocol::emit(
++                    "plan.updated",
++                    json!({
++                        "explanation": params.get("explanation"),
++                        "steps": params.get("plan").cloned().unwrap_or_else(|| json!([]))
++                    }),
++                );
++            }
++            "thread/tokenUsage/updated" => {
++                protocol::emit(
++                    "usage.updated",
++                    params
++                        .get("tokenUsage")
++                        .cloned()
++                        .unwrap_or_else(|| json!({})),
++                );
++            }
++            "turn/completed" => {
++                let status = params
++                    .pointer("/turn/status")
++                    .and_then(Value::as_str)
++                    .unwrap_or("completed");
++                let error = params
++                    .pointer("/turn/error/message")
++                    .and_then(Value::as_str);
++                self.turn_id = None;
++                protocol::emit("turn.completed", json!({"status": status, "error": error}));
++            }
++            "error" => {
++                let text = params
++                    .pointer("/error/message")
++                    .or_else(|| params.get("message"))
++                    .and_then(Value::as_str)
++                    .unwrap_or("Codex reported an unknown error.");
++                protocol::emit_error(text);
++            }
++            _ => {}
++        }
++    }
++
++    fn handle_response(&mut self, message: &Value) -> Result<(), String> {
++        if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            return Err(format!("Codex protocol error: {error}"));
++        }
++        match Self::response_id(message) {
++            Some(INITIALIZE_ID) => {
++                self.send(&json!({"method": "initialized"}))?;
++                self.start_thread()?;
++            }
++            Some(THREAD_START_ID) => {
++                self.thread_id = message
++                    .pointer("/result/thread/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned);
++                if let Some(thread_id) = &self.thread_id {
++                    protocol::emit(
++                        "runtime.ready",
++                        json!({
++                            "provider": "codex",
++                            "threadId": thread_id,
++                            "capabilities": {
++                                "approvals": true,
++                                "userInput": true,
++                                "plans": true,
++                                "usage": true,
++                                "modelOverrides": false
++                            }
++                        }),
++                    );
++                } else {
++                    return Err(
++                        "Codex thread/start response did not include a thread id.".to_string()
++                    );
++                }
++            }
++            Some(_) => {
++                if let Some(turn_id) = message
++                    .pointer("/result/turn/id")
++                    .and_then(Value::as_str)
++                    .map(str::to_owned)
++                {
++                    self.turn_id = Some(turn_id);
++                }
++            }
++            None => return Err("Codex returned an unrecognized protocol message.".to_string()),
++        }
++        Ok(())
++    }
++
++    fn codex_decision(decision: &str) -> Result<&'static str, String> {
++        match decision {
++            "approve" => Ok("accept"),
++            "approve_session" => Ok("acceptForSession"),
++            "decline" => Ok("decline"),
++            "cancel" => Ok("cancel"),
++            _ => Err(format!("Unknown approval decision: {decision}")),
++        }
++    }
++
++    fn approval_result(pending: &PendingRequest, decision: &str) -> Result<Value, String> {
++        match pending.kind {
++            PendingKind::CommandApproval | PendingKind::FileChangeApproval => {
++                Ok(json!({"decision": Self::codex_decision(decision)?}))
++            }
++            PendingKind::PermissionApproval => {
++                let permissions = if matches!(decision, "approve" | "approve_session") {
++                    pending
++                        .params
++                        .get("permissions")
++                        .cloned()
++                        .unwrap_or_else(|| json!({}))
++                } else {
++                    json!({})
++                };
++                Ok(json!({
++                    "permissions": permissions,
++                    "scope": if decision == "approve_session" { "session" } else { "turn" }
++                }))
++            }
++            PendingKind::UserInput => {
++                Err("The pending interaction requires user-input answers.".to_string())
++            }
++        }
++    }
++
++    fn user_input_response(answers: &Value) -> Value {
++        let mut result = Map::new();
++        if let Some(values) = answers.as_object() {
++            for (question_id, answer) in values {
++                let answers = match answer {
++                    Value::Array(items) => items.clone(),
++                    Value::String(text) => vec![Value::String(text.clone())],
++                    _ => vec![Value::String(answer.to_string())],
++                };
++                result.insert(question_id.clone(), json!({"answers": answers}));
++            }
++        }
++        Value::Object(result)
++    }
++}
++
++impl ProviderAdapter for CodexAdapter {
++    fn start_turn(&mut self, prompt: &str) -> Result<(), String> {
++        let thread_id = self
++            .thread_id
++            .clone()
++            .ok_or_else(|| "Codex thread is not ready.".to_string())?;
++        self.request(
++            "turn/start",
++            json!({
++                "threadId": thread_id,
++                "input": [{
++                    "type": "text",
++                    "text": prompt,
++                    "textElements": []
++                }]
++            }),
++        )?;
++        protocol::emit("session.state", json!({"state": "running"}));
++        Ok(())
++    }
++
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++    ) -> Result<(), String> {
++        self.send(&json!({
++            "id": request_id,
++            "result": {
++                "contentItems": [{"type": "inputText", "text": result}],
++                "success": success
++            }
++        }))
++    }
++
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String> {
++        let pending = self
++            .pending
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown pending provider request: {request_id}"))?;
++        let result = match Self::approval_result(&pending, decision) {
++            Ok(result) => result,
++            Err(error) => {
++                self.pending.insert(request_id.to_owned(), pending);
++                return Err(error);
++            }
++        };
++        self.send(&json!({"id": pending.server_id, "result": result}))?;
++        protocol::emit(
++            "request.resolved",
++            json!({"requestId": request_id, "decision": decision}),
++        );
++        Ok(())
++    }
++
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String> {
++        let pending = self
++            .pending
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown pending user-input request: {request_id}"))?;
++        if pending.kind != PendingKind::UserInput {
++            self.pending.insert(request_id.to_owned(), pending);
++            return Err("The pending interaction is an approval request.".to_string());
++        }
++        let provider_answers = Self::user_input_response(answers);
++        self.send(&json!({
++            "id": pending.server_id,
++            "result": {"answers": provider_answers}
++        }))?;
++        protocol::emit(
++            "user_input.resolved",
++            json!({"requestId": request_id, "answers": answers}),
++        );
++        Ok(())
++    }
++
++    fn interrupt(&mut self) -> Result<(), String> {
++        if let (Some(thread_id), Some(turn_id)) = (self.thread_id.clone(), self.turn_id.clone()) {
++            self.request(
++                "turn/interrupt",
++                json!({"threadId": thread_id, "turnId": turn_id}),
++            )?;
++        }
++        Ok(())
++    }
++
++    fn handle_message(&mut self, message: Value) -> Result<(), String> {
++        if message.get("method").is_some() && message.get("id").is_some() {
++            return self.handle_server_request(&message);
++        }
++        if message.get("method").is_some() {
++            self.handle_notification(&message);
++            return Ok(());
++        }
++        self.handle_response(&message)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalizes_user_input_answers() {
++        assert_eq!(
++            CodexAdapter::user_input_response(&json!({
++                "target": "Part Design",
++                "features": ["Pocket", "Fillet"]
++            })),
++            json!({
++                "target": {"answers": ["Part Design"]},
++                "features": {"answers": ["Pocket", "Fillet"]}
++            })
++        );
++    }
++
++    #[test]
++    fn maps_generic_approval_decisions() {
++        assert_eq!(CodexAdapter::codex_decision("approve").unwrap(), "accept");
++        assert_eq!(
++            CodexAdapter::codex_decision("approve_session").unwrap(),
++            "acceptForSession"
++        );
++        assert_eq!(CodexAdapter::codex_decision("decline").unwrap(), "decline");
++        assert!(CodexAdapter::codex_decision("always").is_err());
++    }
++
++    #[test]
++    fn classifies_codex_activity_without_leaking_provider_shapes() {
++        assert_eq!(
++            CodexAdapter::item_description(&json!({
++                "type": "commandExecution",
++                "command": "git status"
++            })),
++            Some((
++                "command_execution",
++                "Running command".to_string(),
++                Some("git status".to_string())
++            ))
++        );
++    }
++
++    #[test]
++    fn builds_provider_specific_approval_responses_behind_the_adapter() {
++        let command = PendingRequest {
++            server_id: json!(12),
++            kind: PendingKind::CommandApproval,
++            params: json!({}),
++        };
++        assert_eq!(
++            CodexAdapter::approval_result(&command, "approve_session").unwrap(),
++            json!({"decision": "acceptForSession"})
++        );
++
++        let permissions = PendingRequest {
++            server_id: json!(13),
++            kind: PendingKind::PermissionApproval,
++            params: json!({
++                "permissions": {"network": {"enabled": true}}
++            }),
++        };
++        assert_eq!(
++            CodexAdapter::approval_result(&permissions, "approve").unwrap(),
++            json!({
++                "permissions": {"network": {"enabled": true}},
++                "scope": "turn"
++            })
++        );
++        assert_eq!(
++            CodexAdapter::approval_result(&permissions, "decline").unwrap(),
++            json!({"permissions": {}, "scope": "turn"})
++        );
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++mod codex;
++
++use crate::process::IoEvent;
++use serde_json::Value;
++use std::sync::mpsc;
++
++pub trait ProviderAdapter {
++    fn start_turn(&mut self, prompt: &str) -> Result<(), String>;
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++    ) -> Result<(), String>;
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String>;
++    fn resolve_user_input(&mut self, request_id: &str, answers: &Value) -> Result<(), String>;
++    fn interrupt(&mut self) -> Result<(), String>;
++    fn handle_message(&mut self, message: Value) -> Result<(), String>;
++}
++
++pub fn start(
++    kind: &str,
++    binary: &str,
++    cwd: &str,
++    sender: &mpsc::Sender<IoEvent>,
++) -> Result<Box<dyn ProviderAdapter>, String> {
++    match kind {
++        "codex" => Ok(Box::new(codex::CodexAdapter::start(binary, cwd, sender)?)),
++        _ => Err(format!("Unsupported provider adapter: {kind}")),
++    }
++}
+--- a/src/Mod/Anthracite/TestAnthraciteGui.py
++++ b/src/Mod/Anthracite/TestAnthraciteGui.py
+@@ -20,6 +20,11 @@ def run_smoke_test():
+     if quick_widget.status() != QtQuickWidgets.QQuickWidget.Ready:
+         errors = "; ".join(error.toString() for error in quick_widget.errors())
+         raise AssertionError(f"Anthracite QML did not load: {errors}")
++    root = quick_widget.rootObject()
++    if root.findChild(QtCore.QObject, "AnthraciteInteractionCard") is None:
++        raise AssertionError("Anthracite QML does not expose the interaction card.")
++    if root.findChild(QtCore.QObject, "AnthraciteRequestedInput") is None:
++        raise AssertionError("Anthracite QML does not expose requested-input controls.")
+     print("ANTHRACITE_GUI_SMOKE_OK")
+ 
+ 

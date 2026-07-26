@@ -7,17 +7,6 @@
 - `freecad_commit.txt` is the exact upstream base.
 - `patches/series` is the exact order of Anthracite changes.
 
-## Current implementation
-
-- `0001` adds the built-in module, dock registration, QML sidebar and toggle
-  command.
-- `0002` adds the transactional Python executor and its FreeCADCmd tests.
-- `0003` adds the Rust runtime, live Codex app-server adapter, Qt bridge,
-  revision observer and GUI smoke test.
-- Codex is the first complete provider. Keep Claude Code and OpenCode adapters
-  behind the same line-delimited runtime protocol; do not duplicate the CAD
-  executor or QML surface per provider.
-
 ## Repository model
 
 Anthracite is a patch-stack soft fork of FreeCAD.
@@ -77,9 +66,11 @@ just validate
 - The UI is QML-first, with Qt Quick where useful. It must be a normal FreeCAD
   dock/sidebar: movable, resizable, closable, floatable, and restorable.
 - The native 3D viewport and ordinary FreeCAD interactions remain first class.
-- Integrate the user's existing Codex, Claude Code, or OpenCode installation.
-  Preserve its authentication, configuration, models, skills, and normal
-  tools. Do not build a new general-purpose agent harness yet.
+- Integrate the user's existing Codex installation and preserve its
+  authentication, configuration, models, skills, and normal tools. Do not
+  build a new general-purpose agent harness. Keep provider work behind the
+  normalized runtime adapter; OpenCode is next and Claude Code is not near-term.
+  Never duplicate the CAD executor or QML surface per provider.
 - Expose one CAD-specific model tool:
   `freecad(<ordinary FreeCAD Python source>)`.
 - Python is the model's compositional action language. Prefer FreeCAD document
@@ -137,7 +128,7 @@ The first vertical slice is:
 
 ```text
 prompt in a dockable QML sidebar
-  → existing Codex, Claude Code, or OpenCode session
+  → existing Codex session
   → one freeform FreeCAD Python tool call
   → GUI-thread transaction and recompute
   → structured CAD change observation

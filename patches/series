@@ -4,3 +4,11 @@
 0001-add-anthracite-module.patch
 0002-add-transactional-freecad-tool.patch
 0003-connect-codex-agent-runtime.patch
+0004-normalize-agent-interactions.patch
+0005-add-turso-trajectory-store.patch
+0006-add-threads-and-drafts.patch
+0007-follow-active-freecad-document.patch
+0008-add-model-controls-and-compact-activity.patch
+0009-add-viewport-render-observations.patch
+0010-show-context-window-usage.patch
+0011-observe-freecad-selection-context.patch
