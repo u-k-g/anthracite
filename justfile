@@ -6,10 +6,31 @@ patch_dir := root / "patches"
 series_file := patch_dir / "series"
 pin_file := root / "freecad_commit.txt"
 repo_file := root / "freecad_repo.txt"
+profile_dir := root / "build/profile"
 
 # List the available workflow commands.
 default:
     @just --list
+
+# Launch the development build with a writable, persistent Anthracite profile.
+run: _require-source
+    #!/usr/bin/env bash
+    set -euo pipefail
+    executable="{{ source_dir }}/build/debug/bin/FreeCAD"
+    if [[ ! -x "$executable" ]]; then
+        printf '%s\n' "Anthracite is not built; run the debug build command from README.md first." >&2
+        exit 1
+    fi
+    stylesheet_icon="{{ source_dir }}/build/debug/share/Gui/Stylesheets/overlay/icons/mode.svg"
+    if [[ ! -f "$stylesheet_icon" ]]; then
+        "{{ source_dir }}/.pixi/envs/default/bin/cmake" \
+            --build "{{ source_dir }}/build/debug" \
+            --target Stylesheets_data
+    fi
+    mkdir -p "{{ profile_dir }}"
+    export FREECAD_USER_HOME="{{ profile_dir }}"
+    export QSG_RHI_BACKEND="opengl"
+    exec "$executable"
 
 # Check that the local machine has the workflow dependencies.
 doctor:

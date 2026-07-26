@@ -126,11 +126,14 @@ FreeCAD's Pixi environment:
 
 ```sh
 pixi run configure-debug
-pixi run cmake --build build/debug --target AnthraciteGui FreeCAD -j 10
+pixi run cmake --build build/debug --target AnthraciteGui FreeCAD Stylesheets_data -j 10
 ```
 
-Launch the resulting `build/debug/bin/FreeCAD`, open the Anthracite dock, choose Codex or OpenCode
-in the composer, and use **Configure…** only if Anthracite cannot discover the existing executable.
+Launch with `just run`. The launcher uses a writable, persistent FreeCAD profile under
+`build/profile`; this also avoids read-only or incompatible system FreeCAD profiles while leaving
+Codex and OpenCode authentication and configuration untouched. Open the Anthracite dock, choose
+Codex or OpenCode in the composer, and use **Configure…** only if Anthracite cannot discover the
+existing executable.
 
 </details>
 

@@ -208,6 +208,15 @@
  }
  
  QString AgentBridge::workingDirectory() const
+@@ -632,7 +727,7 @@ QString AgentBridge::workingDirectory()
+ 
+ QString AgentBridge::databasePath() const
+ {
+-    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
++    return QDir(QString::fromStdString(App::Application::getUserAppDataDir()))
+         .filePath(QStringLiteral("Anthracite/anthracite.db"));
+ }
+ 
 @@ -700,9 +795,9 @@ void AgentBridge::synchronizeDocumentCon
      pendingRestartSaveId = 0;
      pendingDraft.clear();
