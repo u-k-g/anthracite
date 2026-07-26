@@ -2,11 +2,8 @@
 
 ## Sources of truth
 
-- `DECISIONS.md` is authoritative for the product and architecture.
-- `WORKFLOW.md` is authoritative for upstream and patch mechanics.
-- `ARCHITECTURE.md` is research and rationale. It contains explored and
-  superseded alternatives; do not follow it where it conflicts with
-  `DECISIONS.md`.
+- `README.md` is authoritative for the product, architecture, and patch
+  workflow.
 - `freecad_commit.txt` is the exact upstream base.
 - `patches/series` is the exact order of Anthracite changes.
 
