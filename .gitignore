@@ -1,6 +1,7 @@
 *
 
 !.gitignore
+!.gitattributes
 
 !devutils/
 !devutils/**/

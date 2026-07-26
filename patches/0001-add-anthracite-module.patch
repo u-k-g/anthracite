@@ -1,0 +1,809 @@
+--- a/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
++++ b/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
+@@ -103,6 +103,7 @@ macro(InitializeFreeCADBuildOptions)
+     option(BUILD_SANDBOX "Build the FreeCAD Sandbox module which is only for testing purposes" OFF)
+     option(BUILD_TEMPLATE "Build the FreeCAD template module which is only for testing purposes" OFF)
+     option(BUILD_ADDONMGR "Build the FreeCAD addon manager module" ON)
++    option(BUILD_ANTHRACITE "Build the Anthracite agent module" ON)
+     option(BUILD_BIM "Build the FreeCAD BIM module" ON)
+     option(BUILD_DRAFT "Build the FreeCAD draft module" ON)
+     option(BUILD_DRAWING "Build the FreeCAD drawing module" OFF)
+--- a/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
++++ b/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
+@@ -91,6 +91,7 @@ macro(PrintFinalReport)
+     value(FREECAD_USE_PYSIDE)
+     value(FREECAD_USE_SHIBOKEN)
+     value(BUILD_ADDONMGR)
++    value(BUILD_ANTHRACITE)
+     value(BUILD_BIM)
+     value(BUILD_ASSEMBLY)
+     value(BUILD_CLOUD)
+--- /dev/null
++++ b/src/Mod/Anthracite/CMakeLists.txt
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++set(Anthracite_Scripts
++    Init.py
++)
++
++if(BUILD_GUI)
++    list(APPEND Anthracite_Scripts InitGui.py)
++    add_subdirectory(Gui)
++endif()
++
++add_custom_target(AnthraciteScripts ALL
++    SOURCES ${Anthracite_Scripts}
++)
++
++fc_target_copy_resource(
++    AnthraciteScripts
++    ${CMAKE_CURRENT_SOURCE_DIR}
++    ${CMAKE_BINARY_DIR}/Mod/Anthracite
++    ${Anthracite_Scripts}
++)
++
++install(
++    FILES ${Anthracite_Scripts}
++    DESTINATION Mod/Anthracite
++)
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include <QResource>
++#include <QTimer>
++
++#include <App/Application.h>
++#include <Base/Console.h>
++#include <Base/Interpreter.h>
++#include <Base/PyObjectBase.h>
++#include <Gui/Application.h>
++
++#include "Sidebar.h"
++
++
++void CreateAnthraciteCommands();
++
++namespace AnthraciteGui
++{
++class Module: public Py::ExtensionModule<Module>
++{
++public:
++    Module()
++        : Py::ExtensionModule<Module>("AnthraciteGui")
++    {
++        initialize("Native GUI integration for Anthracite.");
++    }
++};
++
++PyObject* initModule()
++{
++    return Base::Interpreter().addModule(new Module);
++}
++}  // namespace AnthraciteGui
++
++PyMOD_INIT_FUNC(AnthraciteGui)
++{
++    if (!Gui::Application::Instance) {
++        PyErr_SetString(PyExc_ImportError, "Cannot load AnthraciteGui in console mode.");
++        PyMOD_Return(nullptr);
++    }
++
++    Q_INIT_RESOURCE(Anthracite);
++    PyObject* module = AnthraciteGui::initModule();
++    CreateAnthraciteCommands();
++    AnthraciteGui::ensureSidebar();
++
++    auto preferences = App::GetApplication().GetParameterGroupByPath(
++        "User parameter:BaseApp/Preferences/Mod/Anthracite"
++    );
++    if (!preferences->GetBool("SidebarInitialized", false)) {
++        preferences->SetBool("SidebarInitialized", true);
++        QTimer::singleShot(0, []() { AnthraciteGui::showSidebar(); });
++    }
++
++    Base::Console().log("Loading GUI of Anthracite module... done\n");
++    PyMOD_Return(module);
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++find_package(
++    Qt${FREECAD_QT_MAJOR_VERSION}
++    REQUIRED
++    COMPONENTS Qml Quick QuickWidgets
++)
++
++qt_add_resources(
++    AnthraciteGui_QRC
++    Resources/Anthracite.qrc
++)
++
++set(AnthraciteGui_SRCS
++    ${AnthraciteGui_QRC}
++    AppAnthraciteGui.cpp
++    Command.cpp
++    ConversationModel.cpp
++    ConversationModel.h
++    Sidebar.cpp
++    Sidebar.h
++)
++
++add_library(AnthraciteGui SHARED ${AnthraciteGui_SRCS})
++
++target_include_directories(
++    AnthraciteGui
++    PRIVATE
++    ${CMAKE_BINARY_DIR}
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_BINARY_DIR}/src
++    ${CMAKE_CURRENT_BINARY_DIR}
++)
++
++target_link_libraries(
++    AnthraciteGui
++    PRIVATE
++    FreeCADGui
++    Qt${FREECAD_QT_MAJOR_VERSION}::Qml
++    Qt${FREECAD_QT_MAJOR_VERSION}::Quick
++    Qt${FREECAD_QT_MAJOR_VERSION}::QuickWidgets
++)
++
++if(FREECAD_WARN_ERROR)
++    target_compile_warn_error(AnthraciteGui)
++endif()
++
++SET_BIN_DIR(AnthraciteGui AnthraciteGui /Mod/Anthracite)
++SET_PYTHON_PREFIX_SUFFIX(AnthraciteGui)
++
++install(TARGETS AnthraciteGui DESTINATION ${CMAKE_INSTALL_LIBDIR})
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Command.cpp
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include <Gui/Application.h>
++#include <Gui/Command.h>
++
++#include "Sidebar.h"
++
++
++DEF_STD_CMD_A(AnthraciteCmdToggleSidebar)
++
++AnthraciteCmdToggleSidebar::AnthraciteCmdToggleSidebar()
++    : Command("Anthracite_ToggleSidebar")
++{
++    sGroup = "Anthracite";
++    sMenuText = QT_TR_NOOP("&Anthracite");
++    sToolTipText = QT_TR_NOOP("Show the Anthracite agent sidebar");
++    sStatusTip = QT_TR_NOOP("Show the Anthracite agent sidebar");
++    sWhatsThis = "Anthracite_ToggleSidebar";
++}
++
++void AnthraciteCmdToggleSidebar::activated(int message)
++{
++    Q_UNUSED(message);
++    AnthraciteGui::showSidebar();
++}
++
++bool AnthraciteCmdToggleSidebar::isActive()
++{
++    return true;
++}
++
++void CreateAnthraciteCommands()
++{
++    auto& commands = Gui::Application::Instance->commandManager();
++    auto* command = new AnthraciteCmdToggleSidebar();
++    command->initAction();
++    commands.addCommand(command);
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "ConversationModel.h"
++
++#include <utility>
++
++
++using namespace AnthraciteGui;
++
++ConversationModel::ConversationModel(QObject* parent)
++    : QAbstractListModel(parent)
++{}
++
++int ConversationModel::rowCount(const QModelIndex& parent) const
++{
++    return parent.isValid() ? 0 : static_cast<int>(messages.size());
++}
++
++QVariant ConversationModel::data(const QModelIndex& index, int role) const
++{
++    if (!index.isValid() || index.row() < 0 || index.row() >= static_cast<int>(messages.size())) {
++        return {};
++    }
++
++    const auto& message = messages.at(static_cast<std::size_t>(index.row()));
++    switch (role) {
++        case AuthorRole:
++            return message.author;
++        case BodyRole:
++            return message.body;
++        case KindRole:
++            return message.kind;
++        default:
++            return {};
++    }
++}
++
++QHash<int, QByteArray> ConversationModel::roleNames() const
++{
++    return {
++        {AuthorRole, "author"},
++        {BodyRole, "body"},
++        {KindRole, "kind"},
++    };
++}
++
++void ConversationModel::append(QString author, QString body, QString kind)
++{
++    const int row = static_cast<int>(messages.size());
++    beginInsertRows({}, row, row);
++    messages.push_back({std::move(author), std::move(body), std::move(kind)});
++    endInsertRows();
++}
++
++void ConversationModel::beginAssistantMessage()
++{
++    append(QStringLiteral("Anthracite"), {}, QStringLiteral("assistant"));
++}
++
++void ConversationModel::appendAssistantDelta(const QString& delta)
++{
++    if (messages.empty() || messages.back().kind != QLatin1String("assistant")) {
++        beginAssistantMessage();
++    }
++
++    messages.back().body += delta;
++    const int row = static_cast<int>(messages.size()) - 1;
++    Q_EMIT dataChanged(index(row), index(row), {BodyRole});
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/ConversationModel.h
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
++#define ANTHRACITEGUI_CONVERSATIONMODEL_H
++
++#include <QAbstractListModel>
++#include <QString>
++#include <vector>
++
++
++namespace AnthraciteGui
++{
++class ConversationModel: public QAbstractListModel
++{
++    Q_OBJECT
++
++public:
++    enum Role
++    {
++        AuthorRole = Qt::UserRole + 1,
++        BodyRole,
++        KindRole
++    };
++
++    explicit ConversationModel(QObject* parent = nullptr);
++
++    int rowCount(const QModelIndex& parent = QModelIndex()) const override;
++    QVariant data(const QModelIndex& index, int role) const override;
++    QHash<int, QByteArray> roleNames() const override;
++
++    void append(QString author, QString body, QString kind);
++    void beginAssistantMessage();
++    void appendAssistantDelta(const QString& delta);
++
++private:
++    struct Message
++    {
++        QString author;
++        QString body;
++        QString kind;
++    };
++
++    std::vector<Message> messages;
++};
++}  // namespace AnthraciteGui
++
++#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
+@@ -0,0 +1,6 @@
++<!DOCTYPE RCC>
++<RCC version="1.0">
++    <qresource prefix="/Anthracite">
++        <file>qml/Main.qml</file>
++    </qresource>
++</RCC>
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
+@@ -0,0 +1,208 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++import QtQuick 2.15
++import QtQuick.Controls 2.15
++import QtQuick.Layouts 1.15
++
++Pane {
++    id: root
++
++    padding: 0
++
++    SystemPalette {
++        id: systemPalette
++        colorGroup: SystemPalette.Active
++    }
++
++    background: Rectangle {
++        color: systemPalette.window
++    }
++
++    ColumnLayout {
++        anchors.fill: parent
++        spacing: 0
++
++        Rectangle {
++            Layout.fillWidth: true
++            Layout.preferredHeight: 52
++            color: systemPalette.window
++
++            RowLayout {
++                anchors.fill: parent
++                anchors.leftMargin: 14
++                anchors.rightMargin: 14
++
++                Label {
++                    text: qsTr("Anthracite")
++                    font.pixelSize: 16
++                    font.weight: Font.DemiBold
++                    color: systemPalette.windowText
++                }
++
++                Item {
++                    Layout.fillWidth: true
++                }
++
++                Rectangle {
++                    implicitWidth: statusLabel.implicitWidth + 16
++                    implicitHeight: 24
++                    radius: 12
++                    color: anthraciteController.busy
++                           ? Qt.rgba(0.30, 0.52, 0.95, 0.18)
++                           : Qt.rgba(0.50, 0.50, 0.50, 0.14)
++
++                    Label {
++                        id: statusLabel
++                        anchors.centerIn: parent
++                        text: anthraciteController.status
++                        font.pixelSize: 11
++                        color: systemPalette.windowText
++                    }
++                }
++            }
++
++            Rectangle {
++                anchors.bottom: parent.bottom
++                width: parent.width
++                height: 1
++                color: systemPalette.mid
++                opacity: 0.45
++            }
++        }
++
++        ListView {
++            id: timeline
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++            Layout.margins: 10
++            spacing: 9
++            clip: true
++            model: anthraciteController.messages
++
++            onCountChanged: positionViewAtEnd()
++
++            delegate: Item {
++                width: timeline.width
++                height: bubble.implicitHeight
++
++                Rectangle {
++                    id: bubble
++                    width: parent.width
++                    implicitHeight: messageColumn.implicitHeight + 18
++                    radius: 8
++                    color: kind === "user"
++                           ? Qt.rgba(0.30, 0.52, 0.95, 0.16)
++                           : kind === "error"
++                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
++                             : kind === "activity"
++                               ? Qt.rgba(0.50, 0.50, 0.50, 0.10)
++                               : Qt.rgba(0.50, 0.50, 0.50, 0.07)
++
++                    Column {
++                        id: messageColumn
++                        anchors.left: parent.left
++                        anchors.right: parent.right
++                        anchors.top: parent.top
++                        anchors.margins: 9
++                        spacing: 5
++
++                        Label {
++                            text: author
++                            font.pixelSize: 11
++                            font.weight: Font.DemiBold
++                            color: systemPalette.windowText
++                            opacity: 0.72
++                        }
++
++                        Label {
++                            width: parent.width
++                            text: body
++                            wrapMode: Text.Wrap
++                            textFormat: Text.PlainText
++                            color: systemPalette.windowText
++                        }
++                    }
++                }
++            }
++
++            ScrollBar.vertical: ScrollBar {}
++        }
++
++        Rectangle {
++            Layout.fillWidth: true
++            Layout.preferredHeight: composerLayout.implicitHeight + 20
++            color: systemPalette.window
++
++            Rectangle {
++                width: parent.width
++                height: 1
++                color: systemPalette.mid
++                opacity: 0.45
++            }
++
++            ColumnLayout {
++                id: composerLayout
++                anchors.left: parent.left
++                anchors.right: parent.right
++                anchors.bottom: parent.bottom
++                anchors.margins: 10
++                spacing: 8
++
++                TextArea {
++                    id: composer
++                    Layout.fillWidth: true
++                    Layout.preferredHeight: Math.max(70, Math.min(140, implicitHeight))
++                    placeholderText: qsTr("Describe what you want to make or change…")
++                    wrapMode: TextEdit.Wrap
++                    enabled: !anthraciteController.busy
++
++                    Keys.onPressed: function(event) {
++                        if ((event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))
++                                && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
++                            send()
++                            event.accepted = true
++                        }
++                    }
++                }
++
++                RowLayout {
++                    Layout.fillWidth: true
++
++                    Label {
++                        text: qsTr("Codex")
++                        color: systemPalette.windowText
++                        opacity: 0.65
++                        font.pixelSize: 11
++                    }
++
++                    Item {
++                        Layout.fillWidth: true
++                    }
++
++                    Button {
++                        visible: anthraciteController.busy
++                        text: qsTr("Stop")
++                        onClicked: anthraciteController.stop()
++                    }
++
++                    Button {
++                        visible: !anthraciteController.busy
++                        text: qsTr("Send")
++                        highlighted: true
++                        enabled: composer.text.trim().length > 0
++                        onClicked: send()
++                    }
++                }
++            }
++        }
++    }
++
++    function send() {
++        const text = composer.text.trim()
++        if (text.length === 0 || anthraciteController.busy) {
++            return
++        }
++        composer.text = ""
++        anthraciteController.submit(text)
++    }
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#include "Sidebar.h"
++
++#include <QDockWidget>
++#include <QQmlContext>
++#include <QQuickWidget>
++#include <QUrl>
++#include <QVBoxLayout>
++
++#include <utility>
++
++#include <Gui/DockWindowManager.h>
++
++
++using namespace AnthraciteGui;
++
++SidebarController::SidebarController(QObject* parent)
++    : QObject(parent)
++    , conversation(this)
++    , currentStatus(QStringLiteral("Ready"))
++{
++    conversation.append(
++        QStringLiteral("Anthracite"),
++        QStringLiteral("Connect an existing agent and describe what you want to make in FreeCAD."),
++        QStringLiteral("system")
++    );
++}
++
++QAbstractItemModel* SidebarController::messages()
++{
++    return &conversation;
++}
++
++QString SidebarController::status() const
++{
++    return currentStatus;
++}
++
++bool SidebarController::busy() const
++{
++    return turnBusy;
++}
++
++void SidebarController::submit(const QString& prompt)
++{
++    const QString text = prompt.trimmed();
++    if (text.isEmpty() || turnBusy) {
++        return;
++    }
++
++    conversation.append(QStringLiteral("You"), text, QStringLiteral("user"));
++    setBusy(true);
++    setStatus(QStringLiteral("Starting agent"));
++    Q_EMIT promptSubmitted(text);
++}
++
++void SidebarController::stop()
++{
++    if (turnBusy) {
++        Q_EMIT stopRequested();
++        setStatus(QStringLiteral("Stopping"));
++    }
++}
++
++void SidebarController::appendActivity(const QString& text)
++{
++    conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
++}
++
++void SidebarController::beginAssistantMessage()
++{
++    conversation.beginAssistantMessage();
++}
++
++void SidebarController::appendAssistantDelta(const QString& delta)
++{
++    conversation.appendAssistantDelta(delta);
++}
++
++void SidebarController::completeTurn()
++{
++    setBusy(false);
++    setStatus(QStringLiteral("Ready"));
++}
++
++void SidebarController::failTurn(const QString& error)
++{
++    conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
++    setBusy(false);
++    setStatus(QStringLiteral("Error"));
++}
++
++void SidebarController::setStatus(QString status)
++{
++    if (currentStatus == status) {
++        return;
++    }
++    currentStatus = std::move(status);
++    Q_EMIT statusChanged();
++}
++
++void SidebarController::setBusy(bool busy)
++{
++    if (turnBusy == busy) {
++        return;
++    }
++    turnBusy = busy;
++    Q_EMIT busyChanged();
++}
++
++Sidebar::Sidebar(QWidget* parent)
++    : QWidget(parent)
++    , sidebarController(this)
++{
++    setWindowTitle(tr("Anthracite"));
++    setMinimumWidth(320);
++
++    auto* quickView = new QQuickWidget(this);
++    quickView->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    quickView->rootContext()->setContextProperty(
++        QStringLiteral("anthraciteController"),
++        &sidebarController
++    );
++    quickView->setSource(QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml")));
++
++    auto* layout = new QVBoxLayout(this);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->addWidget(quickView);
++}
++
++SidebarController* Sidebar::controller()
++{
++    return &sidebarController;
++}
++
++Sidebar* AnthraciteGui::ensureSidebar()
++{
++    auto* manager = Gui::DockWindowManager::instance();
++    if (auto* existing = qobject_cast<Sidebar*>(manager->getDockWindow("AnthraciteSidebar"))) {
++        return existing;
++    }
++
++    auto* sidebar = new Sidebar();
++    manager->addDockWindow("AnthraciteSidebar", sidebar, Qt::RightDockWidgetArea);
++    return sidebar;
++}
++
++void AnthraciteGui::showSidebar()
++{
++    auto* sidebar = ensureSidebar();
++    auto* dock = qobject_cast<QDockWidget*>(sidebar->parentWidget());
++    if (dock) {
++        dock->show();
++        dock->raise();
++    }
++    sidebar->setFocus();
++}
++
++SidebarController* AnthraciteGui::sidebarController()
++{
++    return ensureSidebar()->controller();
++}
+--- /dev/null
++++ b/src/Mod/Anthracite/Gui/Sidebar.h
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++#ifndef ANTHRACITEGUI_SIDEBAR_H
++#define ANTHRACITEGUI_SIDEBAR_H
++
++#include <QPointer>
++#include <QString>
++#include <QWidget>
++
++#include "ConversationModel.h"
++
++
++namespace AnthraciteGui
++{
++class SidebarController: public QObject
++{
++    Q_OBJECT
++    Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
++    Q_PROPERTY(QString status READ status NOTIFY statusChanged)
++    Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
++
++public:
++    explicit SidebarController(QObject* parent = nullptr);
++
++    QAbstractItemModel* messages();
++    QString status() const;
++    bool busy() const;
++
++    Q_INVOKABLE void submit(const QString& prompt);
++    Q_INVOKABLE void stop();
++
++    void appendActivity(const QString& text);
++    void beginAssistantMessage();
++    void appendAssistantDelta(const QString& delta);
++    void completeTurn();
++    void failTurn(const QString& error);
++
++Q_SIGNALS:
++    void promptSubmitted(const QString& prompt);
++    void stopRequested();
++    void statusChanged();
++    void busyChanged();
++
++private:
++    void setStatus(QString status);
++    void setBusy(bool busy);
++
++    ConversationModel conversation;
++    QString currentStatus;
++    bool turnBusy = false;
++};
++
++class Sidebar: public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit Sidebar(QWidget* parent = nullptr);
++    SidebarController* controller();
++
++private:
++    SidebarController sidebarController;
++};
++
++Sidebar* ensureSidebar();
++void showSidebar();
++SidebarController* sidebarController();
++}  // namespace AnthraciteGui
++
++#endif  // ANTHRACITEGUI_SIDEBAR_H
+--- /dev/null
++++ b/src/Mod/Anthracite/Init.py
+@@ -0,0 +1 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
+--- /dev/null
++++ b/src/Mod/Anthracite/InitGui.py
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++# Importing the native module registers the sidebar and its command.
++import AnthraciteGui  # noqa: F401
+--- a/src/Mod/CMakeLists.txt
++++ b/src/Mod/CMakeLists.txt
+@@ -6,6 +6,10 @@ if(BUILD_ADDONMGR)
+   add_subdirectory(AddonManager)
+ endif(BUILD_ADDONMGR)
+ 
++if(BUILD_ANTHRACITE)
++  add_subdirectory(Anthracite)
++endif(BUILD_ANTHRACITE)
++
+ if(BUILD_BIM)
+   add_subdirectory(BIM)
+ endif(BUILD_BIM)

@@ -7,6 +7,17 @@
 - `freecad_commit.txt` is the exact upstream base.
 - `patches/series` is the exact order of Anthracite changes.
 
+## Current implementation
+
+- `0001` adds the built-in module, dock registration, QML sidebar and toggle
+  command.
+- `0002` adds the transactional Python executor and its FreeCADCmd tests.
+- `0003` adds the Rust runtime, live Codex app-server adapter, Qt bridge,
+  revision observer and GUI smoke test.
+- Codex is the first complete provider. Keep Claude Code and OpenCode adapters
+  behind the same line-delimited runtime protocol; do not duplicate the CAD
+  executor or QML surface per provider.
+
 ## Repository model
 
 Anthracite is a patch-stack soft fork of FreeCAD.
@@ -95,8 +106,10 @@ just validate
   binding layer where a direct FreeCAD Python call is clearer.
 - Keep the Rust/native boundary narrow and stable.
 - Use embedded [Turso](https://github.com/tursodatabase/turso) for conversation
-  and session state. Store only a small Anthracite document identity in
-  `.FCStd`.
+  and session state. Keep Anthracite identity and session associations outside
+  `.FCStd` by default. If document metadata is ever necessary, use only normal
+  upstream-supported FreeCAD extension or property mechanisms and require
+  verified open/save round-trip compatibility with unmodified FreeCAD.
 
 ## Reference repositories
 
@@ -118,13 +131,6 @@ just validate
   Anthracite's broad FreeCAD Python action; its command observation maps to a
   transaction/diff/recompute/diagnostic/render observation. Preserve bounded
   execution and serializable trajectories.
-- [Codex](https://github.com/openai/codex): reference provider protocols,
-  session handling, approvals, tool adaptation, and operational safeguards.
-  Keep provider adaptation outside the FreeCAD executor.
-- [VibeCAD](https://github.com/10-X-eng/vibecad): low-confidence comparative
-  material only. Independently justify anything taken from it. Do not copy its
-  large per-workbench tool surface or broad custom CAD runtime.
-
 ## Initial implementation target
 
 The first vertical slice is:

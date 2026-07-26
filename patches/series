@@ -1,3 +1,6 @@
 # Anthracite patches, in the order applied to FreeCAD.
 #
 # Add patches with `just patch-new <name>` so Quilt updates this file.
+0001-add-anthracite-module.patch
+0002-add-transactional-freecad-tool.patch
+0003-connect-codex-agent-runtime.patch

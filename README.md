@@ -11,13 +11,30 @@
 Anthracite puts a complete agent experience inside FreeCAD.
 
 - a native, dockable QML sidebar alongside the 3D viewport
-- existing Codex, Claude Code and OpenCode installations instead of a new agent harness
-- document threads, streaming activity, plans, approvals, drafts and CAD-aware context
+- existing coding-agent installations instead of a new agent harness
+- streaming chat and CAD activity, with durable threads, plans, approvals and drafts to follow
 - transactional, undoable changes with recompute, validation and structured diagnostics
 
 FreeCAD's normal selection, commands, properties, task panels and viewport remain first class.
 The agent is another powerful way to operate the application, not a replacement for its existing
 interface.
+
+</details>
+
+<details open>
+<summary><strong>status</strong></summary>
+
+The first working vertical slice is implemented in three ordered patches:
+
+- a persistent native FreeCAD dock with a QML chat timeline and composer
+- a transactional `freecad` Python executor with rollback, recompute, validation, structured
+  change observations and external-edit revision checks
+- a Rust process bridge for the existing Codex `app-server`, including streaming, interruption
+  and dynamic tool calls
+
+Codex is the first complete provider adapter. Claude Code and OpenCode adapters, approvals, durable
+Turso-backed threads and richer CAD observations remain follow-on work behind the same narrow
+runtime protocol.
 
 </details>
 
@@ -32,12 +49,10 @@ freecad(<ordinary Python source>)
 
 The model writes normal FreeCAD Python using `App`, `Gui`, workbench modules and a thin `cad`
 helper. Each call runs on the GUI thread inside a named transaction, recomputes and validates the
-document, then commits or rolls back and returns the result, CAD changes, diagnostics and optional
-viewport images.
+document, then commits or rolls back and returns the result, CAD changes and diagnostics.
 
 The document persists between calls while Python locals do not. Document revisions prevent stale
-writes, and ambiguous face or edge references fail instead of silently resolving to different
-topology.
+writes. Stable internal object names are reported alongside labels and shape summaries.
 
 Use document/workbench APIs first, registered GUI commands second and thin helpers only for missing
 ergonomics. Anthracite does not re-express FreeCAD as hundreds of JSON tools, invent a CAD language,
@@ -65,8 +80,10 @@ Anthracite changes are explicit GNU Quilt patches under `patches/`, applied in t
   that keeps the FreeCAD patch stack simple.
 - C++/Qt owns FreeCAD registration, docking, GUI-thread scheduling and narrow native bridges.
 - Python remains the model-facing FreeCAD action language.
-- Embedded [Turso](https://github.com/tursodatabase/turso) stores conversations, sessions, tool
-  activity, drafts and CAD action history. Only a small Anthracite identity belongs in `.FCStd`.
+- Embedded [Turso](https://github.com/tursodatabase/turso) will store conversations, sessions, tool
+  activity, drafts, CAD action history and document/session associations outside `.FCStd` by
+  default. Any future in-document metadata must use upstream-supported FreeCAD mechanisms and
+  round-trip safely through unmodified FreeCAD.
 
 Keep new product code concentrated in `src/Mod/Anthracite`. Patch FreeCAD core only for narrow,
 proven integration gaps.
@@ -88,6 +105,17 @@ Make changes in `build/src`, then refresh the patch. Do not leave implementation
 source tree. FreeCAD version bumps are deliberate: change the pin, repair every patch in order,
 then build and test.
 
+With FreeCAD materialized and the patches applied, configure and build the current slice with
+FreeCAD's Pixi environment:
+
+```sh
+pixi run configure-debug
+pixi run cmake --build build/debug --target AnthraciteGui FreeCAD -j 10
+```
+
+Launch the resulting `build/debug/bin/FreeCAD`, open the Anthracite dock, and use **Configure…** to
+select an existing Codex executable if it is not already on FreeCAD's `PATH`.
+
 </details>
 
 <details>
@@ -99,24 +127,23 @@ then build and test.
   followed by a useful observation
 - [Helium](https://github.com/imputnet/helium) — pinned upstream, disposable source and an ordered
   patch series
-- [VibeCAD](https://github.com/10-X-eng/vibecad) — low-confidence comparative material, not an
-  architectural source of truth
 
 </details>
 
 <details>
-<summary><strong>first milestone</strong></summary>
+<summary><strong>vertical slice</strong></summary>
 
 ```text
 prompt in the dockable QML sidebar
-  → existing Codex, Claude Code or OpenCode session
+  → existing Codex session
   → one freeform FreeCAD Python tool call
   → GUI-thread transaction, recompute and validation
   → structured CAD change observation
   → streamed result in the sidebar
 ```
 
-Build this path before expanding the tool surface or workbench coverage.
+This path is implemented. Additional providers can adapt to the same runtime event protocol without
+changing the FreeCAD executor or QML surface.
 
 </details>
 

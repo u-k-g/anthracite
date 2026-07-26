@@ -1,0 +1,443 @@
+--- /dev/null
++++ b/src/Mod/Anthracite/AnthraciteExecutor.py
+@@ -0,0 +1,351 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++"""Transactional execution surface exposed to coding agents inside FreeCAD."""
++
++from __future__ import annotations
++
++import ast
++import contextlib
++import io
++import json
++import traceback
++from typing import Any
++
++import FreeCAD as App
++
++try:
++    import FreeCADGui as Gui
++except ImportError:
++    Gui = None
++
++
++_MAX_TEXT = 12_000
++_MAX_VALUE = 500
++_revisions: dict[str, int] = {}
++
++
++def _bounded(text: str, limit: int = _MAX_TEXT) -> str:
++    if len(text) <= limit:
++        return text
++    return f"{text[:limit]}\n… <truncated {len(text) - limit} characters>"
++
++
++def _value_summary(value: Any) -> str:
++    try:
++        result = repr(value)
++    except Exception as error:  # A broken property must not break observation.
++        result = f"<unrepresentable: {error}>"
++    return _bounded(result, _MAX_VALUE)
++
++
++def _json_safe(value: Any) -> Any:
++    if value is None or isinstance(value, (bool, int, float, str)):
++        return value
++    if isinstance(value, (list, tuple)):
++        return [_json_safe(item) for item in value[:100]]
++    if isinstance(value, dict):
++        return {
++            str(key): _json_safe(item)
++            for key, item in list(value.items())[:100]
++        }
++    return _value_summary(value)
++
++
++def _shape_summary(obj: Any) -> dict[str, Any] | None:
++    if not hasattr(obj, "Shape"):
++        return None
++    try:
++        shape = obj.Shape
++        if shape.isNull():
++            return {"null": True}
++        bounds = shape.BoundBox
++        return {
++            "null": False,
++            "valid": bool(shape.isValid()),
++            "solids": len(shape.Solids),
++            "faces": len(shape.Faces),
++            "edges": len(shape.Edges),
++            "volume": float(shape.Volume),
++            "area": float(shape.Area),
++            "bounds": {
++                "x": [float(bounds.XMin), float(bounds.XMax)],
++                "y": [float(bounds.YMin), float(bounds.YMax)],
++                "z": [float(bounds.ZMin), float(bounds.ZMax)],
++            },
++        }
++    except Exception as error:
++        return {"error": str(error)}
++
++
++def _object_snapshot(obj: Any) -> dict[str, Any]:
++    properties = {}
++    for name in obj.PropertiesList:
++        try:
++            properties[name] = _value_summary(getattr(obj, name))
++        except Exception as error:
++            properties[name] = f"<unavailable: {error}>"
++
++    state = []
++    try:
++        state = [str(item) for item in obj.State]
++    except Exception:
++        pass
++
++    return {
++        "type": str(obj.TypeId),
++        "label": str(obj.Label),
++        "state": state,
++        "properties": properties,
++        "shape": _shape_summary(obj),
++    }
++
++
++def _document_snapshot(doc: Any) -> dict[str, dict[str, Any]]:
++    return {
++        str(obj.Name): _object_snapshot(obj)
++        for obj in sorted(doc.Objects, key=lambda item: item.Name)
++    }
++
++
++def _changed_properties(
++    before: dict[str, Any], after: dict[str, Any]
++) -> list[str]:
++    old = before.get("properties", {})
++    new = after.get("properties", {})
++    return sorted(
++        name
++        for name in set(old) | set(new)
++        if old.get(name) != new.get(name)
++    )
++
++
++def _observation(
++    doc: Any,
++    before: dict[str, dict[str, Any]],
++    after: dict[str, dict[str, Any]],
++) -> dict[str, Any]:
++    before_names = set(before)
++    after_names = set(after)
++    changed = []
++    for name in sorted(before_names & after_names):
++        if before[name] == after[name]:
++            continue
++        changed.append(
++            {
++                "name": name,
++                "label": after[name]["label"],
++                "type": after[name]["type"],
++                "properties": _changed_properties(before[name], after[name]),
++                "shape": after[name]["shape"],
++                "state": after[name]["state"],
++            }
++        )
++
++    created = []
++    for name in sorted(after_names - before_names):
++        item = after[name]
++        created.append(
++            {
++                "name": name,
++                "label": item["label"],
++                "type": item["type"],
++                "shape": item["shape"],
++                "state": item["state"],
++            }
++        )
++
++    return {
++        "document": str(doc.Name),
++        "created": created,
++        "deleted": sorted(before_names - after_names),
++        "changed": changed,
++        "objectCount": len(after),
++    }
++
++
++def _invalid_objects(doc: Any) -> list[dict[str, str]]:
++    invalid = []
++    for obj in doc.Objects:
++        state = []
++        try:
++            state = [str(item) for item in obj.State]
++        except Exception:
++            pass
++        errors = [item for item in state if item in {"Invalid", "Error"}]
++
++        shape = _shape_summary(obj)
++        if shape and shape.get("null") is False and shape.get("valid") is False:
++            errors.append("Invalid shape")
++
++        if errors:
++            invalid.append({"name": str(obj.Name), "error": ", ".join(errors)})
++    return invalid
++
++
++def _compile(source: str):
++    tree = ast.parse(source, filename="<anthracite-freecad>", mode="exec")
++    if tree.body and isinstance(tree.body[-1], ast.Expr):
++        tree.body[-1] = ast.Assign(
++            targets=[ast.Name(id="_result", ctx=ast.Store())],
++            value=tree.body[-1].value,
++        )
++        ast.fix_missing_locations(tree)
++    return compile(tree, "<anthracite-freecad>", "exec")
++
++
++class Cad:
++    """Small inspection helper; creation and editing stay ordinary FreeCAD Python."""
++
++    def __init__(self, doc: Any):
++        self.doc = doc
++        self.events: list[dict[str, Any]] = []
++
++    def find(
++        self,
++        *,
++        name: str | None = None,
++        label: str | None = None,
++        type_id: str | None = None,
++    ) -> list[Any]:
++        objects = self.doc.Objects
++        if name is not None:
++            objects = [obj for obj in objects if obj.Name == name]
++        if label is not None:
++            objects = [obj for obj in objects if obj.Label == label]
++        if type_id is not None:
++            objects = [obj for obj in objects if obj.TypeId == type_id]
++        return list(objects)
++
++    def inspect(self, obj: Any | None = None) -> Any:
++        if obj is None:
++            return _document_snapshot(self.doc)
++        if isinstance(obj, str):
++            obj = self.doc.getObject(obj)
++        if obj is None:
++            return None
++        return _object_snapshot(obj)
++
++    def selected(self) -> list[Any]:
++        if Gui is None:
++            return []
++        return list(Gui.Selection.getSelection())
++
++    def emit(self, label: str, value: Any) -> None:
++        self.events.append({"label": str(label), "value": _json_safe(value)})
++
++    def assert_valid(self) -> None:
++        invalid = _invalid_objects(self.doc)
++        if invalid:
++            details = "; ".join(
++                f"{item['name']}: {item['error']}" for item in invalid
++            )
++            raise RuntimeError(f"FreeCAD validation failed: {details}")
++
++    def fit_view(self) -> None:
++        if Gui is not None and Gui.activeDocument() is not None:
++            Gui.activeDocument().activeView().viewAxonometric()
++            Gui.activeDocument().activeView().fitAll()
++
++
++def execute(source: str, expected_revision: int | None = None) -> dict[str, Any]:
++    """Execute source once, returning a structured result suitable for an LLM."""
++
++    if not isinstance(source, str) or not source.strip():
++        return {
++            "ok": False,
++            "error": {"type": "ValueError", "message": "Python source is empty."},
++        }
++
++    doc = App.ActiveDocument
++    if doc is None:
++        doc = App.newDocument("Anthracite")
++
++    # Transactions only retain enough state to abort when undo is enabled.
++    if doc.UndoMode == 0:
++        doc.UndoMode = 1
++
++    revision = _revisions.get(doc.Name, 0)
++    if expected_revision is not None and expected_revision != revision:
++        return {
++            "ok": False,
++            "conflict": True,
++            "revision": revision,
++            "error": {
++                "type": "RevisionConflict",
++                "message": (
++                    f"Expected document revision {expected_revision}, "
++                    f"but the current revision is {revision}."
++                ),
++            },
++        }
++
++    before = _document_snapshot(doc)
++    stdout = io.StringIO()
++    stderr = io.StringIO()
++    cad = Cad(doc)
++    namespace = {
++        "__builtins__": __builtins__,
++        "App": App,
++        "FreeCAD": App,
++        "Gui": Gui,
++        "doc": doc,
++        "cad": cad,
++    }
++
++    doc.openTransaction("Anthracite agent")
++    try:
++        code = _compile(source)
++        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
++            exec(code, namespace, namespace)
++
++        if App.getDocument(doc.Name) is not doc:
++            raise RuntimeError("The active document was closed during the tool call.")
++
++        doc.recompute()
++        cad.assert_valid()
++        after = _document_snapshot(doc)
++        doc.commitTransaction()
++    except Exception as error:
++        error_traceback = traceback.format_exc()
++        try:
++            doc.abortTransaction()
++            doc.recompute()
++        except Exception:
++            error_traceback += "\nRollback failure:\n" + traceback.format_exc()
++        after_rollback = _document_snapshot(doc)
++        return {
++            "ok": False,
++            "revision": revision,
++            "rolledBack": True,
++            "stdout": _bounded(stdout.getvalue()),
++            "stderr": _bounded(stderr.getvalue()),
++            "error": {
++                "type": type(error).__name__,
++                "message": str(error),
++                "traceback": _bounded(error_traceback),
++            },
++            "observation": _observation(doc, before, after_rollback),
++            "events": cad.events,
++        }
++
++    revision += 1
++    _revisions[doc.Name] = revision
++    return {
++        "ok": True,
++        "revision": revision,
++        "stdout": _bounded(stdout.getvalue()),
++        "stderr": _bounded(stderr.getvalue()),
++        "result": _json_safe(namespace.get("_result")),
++        "observation": _observation(doc, before, after),
++        "events": cad.events,
++    }
++
++
++def execute_json(source: str, expected_revision: int | None = None) -> str:
++    """JSON convenience boundary for the native provider bridge."""
++
++    return json.dumps(
++        execute(source, expected_revision),
++        ensure_ascii=False,
++        separators=(",", ":"),
++    )
+--- a/src/Mod/Anthracite/CMakeLists.txt
++++ b/src/Mod/Anthracite/CMakeLists.txt
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+ set(Anthracite_Scripts
++    AnthraciteExecutor.py
+     Init.py
++    TestAnthracite.py
+ )
+ 
+ if(BUILD_GUI)
+--- /dev/null
++++ b/src/Mod/Anthracite/TestAnthracite.py
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++
++import unittest
++
++import FreeCAD as App
++
++import AnthraciteExecutor
++
++
++class ExecutorTest(unittest.TestCase):
++    def setUp(self):
++        for name in list(App.listDocuments()):
++            App.closeDocument(name)
++        self.doc = App.newDocument("AnthraciteExecutorTest")
++        AnthraciteExecutor._revisions.clear()
++
++    def tearDown(self):
++        for name in list(App.listDocuments()):
++            App.closeDocument(name)
++
++    def test_success_returns_change_observation_and_final_expression(self):
++        result = AnthraciteExecutor.execute(
++            "\n".join(
++                [
++                    "obj = doc.addObject('App::FeaturePython', 'Thing')",
++                    "obj.addProperty('App::PropertyInteger', 'Count')",
++                    "obj.Count = 42",
++                    "cad.emit('created', obj.Name)",
++                    "obj.Count",
++                ]
++            )
++        )
++
++        self.assertTrue(result["ok"])
++        self.assertEqual(result["revision"], 1)
++        self.assertEqual(result["result"], 42)
++        self.assertEqual(result["events"], [{"label": "created", "value": "Thing"}])
++        self.assertEqual(
++            [item["name"] for item in result["observation"]["created"]],
++            ["Thing"],
++        )
++
++    def test_exception_rolls_back_entire_tool_call(self):
++        result = AnthraciteExecutor.execute(
++            "\n".join(
++                [
++                    "doc.addObject('App::FeaturePython', 'MustDisappear')",
++                    "raise RuntimeError('deliberate failure')",
++                ]
++            )
++        )
++
++        self.assertFalse(result["ok"])
++        self.assertTrue(result["rolledBack"])
++        self.assertEqual(result["revision"], 0)
++        self.assertIsNone(self.doc.getObject("MustDisappear"))
++        self.assertEqual(result["observation"]["objectCount"], 0)
++
++    def test_stale_revision_does_not_execute(self):
++        first = AnthraciteExecutor.execute("41 + 1")
++        stale = AnthraciteExecutor.execute(
++            "doc.addObject('App::FeaturePython', 'NeverCreated')",
++            expected_revision=0,
++        )
++
++        self.assertTrue(first["ok"])
++        self.assertFalse(stale["ok"])
++        self.assertTrue(stale["conflict"])
++        self.assertEqual(stale["revision"], 1)
++        self.assertIsNone(self.doc.getObject("NeverCreated"))
++
++
++if __name__ == "__main__":
++    unittest.main()
