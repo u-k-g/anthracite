@@ -8,6 +8,7 @@
 !patches/**/
 
 !AGENTS.md
+!LICENSE
 !README.md
 !freecad_commit.txt
 !freecad_repo.txt

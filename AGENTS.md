@@ -19,6 +19,9 @@ Anthracite is a patch-stack soft fork of FreeCAD.
   `src/Mod/Anthracite` inside the FreeCAD tree.
 - Patch FreeCAD core only when a narrow integration point is materially cleaner
   or more capable than keeping the change in the Anthracite module.
+- Anthracite uses the same `LGPL-2.1-or-later` license as FreeCAD. New source
+  files must carry that SPDX identifier and follow FreeCAD's license-header
+  conventions.
 - `.gitignore` is a strict whitelist. Any new intentional repository file or
   directory must also be explicitly admitted there.
 
