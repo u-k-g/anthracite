@@ -109,7 +109,7 @@
  endif(BUILD_BIM)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Resources/AnthraciteDefaults.cfg
-@@ -0,0 +1,1355 @@
+@@ -0,0 +1,1358 @@
 +<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
 +<FCParameters>
 +  <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
@@ -153,6 +153,9 @@
 +          <FCText Name="ScriptFile">FullScript.FCScript</FCText>
 +        </FCParamGroup>
 +        <FCParamGroup Name="Mod">
++          <FCParamGroup Name="Anthracite">
++            <FCUInt Name="DefaultsVersion" Value="1" />
++          </FCParamGroup>
 +          <FCParamGroup Name="CAM">
 +            <FCUInt Name="DefaultBBoxNormalColor" Value="4059297279" />
 +            <FCUInt Name="DefaultBBoxSelectionColor" Value="582537215" />

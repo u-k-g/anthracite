@@ -33,11 +33,30 @@ run: build
     #!/usr/bin/env bash
     set -euo pipefail
     executable="{{ source_dir }}/build/debug/bin/FreeCAD"
+    defaults="{{ source_dir }}/build/debug/Mod/Anthracite/AnthraciteDefaults.cfg"
+    user_parameters="{{ profile_dir }}/user.cfg"
+    defaults_version='Name="DefaultsVersion" Value="1"'
     if [[ ! -x "$executable" ]]; then
         printf '%s\n' "The complete Anthracite build did not produce FreeCAD." >&2
         exit 1
     fi
+    if [[ ! -r "$defaults" ]]; then
+        printf 'Anthracite defaults are missing: %s\n' "$defaults" >&2
+        exit 1
+    fi
     mkdir -p "{{ profile_dir }}"
+    if [[ ! -f "$user_parameters" ]] || ! grep -Fq "$defaults_version" "$user_parameters"; then
+        if [[ -f "$user_parameters" ]]; then
+            backup="$user_parameters.before-anthracite-defaults-v1"
+            if [[ ! -e "$backup" ]]; then
+                cp -p "$user_parameters" "$backup"
+            fi
+            printf 'Applying Anthracite defaults; previous profile saved to %s\n' "$backup"
+        else
+            printf '%s\n' "Applying Anthracite defaults to the new development profile."
+        fi
+        cp "$defaults" "$user_parameters"
+    fi
     export FREECAD_USER_HOME="{{ profile_dir }}"
     export QSG_RHI_BACKEND="opengl"
 

@@ -135,9 +135,12 @@ just build
 Launch with `just run`; it first performs an incremental full build so a partial developer target
 cannot open a workbenchless FreeCAD. The launcher uses a writable, persistent FreeCAD profile under
 `build/profile`; this avoids read-only or incompatible system FreeCAD profiles while leaving Codex
-and OpenCode authentication and configuration untouched. Open the Anthracite dock, choose Codex or
-OpenCode in the composer, and use **Configure…** only if Anthracite cannot discover the existing
-executable.
+and OpenCode authentication and configuration untouched. On the first launch of each bundled
+defaults version, the launcher seeds that profile with Anthracite's workbench, toolbar, dock,
+document, recovery, and window configuration. It preserves the previous profile beside `user.cfg`
+before doing so, and subsequent FreeCAD preference changes remain persistent. Open the Anthracite
+dock, choose Codex or OpenCode in the composer, and use **Configure…** only if Anthracite cannot
+discover the existing executable.
 
 </details>
 
