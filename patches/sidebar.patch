@@ -1669,7 +1669,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,991 @@
+@@ -0,0 +1,950 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -2583,47 +2583,6 @@
 +                            text: agentSettings.summary
 +                        }
 +                        onClicked: agentSettings.open()
-+                    }
-+
-+                    Rectangle {
-+                        id: contextUsage
-+                        objectName: "AnthraciteContextUsage"
-+                        visible: anthraciteController.usageVisible
-+                        Layout.preferredWidth: usageText.implicitWidth + 16
-+                        Layout.preferredHeight: root.compactControlHeight
-+                        radius: 6
-+                        color: Qt.rgba(0.50, 0.50, 0.50, 0.10)
-+
-+                        Label {
-+                            id: usageText
-+                            anchors.centerIn: parent
-+                            text: anthraciteController.usageLabel
-+                            color: systemPalette.windowText
-+                            font.pixelSize: 11
-+                            opacity: 0.72
-+                        }
-+
-+                        Rectangle {
-+                            anchors.left: parent.left
-+                            anchors.bottom: parent.bottom
-+                            width: parent.width * anthraciteController.usageFraction
-+                            height: 2
-+                            radius: 1
-+                            color: anthraciteController.usageFraction > 0.8
-+                                   ? Qt.rgba(0.90, 0.35, 0.25, 0.9)
-+                                   : systemPalette.highlight
-+                        }
-+
-+                        Transcript.Hint {
-+                            hovered: usageHover.containsMouse
-+                            text: anthraciteController.usageDetail
-+                        }
-+
-+                        MouseArea {
-+                            id: usageHover
-+                            anchors.fill: parent
-+                            hoverEnabled: true
-+                        }
 +                    }
 +
 +                    Button {
@@ -4269,8 +4228,8 @@
 +        raise AssertionError("Anthracite QML does not expose the persistent composer.")
 +    if root.findChild(QtCore.QObject, "AnthraciteAgentSettingsButton") is None:
 +        raise AssertionError("Anthracite QML does not expose unified agent settings.")
-+    if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is None:
-+        raise AssertionError("Anthracite QML does not expose context-window usage.")
++    if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is not None:
++        raise AssertionError("Anthracite QML must not display context-window usage.")
 +
 +    run_agent_settings_test(quick_widget, root, dock)
 +
