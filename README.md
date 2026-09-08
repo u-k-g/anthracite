@@ -7,7 +7,7 @@
 <details open>
 <summary><strong>overview</strong></summary>
 
-Anthracite puts your existing Codex or OpenCode installation in a native FreeCAD sidebar.
+Anthracite puts your existing Codex, OpenCode, or Hermes installation in a native FreeCAD sidebar.
 Describe a change, attach images, or pick a face or edge to reference in your message.
 Inspect the agent's work through expandable activity, viewport images, and FreeCAD's
 normal feature tree, properties, and undo history.
@@ -37,7 +37,7 @@ just run
 `just setup` alone checks readiness without changing anything. `--fix` fetches missing
 source/submodules and applies patches; it does not overwrite dirty work.
 `just build` prepares CMake automatically and compiles incrementally.
-`just run` launches without building. Install Codex or OpenCode separately and select it
+`just run` launches without building. Install Codex, OpenCode, or Hermes separately and select it
 in the sidebar.
 
 - **Linux:** Nix supplies native dependencies and tooling. Packaged `nix build` and
