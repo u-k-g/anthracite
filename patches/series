@@ -6,3 +6,4 @@ freecad-executor.patch
 agent-runtime.patch
 providers.patch
 sidebar.patch
+hermes-provider.patch

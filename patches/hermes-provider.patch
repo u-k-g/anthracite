@@ -1,0 +1,999 @@
+--- a/src/Mod/Anthracite/Gui/AgentBridge.cpp
++++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
+@@ -227,8 +227,7 @@ void AgentBridge::stop()
+ void AgentBridge::chooseProvider()
+ {
+     const QString provider = providerKind();
+-    const QString displayName =
+-        provider == QLatin1String("opencode") ? QStringLiteral("OpenCode") : QStringLiteral("Codex");
++    const QString displayName = providerDisplayName(provider);
+     const QString selected = QFileDialog::getOpenFileName(
+         QApplication::activeWindow(),
+         tr("Choose the %1 executable").arg(displayName),
+@@ -239,7 +238,9 @@ void AgentBridge::chooseProvider()
+     }
+ 
+     auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
+-    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    const char* key = provider == QLatin1String("opencode")
++        ? "OpenCodeBinary"
++        : provider == QLatin1String("hermes") ? "HermesBinary" : "CodexBinary";
+     preferences->SetASCII(key, selected.toUtf8().constData());
+     sidebar->appendActivity(tr("%1 executable set to %2").arg(displayName, selected));
+ 
+@@ -280,12 +281,7 @@ void AgentBridge::selectProvider(const Q
+     preferences->SetASCII("Provider", provider.toUtf8().constData());
+     selectedLocalThreadId.clear();
+     createNewThread = false;
+-    sidebar->appendActivity(
+-        tr("Using %1").arg(
+-            provider == QLatin1String("opencode") ? QStringLiteral("OpenCode")
+-                                                   : QStringLiteral("Codex")
+-        )
+-    );
++    sidebar->appendActivity(tr("Using %1").arg(providerDisplayName(provider)));
+     performSessionRestart(QString(), false);
+ }
+ 
+@@ -425,12 +421,9 @@ void AgentBridge::ensureRuntime()
+ 
+     const QString provider = providerPath();
+     if (provider.isEmpty() || !QFileInfo::exists(provider)) {
+-        const QString displayName = providerKind() == QLatin1String("opencode")
+-            ? QStringLiteral("OpenCode")
+-            : QStringLiteral("Codex");
+         fail(
+             tr("%1 was not found. Use Configure… to select your existing executable.")
+-                .arg(displayName)
++                .arg(providerDisplayName(providerKind()))
+         );
+         return;
+     }
+@@ -441,12 +434,7 @@ void AgentBridge::ensureRuntime()
+         return;
+     }
+ 
+-    sidebar->appendActivity(
+-        tr("Starting %1").arg(
+-            providerKind() == QLatin1String("opencode") ? QStringLiteral("OpenCode")
+-                                                        : QStringLiteral("Codex")
+-        )
+-    );
++    sidebar->appendActivity(tr("Starting %1").arg(providerDisplayName(providerKind())));
+     runtime.setProgram(executable);
+     runtime.setWorkingDirectory(workingDirectory());
+     runtime.start();
+@@ -567,11 +555,7 @@ void AgentBridge::handleMessage(const QJ
+     else if (type == QLatin1String("runtime.ready")) {
+         runtimeReady = true;
+         sidebar->appendActivity(
+-            tr("%1 connected").arg(
+-                payload.value("provider").toString() == QLatin1String("opencode")
+-                    ? QStringLiteral("OpenCode")
+-                    : QStringLiteral("Codex")
+-            )
++            tr("%1 connected").arg(providerDisplayName(payload.value("provider").toString()))
+         );
+         sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
+         persistDraft();
+@@ -815,7 +799,21 @@ QString AgentBridge::providerKind() cons
+ {
+     const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
+     const QString configured = QString::fromStdString(preferences->GetASCII("Provider", "codex"));
+-    return configured == QLatin1String("opencode") ? configured : QStringLiteral("codex");
++    if (configured == QLatin1String("opencode") || configured == QLatin1String("hermes")) {
++        return configured;
++    }
++    return QStringLiteral("codex");
++}
++
++QString AgentBridge::providerDisplayName(const QString& provider) const
++{
++    if (provider == QLatin1String("opencode")) {
++        return QStringLiteral("OpenCode");
++    }
++    if (provider == QLatin1String("hermes")) {
++        return QStringLiteral("Hermes");
++    }
++    return QStringLiteral("Codex");
+ }
+ 
+ QString AgentBridge::providerPath() const
+@@ -826,7 +824,9 @@ QString AgentBridge::providerPath() cons
+ QString AgentBridge::findProviderExecutable(const QString& provider) const
+ {
+     const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
+-    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
++    const char* key = provider == QLatin1String("opencode")
++        ? "OpenCodeBinary"
++        : provider == QLatin1String("hermes") ? "HermesBinary" : "CodexBinary";
+     const QString configured = QString::fromStdString(preferences->GetASCII(key, ""));
+     if (!configured.isEmpty()) {
+         return configured;
+@@ -844,6 +844,12 @@ QString AgentBridge::findProviderExecuta
+               QStringLiteral("/opt/homebrew/bin/opencode"),
+               QStringLiteral("/usr/local/bin/opencode"),
+           }
++        : provider == QLatin1String("hermes")
++        ? QStringList {
++              QDir(home).filePath(QStringLiteral(".local/bin/hermes")),
++              QStringLiteral("/opt/homebrew/bin/hermes"),
++              QStringLiteral("/usr/local/bin/hermes"),
++          }
+         : QStringList {
+               QDir(home).filePath(QStringLiteral(".local/bin/codex")),
+               QStringLiteral("/opt/homebrew/bin/codex"),
+--- a/src/Mod/Anthracite/Gui/AgentBridge.h
++++ b/src/Mod/Anthracite/Gui/AgentBridge.h
+@@ -64,6 +64,7 @@ private:
+     QString executePython(const QString& source, bool& success, const QJsonObject& payload);
+     QString runtimePath() const;
+     QString providerKind() const;
++    QString providerDisplayName(const QString& provider) const;
+     QString providerPath() const;
+     QString findProviderExecutable(const QString& provider) const;
+     QString workingDirectory() const;
+--- a/src/Mod/Anthracite/Gui/CMakeLists.txt
++++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_custom_command(
+         ${AnthraciteRuntime_SOURCE_DIR}/src/timeline.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
++        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/hermes.rs
+         ${AnthraciteRuntime_SOURCE_DIR}/src/providers/opencode.rs
+     COMMENT "Building Anthracite agent runtime"
+     VERBATIM
+--- a/src/Mod/Anthracite/Gui/Sidebar.cpp
++++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
+@@ -241,6 +241,10 @@ QVariantList SidebarController::provider
+             {QStringLiteral("id"), QStringLiteral("opencode")},
+             {QStringLiteral("name"), QStringLiteral("OpenCode")},
+         },
++        QVariantMap {
++            {QStringLiteral("id"), QStringLiteral("hermes")},
++            {QStringLiteral("name"), QStringLiteral("Hermes")},
++        },
+     };
+ }
+ 
+@@ -480,7 +484,8 @@ void SidebarController::chooseProvider()
+ 
+ void SidebarController::selectProvider(const QString& provider)
+ {
+-    if ((provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
++    if ((provider != QLatin1String("codex") && provider != QLatin1String("opencode")
++         && provider != QLatin1String("hermes"))
+         || provider == currentProvider) {
+         return;
+     }
+@@ -640,8 +645,9 @@ void SidebarController::clearInteraction
+ 
+ void SidebarController::restoreProvider(const QString& provider)
+ {
+-    const QString normalized = provider == QLatin1String("opencode") ? provider
+-                                                                     : QStringLiteral("codex");
++    const QString normalized = (provider == QLatin1String("opencode") || provider == QLatin1String("hermes"))
++        ? provider
++        : QStringLiteral("codex");
+     if (currentProvider != normalized) {
+         currentProvider = normalized;
+         Q_EMIT providerChanged();
+--- a/src/Mod/Anthracite/Runtime/src/composer.rs
++++ b/src/Mod/Anthracite/Runtime/src/composer.rs
+@@ -40,6 +40,9 @@ pub fn parts(prompt: &str, attachments:
+                 }
+                 images.push(if provider == "codex" {
+                     json!({"type": "image", "url": url})
++                } else if provider == "hermes" {
++                    let data = url.split_once(',').map(|(_, data)| data).unwrap_or("");
++                    json!({"type": "image", "mimeType": "image/png", "data": data})
+                 } else {
+                     json!({"type": "file", "mime": "image/png", "filename": attachment["name"], "url": url})
+                 });
+@@ -84,6 +87,10 @@ mod tests {
+         let open = parts("", &json!([input["attachments"][0]]), "opencode").unwrap();
+         assert_eq!(open[0]["type"], "file");
+         assert_eq!(open[0]["mime"], "image/png");
++        let hermes = parts("", &json!([input["attachments"][0]]), "hermes").unwrap();
++        assert_eq!(hermes[0]["type"], "image");
++        assert_eq!(hermes[0]["mimeType"], "image/png");
++        assert_eq!(hermes[0]["data"], "aGVsbG8=");
+         assert!(parts("", &json!([]), "codex").is_err());
+         assert!(
+             parts(
+--- /dev/null
++++ b/src/Mod/Anthracite/Runtime/src/providers/hermes.rs
+@@ -0,0 +1,773 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++
++use super::ProviderAdapter;
++use crate::process::{IoEvent, LineProcess, McpBridge};
++use crate::protocol::{self, Emitter};
++use crate::store::Store;
++use serde_json::{json, Value};
++use std::collections::{HashMap, HashSet};
++use std::sync::mpsc;
++
++const INITIALIZE_ID: u64 = 1;
++const SESSION_START_ID: u64 = 2;
++
++struct PendingTool {
++    jsonrpc_id: Value,
++    response: mpsc::Sender<Value>,
++}
++
++struct PendingRequest {
++    server_id: Value,
++    options: Vec<Value>,
++    params: Value,
++}
++
++pub struct HermesAdapter {
++    process: LineProcess,
++    cwd: String,
++    next_request_id: u64,
++    next_interaction_id: u64,
++    next_tool_id: u64,
++    session_id: Option<String>,
++    prompt_request_ids: HashSet<u64>,
++    pending: HashMap<String, PendingRequest>,
++    pending_tools: HashMap<String, PendingTool>,
++    mcp_command: Vec<String>,
++    emitter: Emitter,
++}
++
++impl HermesAdapter {
++    pub fn start(
++        binary: &str,
++        cwd: &str,
++        sender: &mpsc::Sender<IoEvent>,
++        store: Store,
++    ) -> Result<Self, String> {
++        let process = LineProcess::start(binary, &["acp"], cwd, sender)?;
++        let bridge = McpBridge::start(sender)?;
++        let executable = std::env::current_exe()
++            .map_err(|error| format!("Could not locate the Anthracite runtime: {error}"))?;
++        let mut mcp_command = vec![executable.to_string_lossy().to_string()];
++        mcp_command.extend(bridge.proxy_arguments());
++        let emitter = Emitter::new(store);
++        let adapter = Self {
++            process,
++            cwd: cwd.to_owned(),
++            next_request_id: 3,
++            next_interaction_id: 1,
++            next_tool_id: 1,
++            session_id: None,
++            prompt_request_ids: HashSet::new(),
++            pending: HashMap::new(),
++            pending_tools: HashMap::new(),
++            mcp_command,
++            emitter,
++        };
++        adapter.send(&json!({
++            "jsonrpc": "2.0",
++            "id": INITIALIZE_ID,
++            "method": "initialize",
++            "params": {
++                "protocolVersion": 1,
++                "clientInfo": {
++                    "name": "anthracite_freecad",
++                    "title": "Anthracite for FreeCAD",
++                    "version": env!("CARGO_PKG_VERSION")
++                },
++                "clientCapabilities": {
++                    "fs": {"readTextFile": false, "writeTextFile": false},
++                    "terminal": false
++                }
++            }
++        }))?;
++        Ok(adapter)
++    }
++
++    fn send(&self, value: &Value) -> Result<(), String> {
++        self.process.send(value)
++    }
++
++    fn request(&mut self, method: &str, params: Value) -> Result<u64, String> {
++        let id = self.next_request_id;
++        self.next_request_id += 1;
++        self.send(&json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "method": method,
++            "params": params
++        }))?;
++        Ok(id)
++    }
++
++    fn reply(&self, id: &Value, result: Value) -> Result<(), String> {
++        self.send(&json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "result": result
++        }))
++    }
++
++    fn reply_error(&self, id: &Value, message: &str) -> Result<(), String> {
++        self.send(&json!({
++            "jsonrpc": "2.0",
++            "id": id,
++            "error": {"code": -32601, "message": message}
++        }))
++    }
++
++    fn open_session(&self) -> Result<(), String> {
++        let command = self
++            .mcp_command
++            .first()
++            .cloned()
++            .ok_or_else(|| "Anthracite MCP proxy command is empty.".to_string())?;
++        let args = self.mcp_command.iter().skip(1).cloned().collect::<Vec<_>>();
++        self.send(&json!({
++            "jsonrpc": "2.0",
++            "id": SESSION_START_ID,
++            "method": "session/new",
++            "params": {
++                "cwd": self.cwd,
++                "mcpServers": [{
++                    "name": "anthracite",
++                    "command": command,
++                    "args": args,
++                    "env": []
++                }]
++            }
++        }))
++    }
++
++    fn prompt_parts(prompt: &str, attachments: &Value) -> Result<Vec<Value>, String> {
++        let mut parts = crate::composer::parts(prompt, attachments, "hermes")?;
++        if let Some(first) = parts.first_mut() {
++            if first["type"] == "text" {
++                let text = first["text"].as_str().unwrap_or_default().to_owned();
++                first["text"] = json!(format!(
++                    "You are operating inside FreeCAD through Anthracite. \
++Act as an operator of a checked Python executor, not an autonomous designer. \
++Use the anthracite MCP freecad tool for CAD inspection and every CAD mutation. \
++App, Gui, doc, and cad are prebound. Inspect before editing. \
++Ground success claims in executor observations.\n\n{text}"
++                ));
++            }
++        }
++        Ok(parts)
++    }
++
++    fn next_pending_id(&mut self) -> String {
++        let result = format!("hermes-request-{}", self.next_interaction_id);
++        self.next_interaction_id += 1;
++        result
++    }
++
++    fn emit_catalog(&self, models: &Value) {
++        let current = models
++            .get("currentModelId")
++            .and_then(Value::as_str)
++            .unwrap_or("");
++        let catalog = models
++            .get("availableModels")
++            .and_then(Value::as_array)
++            .into_iter()
++            .flatten()
++            .filter_map(|model| {
++                let slug = model
++                    .get("modelId")
++                    .and_then(Value::as_str)
++                    .or_else(|| model.get("model_id").and_then(Value::as_str))?;
++                Some(json!({
++                    "id": slug,
++                    "model": slug,
++                    "name": model.get("name").and_then(Value::as_str).unwrap_or(slug),
++                    "description": model.get("description").and_then(Value::as_str).unwrap_or(""),
++                    "isDefault": slug == current,
++                    "defaultEffort": "",
++                    "efforts": []
++                }))
++            })
++            .collect::<Vec<_>>();
++        self.emitter.emit(
++            "model.catalog",
++            json!({"provider": "hermes", "models": catalog}),
++        );
++    }
++
++    fn emit_ready(&self) {
++        self.emitter.emit(
++            "runtime.ready",
++            json!({
++                "provider": "hermes",
++                "threadId": self.session_id,
++                "capabilities": {
++                    "approvals": true,
++                    "userInput": false,
++                    "plans": true,
++                    "usage": true,
++                    "modelOverrides": true
++                }
++            }),
++        );
++    }
++
++    fn handle_session_response(&mut self, message: &Value) -> Result<(), String> {
++        if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            return Err(format!("Hermes protocol error: {error}"));
++        }
++        self.session_id = message
++            .pointer("/result/sessionId")
++            .and_then(Value::as_str)
++            .map(str::to_owned);
++        if self.session_id.is_none() {
++            return Err("Hermes session/new response did not include a session id.".to_string());
++        }
++        if let Some(session_id) = &self.session_id {
++            self.emitter.set_provider_thread_id(session_id);
++        }
++        if let Some(models) = message.pointer("/result/models") {
++            self.emit_catalog(models);
++        }
++        self.emit_ready();
++        Ok(())
++    }
++
++    fn handle_prompt_response(&mut self, message: &Value) -> Result<(), String> {
++        if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++            self.emitter.emit(
++                "runtime.error",
++                json!({"class": "provider_error", "message": error}),
++            );
++            self.emitter.emit(
++                "turn.completed",
++                json!({"status": "failed", "error": error}),
++            );
++            return Ok(());
++        }
++        let status = message
++            .pointer("/result/stopReason")
++            .and_then(Value::as_str)
++            .unwrap_or("end_turn");
++        let mapped = match status {
++            "cancelled" => "interrupted",
++            "refusal" | "max_tokens" | "max_turn_requests" => "failed",
++            _ => "completed",
++        };
++        self.emitter.emit(
++            "turn.completed",
++            json!({"status": mapped, "error": if mapped == "failed" { Value::String(status.to_owned()) } else { Value::Null }}),
++        );
++        Ok(())
++    }
++
++    fn option_id_for(decision: &str, options: &[Value]) -> Result<Option<String>, String> {
++        let wanted = match decision {
++            "approve" => ["allow_once", "allow_session", "allow_always"].as_slice(),
++            "approve_session" => ["allow_session", "allow_always", "allow_once"].as_slice(),
++            "decline" => ["deny", "deny_always"].as_slice(),
++            "cancel" => return Ok(None),
++            _ => return Err(format!("Unknown approval decision: {decision}")),
++        };
++        let ids = options
++            .iter()
++            .filter_map(|option| option.get("optionId").and_then(Value::as_str))
++            .collect::<Vec<_>>();
++        for candidate in wanted {
++            if ids.iter().any(|id| id == candidate) {
++                return Ok(Some((*candidate).to_owned()));
++            }
++        }
++        Err(format!(
++            "Hermes permission request has no matching option for {decision}."
++        ))
++    }
++
++    fn handle_permission_request(&mut self, message: &Value) -> Result<(), String> {
++        let server_id = message.get("id").cloned().unwrap_or(Value::Null);
++        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
++        let options = params
++            .get("options")
++            .and_then(Value::as_array)
++            .cloned()
++            .unwrap_or_default();
++        let tool_call = params.get("toolCall").unwrap_or(&Value::Null);
++        let title = tool_call
++            .get("title")
++            .and_then(Value::as_str)
++            .unwrap_or("Grant additional access");
++        let detail = tool_call
++            .pointer("/rawInput/command")
++            .or_else(|| tool_call.pointer("/rawInput/description"))
++            .and_then(Value::as_str)
++            .unwrap_or("Hermes requested permission to continue.");
++        let allow_session = options.iter().any(|option| {
++            matches!(
++                option.get("optionId").and_then(Value::as_str),
++                Some("allow_session" | "allow_always")
++            )
++        });
++        let request_id = self.next_pending_id();
++        self.emitter.emit(
++            "request.opened",
++            json!({
++                "requestId": request_id,
++                "requestKind": "permission_approval",
++                "title": title,
++                "detail": detail,
++                "allowSession": allow_session,
++                "providerArgs": params
++            }),
++        );
++        self.pending.insert(
++            request_id,
++            PendingRequest {
++                server_id,
++                options,
++                params,
++            },
++        );
++        Ok(())
++    }
++
++    fn handle_update(&mut self, params: &Value) {
++        let update = params.get("update").unwrap_or(params);
++        let kind = update
++            .get("sessionUpdate")
++            .and_then(Value::as_str)
++            .unwrap_or("");
++        match kind {
++            "agent_message_chunk" => {
++                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
++                    if !text.is_empty() {
++                        self.emitter.emit(
++                            "content.delta",
++                            json!({
++                                "streamKind": "assistant_text",
++                                "text": text,
++                                "messageId": update.get("messageId")
++                            }),
++                        );
++                    }
++                }
++            }
++            "agent_thought_chunk" => {
++                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
++                    if !text.is_empty() {
++                        self.emitter.emit(
++                            "content.delta",
++                            json!({
++                                "streamKind": "reasoning",
++                                "text": text,
++                                "messageId": update.get("messageId")
++                            }),
++                        );
++                    }
++                }
++            }
++            "tool_call" | "tool_call_update" => {
++                let id = update.get("toolCallId").cloned().unwrap_or(Value::Null);
++                let title = update
++                    .get("title")
++                    .and_then(Value::as_str)
++                    .unwrap_or("Calling tool");
++                let status = update.get("status").and_then(Value::as_str).unwrap_or("");
++                let started = kind == "tool_call" && status != "completed" && status != "failed";
++                self.emitter.emit(
++                    if started {
++                        "item.started"
++                    } else {
++                        "item.completed"
++                    },
++                    json!({
++                        "itemId": id,
++                        "kind": "mcp_tool_call",
++                        "title": title,
++                        "detail": update.get("kind"),
++                        "output": update.get("rawOutput")
++                    }),
++                );
++            }
++            "plan" => {
++                let steps = update
++                    .get("entries")
++                    .and_then(Value::as_array)
++                    .into_iter()
++                    .flatten()
++                    .map(|entry| {
++                        json!({
++                            "title": entry.get("content"),
++                            "status": entry.get("status")
++                        })
++                    })
++                    .collect::<Vec<_>>();
++                self.emitter.emit(
++                    "plan.updated",
++                    json!({"explanation": Value::Null, "steps": steps}),
++                );
++            }
++            "usage_update" => {
++                self.emitter.emit(
++                    "usage.updated",
++                    json!({
++                        "usedTokens": update.get("used"),
++                        "maxTokens": update.get("size"),
++                        "totalProcessedTokens": update.get("used")
++                    }),
++                );
++            }
++            _ => {}
++        }
++    }
++
++    fn handle_server_request(&mut self, message: &Value) -> Result<(), String> {
++        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
++        let server_id = message.get("id").cloned().unwrap_or(Value::Null);
++        match method {
++            "session/request_permission" => self.handle_permission_request(message),
++            "fs/read_text_file" | "fs/write_text_file" | "terminal/create" => {
++                self.reply_error(&server_id, &format!("Anthracite does not handle {method}."))
++            }
++            _ => {
++                protocol::emit_warning(format!(
++                    "Provider requested unsupported interaction: {method}"
++                ));
++                self.reply_error(&server_id, &format!("Anthracite does not handle {method}."))
++            }
++        }
++    }
++
++    fn handle_notification(&mut self, message: &Value) {
++        match message.get("method").and_then(Value::as_str).unwrap_or("") {
++            "session/update" => self.handle_update(message.get("params").unwrap_or(&Value::Null)),
++            _ => {}
++        }
++    }
++
++    fn handle_response(&mut self, message: &Value) -> Result<(), String> {
++        let Some(response_id) = message.get("id").and_then(Value::as_u64) else {
++            return Err("Hermes returned an unrecognized protocol message.".to_string());
++        };
++        if self.prompt_request_ids.remove(&response_id) {
++            return self.handle_prompt_response(message);
++        }
++        match response_id {
++            INITIALIZE_ID => {
++                if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++                    return Err(format!("Hermes initialize failed: {error}"));
++                }
++                self.open_session()
++            }
++            SESSION_START_ID => self.handle_session_response(message),
++            _ => {
++                if let Some(error) = message.pointer("/error/message").and_then(Value::as_str) {
++                    self.emitter.emit(
++                        "runtime.warning",
++                        json!({"message": format!("Hermes request failed: {error}")}),
++                    );
++                }
++                Ok(())
++            }
++        }
++    }
++
++    fn tool_description() -> &'static str {
++        concat!(
++            "Execute ordinary Python inside the active FreeCAD GUI. ",
++            "App/FreeCAD, Gui, doc, and a small cad inspection helper are prebound. ",
++            "cad.selection() describes selected objects, faces, and edges. ",
++            "The complete source runs as one transaction, recomputes and validates, ",
++            "then returns result/stdout plus created, changed, and deleted objects. ",
++            "Call cad.render_views() for four model views; cad.render(view='current') attaches one image."
++        )
++    }
++}
++
++impl ProviderAdapter for HermesAdapter {
++    fn emitter(&self) -> &Emitter {
++        &self.emitter
++    }
++
++    fn start_turn(
++        &mut self,
++        prompt: &str,
++        model: &str,
++        _effort: &str,
++        attachments: &Value,
++    ) -> Result<(), String> {
++        let session_id = self
++            .session_id
++            .clone()
++            .ok_or_else(|| "Hermes session is not ready.".to_string())?;
++        if !model.is_empty() {
++            let _ = self.request(
++                "session/set_model",
++                json!({"sessionId": session_id, "modelId": model}),
++            );
++        }
++        let id = self.request(
++            "session/prompt",
++            json!({
++                "sessionId": session_id,
++                "prompt": Self::prompt_parts(prompt, attachments)?
++            }),
++        )?;
++        self.prompt_request_ids.insert(id);
++        self.emitter.record(
++            "content.user",
++            &json!({"text": prompt, "attachments": attachments}),
++        );
++        self.emitter
++            .emit("turn.started", json!({"provider": "hermes"}));
++        self.emitter
++            .emit("session.state", json!({"state": "running"}));
++        Ok(())
++    }
++
++    fn return_tool_result(
++        &mut self,
++        request_id: Value,
++        result: &str,
++        success: bool,
++        images: &Value,
++    ) -> Result<(), String> {
++        let key = match &request_id {
++            Value::String(value) => value.clone(),
++            other => other.to_string(),
++        };
++        let pending = self
++            .pending_tools
++            .remove(&key)
++            .ok_or_else(|| format!("Unknown Hermes MCP tool request: {key}"))?;
++        let mut content = vec![json!({"type": "text", "text": result})];
++        content.extend(
++            images
++                .as_array()
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str)
++                .filter(|image| image.starts_with("data:image/"))
++                .filter_map(|image| {
++                    let (header, data) = image.split_once(',')?;
++                    let mime = header
++                        .strip_prefix("data:")?
++                        .split(';')
++                        .next()
++                        .unwrap_or("image/png");
++                    Some(json!({"type": "image", "mimeType": mime, "data": data}))
++                }),
++        );
++        pending
++            .response
++            .send(json!({
++                "jsonrpc": "2.0",
++                "id": pending.jsonrpc_id,
++                "result": {
++                    "content": content,
++                    "isError": !success
++                }
++            }))
++            .map_err(|_| "Hermes MCP connection closed.".to_string())
++    }
++
++    fn resolve_request(&mut self, request_id: &str, decision: &str) -> Result<(), String> {
++        let pending = self
++            .pending
++            .remove(request_id)
++            .ok_or_else(|| format!("Unknown pending provider request: {request_id}"))?;
++        let outcome = match Self::option_id_for(decision, &pending.options) {
++            Ok(None) => json!({"outcome": "cancelled"}),
++            Ok(Some(option_id)) => json!({"outcome": "selected", "optionId": option_id}),
++            Err(error) => {
++                self.pending.insert(request_id.to_owned(), pending);
++                return Err(error);
++            }
++        };
++        self.reply(&pending.server_id, json!({"outcome": outcome}))?;
++        self.emitter.emit(
++            "request.resolved",
++            json!({"requestId": request_id, "decision": decision}),
++        );
++        Ok(())
++    }
++
++    fn resolve_user_input(&mut self, _request_id: &str, _answers: &Value) -> Result<(), String> {
++        Err("Hermes does not request structured user input through Anthracite.".to_string())
++    }
++
++    fn save_draft(&mut self, body: &str, save_id: &Value) {
++        self.emitter.save_draft(body, save_id);
++    }
++
++    fn save_model_selection(&mut self, model: &str, effort: &str) {
++        self.emitter.save_model_selection(model, effort);
++        if let (Some(session_id), true) = (self.session_id.clone(), !model.is_empty()) {
++            let _ = self.request(
++                "session/set_model",
++                json!({"sessionId": session_id, "modelId": model}),
++            );
++        }
++    }
++
++    fn interrupt(&mut self) -> Result<(), String> {
++        if let Some(session_id) = self.session_id.clone() {
++            self.request("session/cancel", json!({"sessionId": session_id}))?;
++        }
++        Ok(())
++    }
++
++    fn handle_message(&mut self, message: Value) -> Result<(), String> {
++        if message.get("method").is_some() && message.get("id").is_some() {
++            return self.handle_server_request(&message);
++        }
++        if message.get("method").is_some() {
++            self.handle_notification(&message);
++            return Ok(());
++        }
++        self.handle_response(&message)
++    }
++
++    fn handle_mcp_message(
++        &mut self,
++        message: Value,
++        response: Option<mpsc::Sender<Value>>,
++    ) -> Result<(), String> {
++        let Some(response) = response else {
++            return Ok(());
++        };
++        let id = message.get("id").cloned().unwrap_or(Value::Null);
++        match message.get("method").and_then(Value::as_str).unwrap_or("") {
++            "initialize" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "protocolVersion": "2025-06-18",
++                        "capabilities": {"tools": {}},
++                        "serverInfo": {
++                            "name": "anthracite",
++                            "version": env!("CARGO_PKG_VERSION")
++                        }
++                    }
++                }))
++                .map_err(|_| "Hermes MCP connection closed.".to_string()),
++            "ping" => response
++                .send(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
++                .map_err(|_| "Hermes MCP connection closed.".to_string()),
++            "tools/list" => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "result": {
++                        "tools": [{
++                            "name": "freecad",
++                            "description": Self::tool_description(),
++                            "inputSchema": {
++                                "type": "object",
++                                "properties": {
++                                    "code": {
++                                        "type": "string",
++                                        "description": "Complete ordinary FreeCAD Python source."
++                                    }
++                                },
++                                "required": ["code"],
++                                "additionalProperties": false
++                            }
++                        }]
++                    }
++                }))
++                .map_err(|_| "Hermes MCP connection closed.".to_string()),
++            "tools/call" => {
++                let code = message
++                    .pointer("/params/arguments/code")
++                    .and_then(Value::as_str)
++                    .unwrap_or("");
++                if message.pointer("/params/name").and_then(Value::as_str) != Some("freecad")
++                    || code.is_empty()
++                {
++                    return response
++                        .send(json!({
++                            "jsonrpc": "2.0",
++                            "id": id,
++                            "result": {
++                                "content": [{
++                                    "type": "text",
++                                    "text": "The freecad tool requires a non-empty code string."
++                                }],
++                                "isError": true
++                            }
++                        }))
++                        .map_err(|_| "Hermes MCP connection closed.".to_string());
++                }
++                let request_id = format!("hermes-tool-{}", self.next_tool_id);
++                self.next_tool_id += 1;
++                self.pending_tools.insert(
++                    request_id.clone(),
++                    PendingTool {
++                        jsonrpc_id: id,
++                        response,
++                    },
++                );
++                self.emitter.call_tool(json!({
++                    "requestId": request_id,
++                    "tool": "freecad",
++                    "arguments": {"code": code}
++                }))?;
++                Ok(())
++            }
++            method => response
++                .send(json!({
++                    "jsonrpc": "2.0",
++                    "id": id,
++                    "error": {
++                        "code": -32601,
++                        "message": format!("Unsupported MCP method: {method}")
++                    }
++                }))
++                .map_err(|_| "Hermes MCP connection closed.".to_string()),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn maps_permission_decisions_onto_acp_options() {
++        let options = vec![
++            json!({"optionId": "allow_once", "kind": "allow_once", "name": "Allow once"}),
++            json!({"optionId": "allow_session", "kind": "allow_always", "name": "Allow for session"}),
++            json!({"optionId": "deny", "kind": "reject_once", "name": "Deny"}),
++        ];
++        assert_eq!(
++            HermesAdapter::option_id_for("approve", &options).unwrap(),
++            Some("allow_once".to_owned())
++        );
++        assert_eq!(
++            HermesAdapter::option_id_for("approve_session", &options).unwrap(),
++            Some("allow_session".to_owned())
++        );
++        assert_eq!(
++            HermesAdapter::option_id_for("decline", &options).unwrap(),
++            Some("deny".to_owned())
++        );
++        assert_eq!(
++            HermesAdapter::option_id_for("cancel", &options).unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn normalizes_hermes_model_catalog() {
++        let adapter_json = json!({
++            "availableModels": [
++                {"modelId": "openrouter:x-ai/grok-4.6", "name": "Grok 4.6", "description": "Default"}
++            ],
++            "currentModelId": "openrouter:x-ai/grok-4.6"
++        });
++        let slug = adapter_json["availableModels"][0]["modelId"]
++            .as_str()
++            .unwrap();
++        assert_eq!(slug, "openrouter:x-ai/grok-4.6");
++        assert_eq!(adapter_json["currentModelId"], "openrouter:x-ai/grok-4.6");
++    }
++}
+--- a/src/Mod/Anthracite/Runtime/src/providers/mod.rs
++++ b/src/Mod/Anthracite/Runtime/src/providers/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+ mod codex;
++mod hermes;
+ mod opencode;
+ 
+ use crate::process::IoEvent;
+@@ -60,6 +61,9 @@ pub fn start(
+         "opencode" => Ok(Box::new(opencode::OpenCodeAdapter::start(
+             binary, cwd, sender, store,
+         )?)),
++        "hermes" => Ok(Box::new(hermes::HermesAdapter::start(
++            binary, cwd, sender, store,
++        )?)),
+         _ => Err(format!("Unsupported provider adapter: {kind}")),
+     }
+ }
