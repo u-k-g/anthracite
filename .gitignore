@@ -5,8 +5,18 @@
 
 !devutils/
 !devutils/**/
+
+!nix/
+!nix/**/
+
 !patches/
 !patches/**/
+
+!tests/
+!tests/**/
+
+!.agents/
+!.agents/**/
 
 !AGENTS.md
 !LICENSE
@@ -16,18 +26,12 @@
 !flake.nix
 !flake.lock
 !.envrc
-!nix/
-!nix/*.nix
-!devutils/quilt-env.nu
-!devutils/launch.nu
-!devutils/native.nu
-!devutils/workflow.nu
-!tests/
-!tests/*.nu
-!tests/*.py
-
-!patches/*.patch
-!patches/**/*.patch
-
 !justfile
+
+!*.nu
+!*.py
+!*.nix
+!*.patch
+
+!.agents/skills/anthracite/**
 !patches/series

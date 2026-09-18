@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1410 @@
+@@ -0,0 +1,1531 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -670,13 +670,19 @@
 +    """Small inspection helper; creation and editing stay ordinary FreeCAD Python."""
 +
 +    def __init__(self, doc: Any):
-+        self.doc = doc
++        self._doc = doc
 +        self.events: list[dict[str, Any]] = []
 +        self.check_requests = []
 +        self.render_request: dict[str, Any] | None = None
 +        self.render_views_request: list[dict[str, Any]] = []
 +        self.reference_baseline = None
 +        self.automatic_images = True
++
++    @property
++    def doc(self):
++        # Resolve the active document lazily so helpers work inside a call that creates
++        # the document before using them.
++        return self._doc if self._doc is not None else App.ActiveDocument
 +
 +    def feedback(self, *, images=True):
 +        """Control automatic images for this call only; explicit renders still run."""
@@ -1013,6 +1019,118 @@
 +        _executing_docs.discard(doc.Name)
 +
 +
++_DOCUMENT_OPENERS = {"newDocument", "openDocument", "open"}
++
++
++def _opens_or_creates_document(tree) -> bool:
++    """True when a program can establish the active document itself."""
++    for item in ast.walk(tree):
++        if (isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
++                and item.func.attr in _DOCUMENT_OPENERS):
++            return True
++    return False
++
++
++def _execute_document_creation(source: str, progress=lambda stage: None) -> dict[str, Any]:
++    """Run a program that creates or opens the document when none is active.
++
++    With no active document there is nothing to open a native transaction on, so this
++    path cannot roll back partial edits. It says so instead of implying a rollback, and
++    leaves whatever was created in place for inspection.
++    """
++    before_documents = {document.Name: _document_snapshot(document) for document in App.listDocuments()}
++    stdout = io.StringIO()
++    stderr = io.StringIO()
++    cad = Cad(None)
++    namespace = {
++        "__builtins__": __builtins__,
++        "App": App,
++        "FreeCAD": App,
++        "Gui": Gui,
++        "doc": None,
++        "cad": cad,
++    }
++    try:
++        code = _compile(source)
++        progress("python")
++        # Nothing was edited through a transaction, so suppress the external-change
++        # observer: the whole program is this one call, not a series of user edits.
++        App.removeDocumentObserver(_revision_observer)
++        try:
++            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
++                exec(code, namespace, namespace)
++        finally:
++            App.addDocumentObserver(_revision_observer)
++    except Exception as error:
++        return {
++            "ok": False,
++            "requiresInspection": True,
++            "revision": 0,
++            "revisionBefore": 0,
++            "stdout": _bounded(stdout.getvalue()),
++            "stderr": _bounded(stderr.getvalue()),
++            "error": {"type": type(error).__name__, "message": str(error),
++                      "traceback": _bounded(traceback.format_exc())},
++            "observation": None,
++            "events": cad.events,
++            "note": ("No document was active, so this call ran without a transaction and cannot "
++                     "be rolled back. Inspect the document before retrying."),
++        }
++
++    document = App.ActiveDocument
++    if document is None:
++        return {
++            "ok": False,
++            "notExecuted": True,
++            "revision": 0,
++            "stdout": _bounded(stdout.getvalue()),
++            "stderr": _bounded(stderr.getvalue()),
++            "error": {"type": "DocumentMissing",
++                      "message": "The program did not create or open a document."},
++        }
++
++    name = document.Name
++    revision = _revisions.setdefault(name, 0)
++    try:
++        progress("recompute")
++        document.recompute()
++        progress("validation")
++        Cad(document).assert_valid()
++    except Exception as error:
++        return {
++            "ok": False,
++            "requiresInspection": True,
++            "revision": revision,
++            "revisionBefore": revision,
++            "stdout": _bounded(stdout.getvalue()),
++            "stderr": _bounded(stderr.getvalue()),
++            "error": {"type": type(error).__name__, "message": str(error),
++                      "traceback": _bounded(traceback.format_exc())},
++            "observation": None,
++            "events": cad.events,
++            "note": ("The new document could not be validated and no transaction was open, so it "
++                     "was left in place for inspection."),
++        }
++
++    before = before_documents.get(name, {})
++    after = _document_snapshot(document)
++    changed = before != after
++    revision += int(changed)
++    _revisions[name] = revision
++    return {
++        "ok": True,
++        "revisionBefore": revision - int(changed),
++        "revision": revision,
++        "stdout": _bounded(stdout.getvalue()),
++        "stderr": _bounded(stderr.getvalue()),
++        "result": _json_safe(namespace.get("_result")),
++        "observation": _observation(document, before, after),
++        "events": cad.events,
++        "images": [],
++        "createdDocument": name,
++    }
++
++
 +def _execute_impl(source: str, expected_revision: int | None = None, progress=lambda stage: None) -> dict[str, Any]:
 +    """Execute source once, returning a structured result suitable for an LLM."""
 +
@@ -1044,8 +1162,11 @@
 +            except Exception as error:
 +                return {"ok": False, "notExecuted": True,
 +                        "error": {"type": type(error).__name__, "message": str(error)}}
-+        # Never create a document implicitly: an external agent must open or create one
-+        # explicitly so the active document is never an accidental side effect.
++        # A program that creates or opens a document is the one legitimate case for
++        # starting with no active document. Anything else is rejected so a stray edit
++        # never produces an accidental scratch document.
++        if _opens_or_creates_document(parsed):
++            return _execute_document_creation(source, progress)
 +        return {
 +            "ok": False,
 +            "notExecuted": True,
