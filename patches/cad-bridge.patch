@@ -681,7 +681,7 @@
 +    _bridge.unsubscribe(callback)
 --- /dev/null
 +++ b/src/Mod/Anthracite/anthracite
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,335 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite command-line client.
@@ -859,8 +859,20 @@
 +
 +
 +def present(result: dict, shots: list[Path]) -> dict:
-+    """Replace base64 image payloads with file paths a harness can read."""
-+    renders = (result.get("observation") or {}).get("renders") or []
++    """Replace base64 payloads with one shot array of paths a harness can read.
++
++    The executor's `observation.renders` and the CLI's `shots` describe the same images,
++    so only `shots` is printed to keep the payload small.
++    """
++    presented = dict(result)
++    presented.pop("images", None)
++    observation = presented.get("observation")
++    renders = []
++    if isinstance(observation, dict):
++        observation = dict(observation)
++        renders = observation.pop("renders", None) or []
++        observation.pop("render", None)
++        presented["observation"] = observation
 +    by_index = {entry.get("imageIndex"): entry for entry in renders if isinstance(entry, dict)}
 +    entries = []
 +    for index, path in enumerate(shots):
@@ -869,8 +881,6 @@
 +        if meta:
 +            entry.update({key: value for key, value in meta.items() if key != "dataUrl"})
 +        entries.append(entry)
-+    presented = dict(result)
-+    presented.pop("images", None)
 +    presented["shots"] = entries
 +    return presented
 +

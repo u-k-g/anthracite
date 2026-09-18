@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1562 @@
+@@ -0,0 +1,1605 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -24,6 +24,16 @@
 +import FreeCAD as App
 +import AnthraciteInspect as Inspect
 +import AnthraciteHistory as History
++
++try:  # Geometry modules nearly every program needs; prebind them.
++    import Part
++except Exception:  # pragma: no cover - always present in a normal FreeCAD build
++    Part = None
++
++try:
++    import Sketcher
++except Exception:  # pragma: no cover
++    Sketcher = None
 +
 +try:
 +    import FreeCADGui as Gui
@@ -769,6 +779,30 @@
 +        """List editable design parameters (native properties and sketch dimensions)."""
 +        return Inspect.parameters(self.doc, obj)
 +
++    def editability(self):
++        """Audit how parametric the native feature tree is (the E half of a G/E verdict)."""
++        return Inspect.editability(self.doc)
++
++    def export(self, path, objects=None, *, format=None):
++        """Write geometry to a file: step, iges, brep, stl, or obj."""
++        return Inspect.export(self.doc, path, objects, format)
++
++    def compare(self, reference, target=None):
++        """Compare a solid against a reference file, allowing translation and rotation only."""
++        if target is None:
++            target = self._default_solid()
++        return Inspect.compare(self.doc, reference, target, _revisions.get(self.doc.Name, 0))
++
++    def _default_solid(self):
++        for obj in self.doc.Objects:
++            if obj.isDerivedFrom("PartDesign::Body") and getattr(obj, "Tip", None) is not None:
++                return obj.Tip.Name
++        solids = [obj for obj in self.doc.Objects
++                  if hasattr(obj, "Shape") and not obj.Shape.isNull() and obj.Shape.Solids]
++        if not solids:
++            raise ValueError("No solid to compare; name a target explicitly.")
++        return solids[-1].Name
++
 +    def verify(self, checks):
 +        if self.doc is not None and (self.doc.Name in _executing_docs or _creation_in_progress):
 +            self.check_requests.append(checks)
@@ -931,7 +965,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -1029,6 +1063,16 @@
 +_DOCUMENT_OPENERS = {"newDocument", "openDocument", "open"}
 +
 +
++def _base_namespace() -> dict[str, Any]:
++    """Names prebound in every submitted program."""
++    namespace: dict[str, Any] = {"__builtins__": __builtins__, "App": App, "FreeCAD": App, "Gui": Gui}
++    if Part is not None:
++        namespace["Part"] = Part
++    if Sketcher is not None:
++        namespace["Sketcher"] = Sketcher
++    return namespace
++
++
 +def _opens_or_creates_document(tree) -> bool:
 +    """True when a program can establish the active document itself."""
 +    for item in ast.walk(tree):
@@ -1049,14 +1093,7 @@
 +    stdout = io.StringIO()
 +    stderr = io.StringIO()
 +    cad = Cad(None)
-+    namespace = {
-+        "__builtins__": __builtins__,
-+        "App": App,
-+        "FreeCAD": App,
-+        "Gui": Gui,
-+        "doc": None,
-+        "cad": cad,
-+    }
++    namespace = {**_base_namespace(), "doc": None, "cad": cad}
 +    try:
 +        code = _compile(source)
 +        progress("python")
@@ -1234,9 +1271,15 @@
 +            method, args, kwargs = helper
 +            if method in _HISTORY_HELPERS:
 +                return _history_execute(doc, method, args, kwargs, revision)
-+            return {"ok": True, "readOnly": True, "revision": revision, "revisionBefore": revision,
-+                    "result": getattr(Cad(doc), method)(*args, **kwargs),
-+                    "history": History.describe(doc, revision), "images": []}
++            outcome = getattr(Cad(doc), method)(*args, **kwargs)
++            response = {"ok": True, "readOnly": True, "revision": revision, "revisionBefore": revision,
++                        "result": outcome,
++                        "history": History.describe(doc, revision), "images": []}
++            if method == "verify":
++                # A read-only verify is sufficient on its own: surface the claims the
++                # same way a mutation does, so callers need no fake edit.
++                response["verification"] = [outcome]
++            return response
 +        if doc.HasPendingTransaction:
 +            raise ValueError("Finish or cancel the open native transaction before agent mutations.")
 +        label = "Agent edit"
@@ -1266,14 +1309,7 @@
 +    stderr = io.StringIO()
 +    cad = Cad(doc)
 +    cad.reference_baseline = before
-+    namespace = {
-+        "__builtins__": __builtins__,
-+        "App": App,
-+        "FreeCAD": App,
-+        "Gui": Gui,
-+        "doc": doc,
-+        "cad": cad,
-+    }
++    namespace = {**_base_namespace(), "doc": doc, "cad": cad}
 +
 +    action_id = str(uuid.uuid4())
 +    doc.openTransaction(f"Anthracite: {label} [{action_id}]")
@@ -1304,6 +1340,13 @@
 +
 +        if App.getDocument(document_name) is not doc:
 +            raise RuntimeError("The active document was closed during the tool call.")
++        if App.ActiveDocument is not doc:
++            # A transaction cannot span a document switch, so the observation and
++            # revision bookkeeping would describe the wrong document.
++            raise RuntimeError(
++                "The active document changed during the call; create or activate documents "
++                "in a separate call."
++            )
 +
 +        # A lightweight parameter receipt does not need another serialized BRep.
 +        authored = {obj.Name: {key: Inspect.value(getattr(obj, key)) for key in obj.PropertiesList
@@ -1660,7 +1703,7 @@
 +        self.assertAlmostEqual(frame['axes_world']['x']['x'], 0, places=7)
 +        self.assertAlmostEqual(frame['axes_world']['x']['y'], 1, places=7)
 +        measured = self.run_code("cad.measure('BasePad')")['result']
-+        self.assertAlmostEqual(measured['centerOfMass_mm']['x'], 30)
++        self.assertAlmostEqual(measured['centerOfMass_mm'][0], 30)
 +        self.assertIn('world', measured['coordinateFrame'])
 +
 +    def test_intervening_changes_report_native_edits_once_and_not_agent_edits(self):
@@ -2281,13 +2324,19 @@
 +            "checkpoint": identity, "originalDocumentPreserved": True}
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteInspect.py
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,823 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Readable, bounded native CAD observations; never a replacement geometry API."""
 +import FreeCAD as App
 +import math
++import os
 +import re
 +import uuid
++
++try:
++    import Part
++except Exception:  # pragma: no cover - present in a normal FreeCAD build
++    Part = None
 +
 +_reference_documents = {}
 +
@@ -2343,7 +2392,7 @@
 +        ref = {"document": doc.Name, "documentToken": document_token(doc), "object": obj.Name,
 +               "subelement": f"{'Face' if kind == 'faces' else 'Edge'}{index}", "revision": revision}
 +        item = {"reference": ref, "geometryType": geometry_type,
-+                "centerOfMass_mm": value(part.CenterOfMass),
++                "centerOfMass_mm": _center_of_mass(part),
 +                "area_mm2" if kind == "faces" else "length_mm": part.Area if kind == "faces" else part.Length,
 +                "tolerance_mm": part.getTolerance(1)}
 +        for name in ("Radius", "MajorRadius", "MinorRadius", "Axis", "Center"):
@@ -2357,6 +2406,53 @@
 +            "units": {"length": "mm", "area": "mm^2"},
 +            "coordinateFrame": "document/world; directions are unit vectors",
 +            "referencePolicy": "Every reference expires on a document revision change. Multiple matches are candidates, not a selection."}
++
++
++def _center_of_mass(shape):
++    """Center of mass as [x, y, z] mm, or None when the shape cannot report one.
++
++    Compounds do not expose CenterOfMass in this build, so fall back to the
++    volume-weighted average of their solids; one unavailable field must not make the
++    other measurements unverifiable.
++    """
++    try:
++        center = shape.CenterOfMass
++    except Exception:
++        center = None
++    if center is not None:
++        return [center.x, center.y, center.z]
++    total = 0.0
++    accumulated = App.Vector(0.0, 0.0, 0.0)
++    for solid in shape.Solids:
++        try:
++            volume = solid.Volume
++            if volume <= 0:
++                continue
++            accumulated = accumulated + solid.CenterOfMass * volume
++        except Exception:
++            return None
++        total += volume
++    if total <= 0:
++        return None
++    average = accumulated / total
++    return [average.x, average.y, average.z]
++
++
++def _surface_facts(shape):
++    """Datum/face facts for an interface check: plane normal, or cylinder axis and radius."""
++    try:
++        surface = shape.Surface
++    except Exception:
++        return {}
++    kind = type(surface).__name__
++    facts = {"faceType": kind}
++    if kind == "Cylinder":
++        facts["axis"] = [surface.Axis.x, surface.Axis.y, surface.Axis.z]
++        facts["axisPosition"] = [surface.Center.x, surface.Center.y, surface.Center.z]
++        facts["radius_mm"] = surface.Radius
++    elif hasattr(surface, "Axis"):
++        facts["normal"] = [surface.Axis.x, surface.Axis.y, surface.Axis.z]
++    return facts
 +
 +
 +def measure(doc, target, revision, other=None):
@@ -2375,12 +2471,21 @@
 +            result["overlapVolume_mm3"] = shape.common(second).Volume
 +        else:
 +            result["overlapVolume_mm3"] = None
++        first_normal = _surface_facts(shape).get("normal")
++        second_normal = _surface_facts(second).get("normal")
++        if first_normal and second_normal:
++            dot = sum(a * b for a, b in zip(first_normal, second_normal))
++            result["angleDeg"] = round(math.degrees(math.acos(max(-1.0, min(1.0, abs(dot))))), 6)
++            result["parallel"] = abs(abs(dot) - 1.0) <= 1e-6
 +        result["note"] = "Zero distance alone does not distinguish touching from overlap. Null overlap volume means this check is unavailable for non-solids."
 +    else:
 +        b = shape.BoundBox
 +        result.update(valid=shape.isValid(), solids=len(shape.Solids), volume_mm3=shape.Volume,
-+                      area_mm2=shape.Area, centerOfMass_mm=value(shape.CenterOfMass),
-+                      size_mm=[b.XLength, b.YLength, b.ZLength])
++                      area_mm2=shape.Area, size_mm=[b.XLength, b.YLength, b.ZLength])
++        result.update(_surface_facts(shape))
++        center = _center_of_mass(shape)
++        if center is not None:
++            result["centerOfMass_mm"] = center
 +    return result
 +
 +
@@ -2791,6 +2896,214 @@
 +    "repair": {"purpose": "Repair the earliest failing dependency, not the final displayed solid.",
 +               "checks": "Use cad.tree(), cad.sketch(name), and cad.inspect(name). Check constraint conflicts/redundancies, Support and expressions; change only the offending input. Recompute and inspect affected downstream features."},
 +}
++
++
++_OPAQUE_SOLID_TYPES = ("Part::Feature", "Part::FeaturePython")
++_BOOLEAN_TYPES = ("Part::Cut", "Part::Fuse", "Part::MultiFuse", "Part::Common", "Part::MultiCommon")
++_REPEATABLE_FEATURES = ("PartDesign::Pad", "PartDesign::Pocket", "PartDesign::Hole",
++                        "PartDesign::Revolution", "PartDesign::Groove")
++_EDITABILITY_WEIGHTS = {"opaque-solid": 0.4, "boolean-workaround": 0.25, "pattern-as-copies": 0.2,
++                        "repeated-literal-dimensions": 0.1, "no-expressions": 0.05,
++                        "pocket-not-hole": 0.05, "sketch-conflict": 0.2,
++                        "underconstrained-sketch": 0.15, "frozen-sketch": 0.25}
++_EXPORT_FORMATS = {"step": "Part", "stp": "Part", "iges": "Part", "igs": "Part",
++                   "brep": "Part", "stl": "Mesh", "obj": "Mesh"}
++
++
++def _has_solid(obj):
++    try:
++        return hasattr(obj, "Shape") and not obj.Shape.isNull() and bool(obj.Shape.Solids)
++    except Exception:
++        return False
++
++
++def _numeric_dimensions(obj):
++    values = []
++    for name in obj.PropertiesList:
++        if name.startswith("_") or name in _SKIP_PROPERTIES:
++            continue
++        try:
++            if obj.getTypeIdOfProperty(name) not in _EDITABLE_NUMBERS:
++                continue
++            current = getattr(obj, name)
++        except Exception:
++            continue
++        if isinstance(current, (int, float)) and not isinstance(current, bool):
++            values.append((name, float(current)))
++    return values
++
++
++def _single_circle_sketch(profile):
++    try:
++        if not profile.isDerivedFrom("Sketcher::SketchObject"):
++            return False
++        geometry = profile.Geometry
++        return len(geometry) == 1 and type(geometry[0]).__name__ == "Circle"
++    except Exception:
++        return False
++
++
++def editability(doc):
++    """Audit how parametric the native feature tree is: the E half of a G/E verdict.
++
++    Flags the patterns that quietly turn a design into a frozen copy: opaque solids,
++    booleans standing in for native operations, repeated features with no pattern,
++    literal dimensions with no expressions, pockets that should be holes, and sketches
++    held by blocks instead of dimensions. Heuristic: it flags likely problems, not intent.
++    """
++    findings = []
++    objects = list(doc.Objects)
++
++    opaque = [o.Name for o in objects if o.TypeId in _OPAQUE_SOLID_TYPES and _has_solid(o)]
++    if opaque:
++        findings.append({"code": "opaque-solid", "severity": "warning", "objects": opaque,
++                         "message": "Opaque Part::Feature solids are not parametric; build with native features so the design stays editable."})
++
++    booleans = [o.Name for o in objects
++                if o.TypeId in _BOOLEAN_TYPES or o.isDerivedFrom("PartDesign::Boolean")]
++    if booleans:
++        findings.append({"code": "boolean-workaround", "severity": "warning", "objects": booleans,
++                         "message": "Boolean operations are present; if a native Pocket/Hole/Pattern expresses the intent, fix that feature instead of cutting around it."})
++
++    for body in [o for o in objects if o.isDerivedFrom("PartDesign::Body")]:
++        group = [o for o in body.Group if o.isDerivedFrom("PartDesign::Feature")]
++        if any(o.isDerivedFrom("PartDesign::Transformed") for o in group):
++            continue
++        for type_id in _REPEATABLE_FEATURES:
++            names = [o.Name for o in group if o.TypeId == type_id]
++            if len(names) >= 2:
++                findings.append({"code": "pattern-as-copies", "severity": "warning", "objects": names,
++                                 "message": f"{len(names)} {type_id.split('::')[-1]} features repeat with no pattern; use a native pattern feature."})
++
++    expression_users = [o for o in objects if getattr(o, "ExpressionEngine", None)]
++    dimensioned = [o for o in objects if _numeric_dimensions(o)]
++    if dimensioned and not expression_users:
++        findings.append({"code": "no-expressions", "severity": "info",
++                         "objects": [o.Name for o in dimensioned][:20],
++                         "message": "No expressions are used; bind related dimensions so one change propagates."})
++    seen = {}
++    for obj in dimensioned:
++        for _, current in _numeric_dimensions(obj):
++            if current in (0.0, 1.0):
++                continue
++            seen.setdefault(current, set()).add(obj.Name)
++    duplicates = [{"value": value, "objects": sorted(names)}
++                  for value, names in seen.items() if len(names) >= 2]
++    if duplicates:
++        findings.append({"code": "repeated-literal-dimensions", "severity": "warning",
++                         "duplicates": duplicates[:20],
++                         "message": "The same literal dimension appears on multiple objects; bind them to one expression."})
++
++    for pocket in [o for o in objects if o.TypeId == "PartDesign::Pocket"]:
++        if _single_circle_sketch(getattr(pocket, "Profile", None)):
++            findings.append({"code": "pocket-not-hole", "severity": "info", "objects": [pocket.Name],
++                             "message": "A Pocket on a single-circle sketch is usually a PartDesign::Hole; prefer the native Hole feature."})
++
++    for sketch in [o for o in objects if o.isDerivedFrom("Sketcher::SketchObject")]:
++        try:
++            constraints = list(sketch.Constraints)
++            frozen = sum(1 for c in constraints if getattr(c, "Type", "") in ("Block", "Frozen"))
++            dimensional = sum(1 for c in constraints if getattr(c, "Driving", False)
++                              and getattr(c, "Type", "") in _DIMENSION_CONSTRAINTS)
++            if sketch.ConflictingConstraints or sketch.RedundantConstraints:
++                findings.append({"code": "sketch-conflict", "severity": "warning", "objects": [sketch.Name],
++                                 "message": "Sketch has conflicting or redundant constraints; resolve them before continuing."})
++            if sketch.DoF > 0:
++                findings.append({"code": "underconstrained-sketch", "severity": "info", "objects": [sketch.Name],
++                                 "message": f"Sketch has {sketch.DoF} degrees of freedom; constrain it with dimensions."})
++            if frozen and not dimensional:
++                findings.append({"code": "frozen-sketch", "severity": "warning", "objects": [sketch.Name],
++                                 "message": "Sketch is held by Block/Frozen constraints instead of dimensions; it will not respond to design changes."})
++        except Exception:
++            continue
++
++    score = 1.0
++    for finding in findings:
++        score -= _EDITABILITY_WEIGHTS.get(finding["code"], 0.05)
++    score = max(0.0, round(score, 2))
++    verdict = "parametric" if score >= 0.8 else "mixed" if score >= 0.5 else "opaque"
++    return {"document": doc.Name, "score": score, "verdict": verdict, "findings": findings,
++            "expressionCount": len(expression_users),
++            "scope": "Heuristic editability audit; flags likely non-parametric patterns, not design intent."}
++
++
++def _default_export_objects(doc):
++    """Body tips plus standalone solids; never the Body wrapper and tip together."""
++    bodies = [obj for obj in doc.Objects if obj.isDerivedFrom("PartDesign::Body")]
++    grouped = {obj.Name for body in bodies for obj in body.Group}
++    targets = [body.Tip.Name for body in bodies if body.Tip is not None]
++    targets += [obj.Name for obj in doc.Objects
++                if hasattr(obj, "Shape") and not obj.Shape.isNull() and obj.Shape.Solids
++                and obj.Name not in grouped and not obj.isDerivedFrom("PartDesign::Body")]
++    return targets
++
++
++def export(doc, path, objects=None, format=None):
++    """Write geometry to a file (step, iges, brep, stl, obj); returns the absolute path."""
++    if Part is None:
++        raise ValueError("Part is unavailable; cannot export geometry.")
++    if not path:
++        raise ValueError("Export needs a destination path.")
++    extension = (format or os.path.splitext(path)[1].lstrip(".")).lower()
++    if extension not in _EXPORT_FORMATS:
++        raise ValueError(f"Unsupported export format '{extension}'. Use step, iges, brep, stl, or obj.")
++    if objects is None:
++        targets = _default_export_objects(doc)
++    elif isinstance(objects, (str, dict)):
++        targets = [objects]
++    else:
++        targets = list(objects)
++    resolved = [resolve(doc, target) for target in targets]
++    if not resolved:
++        raise ValueError("Nothing to export.")
++    if _EXPORT_FORMATS[extension] == "Mesh":
++        import Mesh
++        Mesh.export(resolved, path)
++    else:
++        Part.export(resolved, path)
++    return {"path": os.path.abspath(path), "format": extension, "objects": [o.Name for o in resolved]}
++
++
++def compare(doc, reference, target, revision):
++    """Compare a target solid against a reference file, allowing translation and rotation only.
++
++    Uses rotation-invariant facts, so a scaled or grossly different part is caught by the
++    volume/area/size ratios. Full alignment and mirror detection are not implemented yet;
++    handedness is reported as not evaluated rather than guessed.
++    """
++    if Part is None:
++        raise ValueError("Part is unavailable; cannot compare geometry.")
++    if not reference or not os.path.exists(reference):
++        raise ValueError(f"Reference file not found: {reference}")
++    reference_shape = Part.read(reference)
++    if reference_shape.isNull():
++        raise ValueError("The reference file has no shape.")
++    target_shape = native_shape(doc, target, revision)
++    if target_shape.isNull():
++        raise ValueError("The target has no shape.")
++
++    def facts(shape):
++        box = shape.BoundBox
++        return {"volume_mm3": round(shape.Volume, 6), "area_mm2": round(shape.Area, 6),
++                "size_mm": sorted(round(value, 6) for value in (box.XLength, box.YLength, box.ZLength)),
++                "solids": len(shape.Solids)}
++
++    want, got = facts(reference_shape), facts(target_shape)
++    volume_ratio = got["volume_mm3"] / want["volume_mm3"] if want["volume_mm3"] else None
++    area_ratio = got["area_mm2"] / want["area_mm2"] if want["area_mm2"] else None
++    size_delta = [round(g - w, 6) for g, w in zip(got["size_mm"], want["size_mm"])]
++    linear_scale = round(volume_ratio ** (1.0 / 3.0), 6) if volume_ratio and volume_ratio > 0 else None
++    scale_matches = bool(volume_ratio and area_ratio
++                         and abs(volume_ratio - 1.0) <= 0.01 and abs(area_ratio - 1.0) <= 0.01)
++    span = max(1.0, sum(want["size_mm"]))
++    deviation = 0.0 if volume_ratio is None else abs(volume_ratio - 1.0) + sum(abs(d) for d in size_delta) / span
++    return {"reference": os.path.abspath(reference), "referenceFacts": want, "target": got,
++            "volumeRatio": round(volume_ratio, 6) if volume_ratio else None,
++            "areaRatio": round(area_ratio, 6) if area_ratio else None,
++            "linearScale": linear_scale, "sizeDelta_mm": size_delta, "scaleMatches": scale_matches,
++            "gScore": round(max(0.0, 1.0 - deviation), 3),
++            "handedness": "not evaluated: full alignment is not implemented",
++            "scope": "Translation/rotation-invariant facts only (volume, area, sorted bounding size)."}
 +
 +
 +def guide(topic=None):

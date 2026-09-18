@@ -35,6 +35,9 @@ transport problem. Always read the JSON even on `1`; it says why.
 If `anthracite` is not on PATH, run `just connect` in the Anthracite repository, or use the
 absolute path FreeCAD shows in its status bar.
 
+`App`, `FreeCAD`, `Gui`, `Part`, `Sketcher`, `doc` (the active document), and `cad` (the
+inspection helper) are prebound; import anything else you need.
+
 ## Prefer a file or a heredoc for anything long
 
 `exec` takes a program, so put multi-line work in a `.py` file or a heredoc rather than fighting
@@ -68,9 +71,21 @@ assuming the returned page is everything.
   literal dimensions; inspect the parameters you are about to change first.
 - History actions (`cad.undo`, `cad.redo`, `cad.checkpoint`, `cad.restore_checkpoint`) must be
   the only statement in a call, with literal arguments. They cannot be nested in a mutation.
+- When a native feature fails (Pad, Pocket, Hole, Pattern), fix that feature — its profile,
+  constraints, support, or parameters. Do not delete it and boolean around the failure.
 - Creating a document is allowed when none is open (`App.newDocument('Part')`), but that call
   has no transaction to roll back to. Prefer one call that creates the document, then a second
-  call that builds it, so the build is transactional.
+  call that builds it, so the build is transactional. Do not create or switch the active document
+  in the middle of an edit: a transaction cannot span documents, and the call is rejected.
+
+## Working from a drawing
+
+1. Read the drawing with your own image/PDF tools and list its dimensions and features.
+2. Inspect what already exists: `cad.tree()`, `cad.inspect()`, `cad.diagnostics()`.
+3. Build native parametric features: sketches + Pad/Pocket/Hole/Pattern, expressions for related
+   dimensions, datums for mating faces.
+4. Render (`cad.render_views`) and verify with explicit `cad.verify` claims and `cad.measure`
+   callouts, then check `cad.editability()`.
 
 ## Read the observation
 
@@ -102,6 +117,28 @@ cad.verify([
 ```
 
 Numeric metrics need a finite `tolerance`; booleans and strings do not.
+
+Judge the result on two axes, not one:
+
+- **G (geometry)** — does the solid match the intent? `cad.verify` claims, `cad.measure` numbers,
+  and `cad.compare('reference.step')` when a reference file exists.
+- **E (editability)** — is the tree still parametric? `cad.editability()` returns a score and
+  findings: opaque solids, booleans standing in for native operations, repeated features with no
+  pattern, literal dimensions with no expressions, pockets that should be holes, blocked sketches.
+
+A high G with a low E is a **failure** — fix the tree before calling the task done.
+
+Interface checks count as geometry too. `cad.measure(<face reference>)` returns `faceType`,
+`normal` for a plane, or `axis` / `axisPosition` / `radius_mm` for a cylinder; `cad.measure(a,
+other=b)` adds `distance_mm`, `angleDeg`, `parallel`, and `overlapVolume_mm3`. Feed them to
+`cad.verify` like any metric, for example
+`{'object': <face reference>, 'metric': 'radius_mm', 'expected': 5.0, 'tolerance': 1e-6}` — use it
+for datum planes, hole axes, and mating faces rather than only bounding boxes and volumes.
+
+When the user has a reference (a drawing or a STEP file), export and compare: `cad.export('part.step')`
+then `cad.compare('reference.step')`, which reports `volumeRatio`, `linearScale`, `scaleMatches`, and
+`gScore`. It allows translation and rotation only; a scaled part is caught by the ratios, and mirror
+detection is not implemented yet — say so rather than assuming.
 
 Metrics: `volume_mm3`, `area_mm2`, `size_mm`, `centerOfMass_mm`, `valid`, `solids`, `type`,
 `fullyConstrained`, `bodyTip`, `sketchDegreesOfFreedom`, `nativeFeatureHistory`; or `distance_mm`
