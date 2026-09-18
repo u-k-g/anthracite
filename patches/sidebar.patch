@@ -1652,7 +1652,7 @@
 +{
 +    if (bridgeConfigValue.isEmpty()) return;
 +    QApplication::clipboard()->setText(bridgeConfigValue);
-+    showToast(tr("MCP configuration copied"));
++    showToast(tr("CLI command copied"));
 +}
 +
 +void SidebarController::applyParameters(const QVariantMap& payload)
