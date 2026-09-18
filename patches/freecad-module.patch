@@ -162,7 +162,7 @@
  endif(BUILD_BIM)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Resources/AnthraciteDefaults.cfg
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1359 @@
 +<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
 +<FCParameters>
 +  <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
@@ -1495,6 +1495,7 @@
 +            <FCParamGroup Name="Custom_1">
 +              <FCText Name="Name">v</FCText>
 +              <FCBool Name="Active" Value="1" />
++              <FCText Name="Std_Measure">FreeCAD</FCText>
 +              <FCText Name="Std_ViewFitAll">FreeCAD</FCText>
 +              <FCText Name="Std_AlignToSelection">FreeCAD</FCText>
 +            </FCParamGroup>
