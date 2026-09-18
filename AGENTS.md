@@ -20,39 +20,39 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
 - Documents persist; Python locals do not. Internal object names and revision-bound topology
   references matter. Reject stale references and report ambiguity/remapping; never guess a new
   face or edge after an edit, undo, or document replacement.
-- Use existing Codex/OpenCode installations, preserving auth, configuration, models, skills, and
-  ordinary tools. One normalized provider adapter feeds one executor and UI. Do not build a new
-  general-purpose harness, add simultaneous project/worktree sessions, or add Claude Code yet.
-  One provider operates on the active FreeCAD document context at a time.
-- QML owns presentation and interaction. Chat is fixed to the right, resizable, showable/hideable,
-  and restorable; never floating. Native FreeCAD editing and the viewport remain first class.
-  Keep the thread lean: final answer under expandable timed work, model-bound images visible,
-  selectable text, inline CAD references, no redundant branding or Copy buttons.
-- Acknowledge inputs immediately (target ~100 ms); preserve focus, drafts, reading position, and
-  spatial continuity. Motion must be interruptible and respect reduced motion. Never imply CAD
-  success before validation. Show honest progress and actionable errors; tests alone do not prove
-  the UI feels smooth. Settings changed during a run apply to the next run.
+- Expose FreeCAD to external agents through one checked `freecad` tool over a local bridge; the
+  agent runs outside FreeCAD (existing Codex/OpenCode/Claude Code or any MCP client), preserving
+  its own auth, configuration, models, skills, and tools. Do not build an in-app agent host,
+  provider adapters, a general-purpose harness, or simultaneous project/worktree sessions. One
+  agent operates on the active FreeCAD document at a time.
+- QML owns presentation and interaction. The dock is a read-only activity history of tool
+  calls—code, observations, diagnostics, and returned images—never a chat surface; fixed to the
+  right, resizable, showable/hideable, and restorable, never floating. Native FreeCAD editing and
+  the viewport remain first class. Keep entries lean: expandable timed work, images visible,
+  selectable text, no redundant branding or Copy buttons.
+- Acknowledge inputs immediately (target ~100 ms); preserve focus, reading position, and spatial
+  continuity. Motion must be interruptible and respect reduced motion. Never imply CAD success
+  before validation. Show honest progress and actionable errors; tests alone do not prove the UI
+  feels smooth.
 - Use `#080808` backgrounds and `#A06666` accents with Qt palettes/native styling. Keep existing
   FreeCAD icons; new Anthracite controls use bundled Iconoir icons, not runtime downloads.
 
 ## Technology choices
 
-- Rust owns providers, protocols, processes, persistence, and conversation/run state, including
-  grouping and replay. Use it where self-contained and maintainable, not to wrap all FreeCAD APIs.
-  Python remains the model-facing CAD API. Keep C++/Qt bridges thin: registration, docking,
-  GUI-thread scheduling, and narrow native integration. Do not add bindings just to replace
-  working glue or build a parallel C++ application.
-- SQLite via `rusqlite`: bundled engine, cached statements, WAL, `synchronous=FULL`, one connection
-  owned by the Rust runtime off the GUI thread. No pool or database async runtime is needed.
-  Persist operation intent before authorizing execution. Database and FreeCAD commits are separate:
-  uncertain outcomes require inspection, never automatic replay or a success claim. A timeout does
+- Python owns the checked CAD executor, the in-app bridge, and the stdio MCP server. Keep C++/Qt
+  thin: module registration, docking, GUI-thread handoff, and narrow native integration. Prefer
+  Python and standard-library code; do not keep a second language or a parallel application for
+  something the executor and bridge already do.
+- The bridge serializes execution on the GUI thread inside FreeCAD transactions and appends each
+  operation to `operations.ndjson`, publishing its loopback address and token to `bridge.json`.
+  Uncertain outcomes require inspection, never automatic replay or a success claim. A timeout does
   not mean an edit failed or rolled back; do not retry while native execution may still be running.
 - Keep session identity outside `.FCStd` for upstream compatibility. Any future in-document
   metadata must use upstream-supported mechanisms and pass unmodified FreeCAD round-trip tests.
-- Mutable preferences, sessions, and identifiable/reloadable UI overrides live under XDG paths
-  (see README). Changing a dock or QML must not require a full rebuild. SQLite is authoritative;
-  the JSONL event projection is for inspection, not recovery.
-- Linux: Nix owns native dependencies and tooling. macOS: Nix supplies tools, Rust, and Pixi;
+- Mutable preferences, history, and reloadable UI overrides live under XDG paths (see README).
+  Changing a dock or QML must not require a full rebuild. `operations.ndjson` is for inspection
+  and the dock history, not recovery.
+- Linux: Nix owns native dependencies and tooling. macOS: Nix supplies tooling and Pixi;
   upstream's pinned `pixi.toml`/`pixi.lock` and CMake preset supply native dependencies. Use the
   locked environment, not host/Homebrew CAD libraries. Keep dependency provenance explicit.
 
@@ -97,25 +97,24 @@ just test
   base, repairing the series, updating `nix/package.nix`'s source hash, reviewing upstream locks,
   then building and testing.
 
-## Verification and Rust conventions
+## Verification and conventions
 
 - `just validate` applies the series to an isolated clean checkout; `validate-series` only checks
   names/files/order-list integrity. Neither replaces build or tests.
-- `just test` runs `tests/runtests.nu`: Rust via cargo-nextest, then isolated FreeCAD GUI,
-  executor, and provider-bridge tests without real model calls. Logs: `build/test-results/`.
-  Runtime/process tests belong in Rust; embedded FreeCAD assertions remain Python; Nushell owns
-  orchestration and workflow tests. Documentation-only edits need link/diff checks, not a rebuild.
+- `just test` runs `tests/runtests.nu`: isolated FreeCAD GUI, executor, and bridge tests without
+  real model calls. Logs: `build/test-results/`. Embedded FreeCAD assertions remain Python;
+  Nushell owns orchestration and workflow tests; the MCP server and bridge are exercised over
+  their real transports. Documentation-only edits need link/diff checks, not a rebuild.
 - Test follow-up parameter edits, native undo/redo, intervening user edits, stale references,
   reported topology remapping, and uncertain execution—not just final-solid validity. UI checks
   should cover focus, scroll stability, input acknowledgement, interruption, and reduced motion.
-- Prefer `cargo clippy` over `cargo check` for Rust checks; use cargo-nextest for tests.
-  Follow existing formatting and naming; use clear, proportionate identifiers without unnecessary
-  abbreviations or verbosity. Use `let ... else` when it clarifies early exits. Imports and macro
-  names should improve readability; avoid blanket style churn and speculative annotations.
-- Handle expected runtime failures with `Result`, not panics. Reserve `.expect()` for genuine
-  structural invariants and explain why failure is impossible. Never use it for fallible external
-  state such as I/O, channels, or user input. `.unwrap()` is fine in tests/fuzz harnesses, not
-  production. No mandatory keywords or mechanical string extraction rules for error messages.
+- Follow existing formatting and naming; use clear, proportionate identifiers without unnecessary
+  abbreviations or verbosity. Imports and names should improve readability; avoid blanket style
+  churn and speculative annotations.
+- Handle expected runtime failures with explicit error results, not panics or assertions. Reserve
+  assertions for genuine structural invariants and explain why failure is impossible; never use
+  them for fallible external state such as I/O, sockets, or user input. No mandatory keywords or
+  mechanical string extraction rules for error messages.
 
 ## References: what to learn
 

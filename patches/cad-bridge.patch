@@ -1,0 +1,846 @@
+--- /dev/null
++++ b/src/Mod/Anthracite/AnthraciteBridge.py
+@@ -0,0 +1,508 @@
++# SPDX-License-Identifier: LGPL-2.1-or-later
++"""Anthracite bridge: expose the checked FreeCAD executor to external agents.
++
++A background thread accepts loopback connections and reads line-delimited JSON
++commands. Execution is deferred to the FreeCAD GUI thread through a repeating QTimer
++drain so every document change and native transaction stays on the thread FreeCAD
++requires. The transaction, recompute, validation, and rollback semantics live in
++``AnthraciteExecutor``; this module only transports commands, serializes execution
++across clients, and records an inspectable operation log.
++
++Agents reach the bridge through ``anthracite-mcp`` (a stdio MCP server). Connection
++details are published to a discovery file; nothing here speaks MCP.
++"""
++
++from __future__ import annotations
++
++import collections
++import datetime
++import json
++import os
++import socket
++import socketserver
++import threading
++import time
++import uuid
++from typing import Any, Callable
++
++import FreeCAD as App
++
++import AnthraciteExecutor
++import AnthraciteInspect
++
++try:
++    import FreeCADGui as Gui  # noqa: F401
++except Exception:  # Console build: the bridge is not started without a GUI.
++    Gui = None
++
++try:
++    from PySide6 import QtCore, QtWidgets
++except Exception:  # pragma: no cover - FreeCAD's GUI always ships Qt.
++    QtCore = None
++    QtWidgets = None
++
++BRIDGE_VERSION = 1
++TIMER_INTERVAL_MS = 40
++IDLE_TIMEOUT_SECONDS = 1800
++MAX_REQUEST_BYTES = 8 * 1024 * 1024
++MAX_LOG_BYTES = 8 * 1024 * 1024
++MAX_LOG_LINES = 2000
++MAX_CODE_BYTES = 20000
++MAX_TEXT_BYTES = 8000
++
++
++def _state_directory() -> str:
++    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
++    return os.path.join(base, "anthracite")
++
++
++def discovery_path() -> str:
++    return os.path.join(_state_directory(), "bridge.json")
++
++
++def operations_path() -> str:
++    return os.path.join(_state_directory(), "operations.ndjson")
++
++
++def mcp_path() -> str:
++    """Absolute path to the stdio MCP server bundled beside this module."""
++    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "anthracite-mcp")
++
++
++def _utc_now() -> str:
++    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
++
++
++def _bounded(value: Any, limit: int) -> str:
++    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
++    if len(text) <= limit:
++        return text
++    return text[:limit] + f"\n… truncated {len(text) - limit} characters"
++
++
++def _write_private(path: str, data: str) -> None:
++    directory = os.path.dirname(path)
++    os.makedirs(directory, mode=0o700, exist_ok=True)
++    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
++        handle.write(data)
++
++
++class _Pending:
++    """One queued request awaiting execution on the GUI thread."""
++
++    def __init__(self, request_type: str, params: dict):
++        self.request_type = request_type
++        self.params = params
++        self.event = threading.Event()
++        self.result: dict | None = None
++        self.images: list[str] = []
++        self.message: str | None = None
++        self.stages: list[str] = []
++        self.document: str | None = None
++        self.document_token: str | None = None
++
++    def report_stage(self, stage: str) -> None:
++        self.stages.append(str(stage))
++
++    def finish(self, result: dict, images: list[str], document: str | None, token: str | None) -> None:
++        self.result = result
++        self.images = images
++        self.document = document
++        self.document_token = token
++        self.event.set()
++
++    def fail(self, message: str) -> None:
++        self.message = message
++        self.event.set()
++
++
++class _Server(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++class _Handler(socketserver.BaseRequestHandler):
++    def handle(self) -> None:
++        bridge: "_Bridge" = self.server.bridge  # type: ignore[attr-defined]
++        bridge.serve(self.request)
++
++
++class _Bridge:
++    def __init__(self) -> None:
++        self._server: _Server | None = None
++        self._thread: threading.Thread | None = None
++        self._timer = None
++        self._token = ""
++        self._host = "127.0.0.1"
++        self._port = 0
++        self._started_at: str | None = None
++        self._queue: collections.deque[_Pending] = collections.deque()
++        self._queue_lock = threading.Lock()
++        self._context = {"document": None, "documentToken": None, "revision": 0}
++        self._clients = 0
++        self._busy = False
++        self._blocked = False
++        self._ring: collections.deque = collections.deque(maxlen=200)
++        self._subscribers: list[Callable[[dict], None]] = []
++        self._log_lock = threading.Lock()
++
++    # -- lifecycle ---------------------------------------------------------
++
++    def start(self, host: str = "127.0.0.1", port: int = 0) -> dict:
++        if self._server is not None:
++            return self.status()
++        if Gui is None or QtWidgets is None:
++            raise RuntimeError("The Anthracite bridge requires the FreeCAD GUI.")
++        server = _Server((host, port), _Handler)
++        server.bridge = self  # type: ignore[attr-defined]
++        self._server = server
++        self._host, self._port = server.server_address[0], server.server_address[1]
++        self._token = uuid.uuid4().hex
++        self._started_at = _utc_now()
++        self._load_history()
++        self._thread = threading.Thread(target=server.serve_forever, name="anthracite-bridge", daemon=True)
++        self._thread.start()
++        self._publish_discovery()
++        application = QtWidgets.QApplication.instance()
++        if application is None:
++            raise RuntimeError("The Anthracite bridge requires a running Qt application.")
++        self._timer = QtCore.QTimer(application)
++        self._timer.setInterval(TIMER_INTERVAL_MS)
++        self._timer.timeout.connect(self._drain)
++        self._timer.start()
++        return self.status()
++
++    def stop(self) -> None:
++        if self._timer is not None:
++            self._timer.stop()
++            self._timer = None
++        if self._server is not None:
++            self._server.shutdown()
++            self._server.server_close()
++            self._server = None
++        self._thread = None
++        with self._queue_lock:
++            for item in self._queue:
++                item.fail("The Anthracite bridge stopped before this call ran.")
++            self._queue.clear()
++        try:
++            os.remove(discovery_path())
++        except OSError:
++            pass
++
++    def is_running(self) -> bool:
++        return self._server is not None
++
++    def status(self) -> dict:
++        return {
++            "running": self.is_running(),
++            "version": BRIDGE_VERSION,
++            "host": self._host,
++            "port": self._port,
++            "startedAt": self._started_at,
++            "document": self._context["document"],
++            "documentToken": self._context["documentToken"],
++            "revision": self._context["revision"],
++            "busy": self._busy,
++            "blocked": self._blocked,
++            "queued": len(self._queue),
++            "clients": self._clients,
++        }
++
++    # -- discovery ---------------------------------------------------------
++
++    def _publish_discovery(self) -> None:
++        payload = {
++            "version": BRIDGE_VERSION,
++            "host": self._host,
++            "port": self._port,
++            "token": self._token,
++            "pid": os.getpid(),
++            "startedAt": self._started_at,
++            "command": os.path.abspath(__file__),
++        }
++        _write_private(discovery_path(), json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
++
++    # -- connections -------------------------------------------------------
++
++    def serve(self, connection: socket.socket) -> None:
++        connection.settimeout(IDLE_TIMEOUT_SECONDS)
++        reader = connection.makefile("rb")
++        writer = connection.makefile("wb")
++        authenticated = False
++        try:
++            token = reader.readline(4096)
++            if token.strip().decode("utf-8", "replace") != self._token:
++                return
++            authenticated = True
++            self._clients += 1
++            while True:
++                raw = reader.readline(MAX_REQUEST_BYTES)
++                if not raw:
++                    break
++                if len(raw) >= MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
++                    self._write(writer, {"status": "error", "message": "Request exceeds the size limit."})
++                    break
++                try:
++                    request = json.loads(raw.decode("utf-8"))
++                except (ValueError, UnicodeDecodeError):
++                    self._write(writer, {"status": "error", "message": "Request is not valid JSON."})
++                    continue
++                self._write(writer, self._dispatch(request))
++        except (TimeoutError, OSError):
++            pass
++        finally:
++            if authenticated:
++                self._clients -= 1
++            for stream in (reader, writer):
++                try:
++                    stream.close()
++                except OSError:
++                    pass
++            try:
++                connection.close()
++            except OSError:
++                pass
++
++    @staticmethod
++    def _write(writer, response: dict) -> None:
++        try:
++            writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
++            writer.flush()
++        except OSError:
++            pass
++
++    def _dispatch(self, request: dict) -> dict:
++        request_id = request.get("id")
++        request_type = request.get("type")
++        params = request.get("params") or {}
++        if request_type in ("status", "ping"):
++            return {"id": request_id, "status": "ok", **self.status()}
++        if request_type != "execute":
++            return {"id": request_id, "status": "error", "message": f"Unknown command: {request_type!r}"}
++        if not isinstance(params.get("code"), str):
++            return {"id": request_id, "status": "error", "message": "The execute command needs string 'code'."}
++        if self._server is None:
++            return {"id": request_id, "status": "error", "message": "The Anthracite bridge is not running."}
++        pending = _Pending(request_type, params)
++        with self._queue_lock:
++            self._queue.append(pending)
++        pending.event.wait()
++        if pending.message is not None:
++            return {"id": request_id, "status": "error", "message": pending.message}
++        return {
++            "id": request_id,
++            "status": "ok",
++            "result": pending.result or {},
++            "images": pending.images,
++            "document": getattr(pending, "document", None),
++            "documentToken": getattr(pending, "document_token", None),
++        }
++
++    # -- GUI-thread execution ---------------------------------------------
++
++    def _interaction_blocked(self) -> bool:
++        application = QtWidgets.QApplication.instance()
++        if application is None:
++            return False
++        if application.activeModalWidget() is not None:
++            return True
++        return application.mouseButtons() != QtCore.Qt.MouseButton.NoButton
++
++    def _drain(self) -> None:
++        while True:
++            with self._queue_lock:
++                if not self._queue:
++                    self._blocked = False
++                    return
++                pending = self._queue[0]
++            if self._interaction_blocked():
++                self._blocked = True
++                return
++            with self._queue_lock:
++                self._queue.popleft()
++            self._run(pending)
++
++    def _run(self, pending: _Pending) -> None:
++        self._busy = True
++        self._blocked = False
++        started = time.monotonic()
++        operation_id = uuid.uuid4().hex[:12]
++        code = pending.params.get("code", "")
++        client = str(pending.params.get("client") or "agent")
++        result: dict = {}
++        images: list[str] = []
++        document_name: str | None = None
++        document_token: str | None = None
++        try:
++            document = App.ActiveDocument
++            document_name = document.Name if document is not None else None
++            if document is not None:
++                document_token = AnthraciteInspect.document_token(document)
++            expected_token = pending.params.get("documentToken")
++            if document is not None and expected_token and expected_token != document_token:
++                result = {
++                    "ok": False,
++                    "conflict": True,
++                    "notExecuted": True,
++                    "revision": self._context["revision"],
++                    "error": {
++                        "type": "DocumentChanged",
++                        "message": "The active FreeCAD document changed since the last observation; inspect before editing.",
++                    },
++                }
++            else:
++                revision = pending.params.get("revision")
++                expected_revision = int(revision) if isinstance(revision, int) else None
++                payload = json.loads(
++                    AnthraciteExecutor.execute_json(code, expected_revision, pending.report_stage)
++                )
++                images = [image for image in payload.pop("images", []) if isinstance(image, str)]
++                result = payload
++        except Exception as error:  # A bridge fault must never strand the caller.
++            result = {"ok": False, "notExecuted": True,
++                      "error": {"type": type(error).__name__, "message": str(error)}}
++        finally:
++            if App.ActiveDocument is not None:
++                document_name = App.ActiveDocument.Name
++                try:
++                    document_token = AnthraciteInspect.document_token(App.ActiveDocument)
++                except Exception:
++                    pass
++                self._context = {
++                    "document": document_name,
++                    "documentToken": document_token,
++                    "revision": result.get("revision", self._context["revision"]),
++                }
++            self._busy = False
++            pending.finish(result, images, document_name, document_token)
++            self._record(operation_id, client, code, result, images, started, pending.stages)
++
++    # -- operation log -----------------------------------------------------
++
++    def _record(self, operation_id, client, code, result, images, started, stages) -> None:
++        record = {
++            "id": operation_id,
++            "timestamp": _utc_now(),
++            "client": client,
++            "status": self._status_of(result),
++            "document": self._context["document"],
++            "revisionBefore": result.get("revisionBefore"),
++            "revisionAfter": result.get("revision"),
++            "label": (result.get("action") or {}).get("label") if isinstance(result.get("action"), dict) else None,
++            "durationMs": round((time.monotonic() - started) * 1000),
++            "stages": stages,
++            "code": _bounded(code, MAX_CODE_BYTES),
++            "stdout": _bounded(result.get("stdout", ""), MAX_TEXT_BYTES),
++            "stderr": _bounded(result.get("stderr", ""), MAX_TEXT_BYTES),
++            "error": result.get("error"),
++            "conflict": bool(result.get("conflict")),
++            "requiresInspection": bool(result.get("requiresInspection")),
++            "imageCount": len(images),
++        }
++        with self._log_lock:
++            self._ring.append(record)
++            self._append_log(record)
++        # Images travel only with the live event: the persisted record keeps just a
++        # count so the operation log never carries base64 payloads.
++        self._notify({"kind": "operation", "operation": record, "images": images})
++
++    @staticmethod
++    def _status_of(result: dict) -> str:
++        if result.get("readOnly"):
++            return "readOnly"
++        if result.get("ok"):
++            return "committed" if result.get("action") else "unchanged"
++        if result.get("conflict") or result.get("notExecuted"):
++            return "rejected"
++        if result.get("requiresInspection"):
++            return "unknown"
++        if result.get("rolledBack"):
++            return "rolled_back"
++        return "failed"
++
++    def _append_log(self, record: dict) -> None:
++        path = operations_path()
++        try:
++            directory = os.path.dirname(path)
++            os.makedirs(directory, mode=0o700, exist_ok=True)
++            if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
++                self._rotate_log(path)
++            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
++            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
++                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
++        except OSError:
++            pass
++
++    @staticmethod
++    def _rotate_log(path: str) -> None:
++        try:
++            with open(path, "r", encoding="utf-8", errors="replace") as handle:
++                lines = handle.readlines()[-MAX_LOG_LINES:]
++            temporary = f"{path}.tmp"
++            with open(temporary, "w", encoding="utf-8") as handle:
++                handle.writelines(lines)
++            os.replace(temporary, path)
++        except OSError:
++            pass
++
++    def _load_history(self) -> None:
++        try:
++            with open(operations_path(), "r", encoding="utf-8", errors="replace") as handle:
++                for line in handle.readlines()[-200:]:
++                    try:
++                        self._ring.append(json.loads(line))
++                    except ValueError:
++                        continue
++        except OSError:
++            pass
++
++    # -- observers ---------------------------------------------------------
++
++    def recent(self, limit: int = 50) -> list[dict]:
++        return list(self._ring)[-limit:]
++
++    def subscribe(self, callback: Callable[[dict], None]) -> None:
++        if callback not in self._subscribers:
++            self._subscribers.append(callback)
++
++    def unsubscribe(self, callback: Callable[[dict], None]) -> None:
++        if callback in self._subscribers:
++            self._subscribers.remove(callback)
++
++    def _notify(self, event: dict) -> None:
++        for callback in list(self._subscribers):
++            try:
++                callback(event)
++            except Exception:
++                pass
++
++
++_bridge = _Bridge()
++
++
++def start(host: str = "127.0.0.1", port: int = 0) -> dict:
++    """Start the bridge server and GUI-thread drain; safe to call repeatedly."""
++
++    return _bridge.start(host, port)
++
++
++def stop() -> None:
++    _bridge.stop()
++
++
++def status() -> dict:
++    return _bridge.status()
++
++
++def recent(limit: int = 50) -> list[dict]:
++    return _bridge.recent(limit)
++
++
++def subscribe(callback: Callable[[dict], None]) -> None:
++    _bridge.subscribe(callback)
++
++
++def unsubscribe(callback: Callable[[dict], None]) -> None:
++    _bridge.unsubscribe(callback)
+--- /dev/null
++++ b/src/Mod/Anthracite/anthracite-mcp
+@@ -0,0 +1,332 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: LGPL-2.1-or-later
++"""Stdio MCP server for the Anthracite FreeCAD bridge.
++
++Exposes one tool, ``freecad``, that runs ordinary FreeCAD Python inside a running
++FreeCAD GUI through the Anthracite bridge. This process is spawned by an MCP client
++and speaks the Model Context Protocol on stdin/stdout; it only forwards one command
++per call over a loopback socket to the FreeCAD process.
++
++The bridge must already be running. Connection details are read from the discovery
++file written by Anthracite ($XDG_STATE_HOME/anthracite/bridge.json by default), which
++can be overridden with ANTHRACITE_BRIDGE, --bridge, or ANTHRACITE_HOST/PORT/TOKEN.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import socket
++import sys
++import threading
++import time
++from pathlib import Path
++
++SERVER_NAME = "anthracite"
++SERVER_VERSION = "0.1.0"
++DEFAULT_PROTOCOL_VERSION = "2024-11-05"
++
++TOOL = {
++    "name": "freecad",
++    "description": (
++        "Run a complete FreeCAD Python program inside the running FreeCAD GUI through "
++        "Anthracite. App, FreeCAD, Gui, doc (the active document), and cad (an inspection "
++        "helper) are prebound. The whole program runs as one native transaction that "
++        "recomputes and validates before committing, or rolls back on failure, and returns "
++        "a structured observation. Discover APIs with cad.guide() and cad.api(); inspect "
++        "before editing; never guess face or edge indices after an edit."
++    ),
++    "inputSchema": {
++        "type": "object",
++        "properties": {
++            "code": {
++                "type": "string",
++                "description": "Complete ordinary FreeCAD Python source.",
++            }
++        },
++        "required": ["code"],
++        "additionalProperties": False,
++    },
++}
++
++INSTRUCTIONS = (
++    "Anthracite drives a running FreeCAD GUI through one checked tool. Send ordinary "
++    "FreeCAD Python; it runs as a single native transaction that recomputes, validates, "
++    "and then commits or rolls back. Inspect before editing with cad.tree(), "
++    "cad.inspect(), cad.diagnostics(), and cad.guide(). Read the observation: ok, revision, "
++    "editReceipt, verification, diagnostics, images, and nextActions. A successful recompute "
++    "is not proof of design correctness; schedule checks with cad.verify([...]) and report "
++    "only what you checked. Topology references expire whenever the revision changes, so "
++    "never reuse a guessed face or edge index after an edit. If a call's outcome is unknown, "
++    "inspect before retrying."
++)
++
++
++def state_directory() -> Path:
++    override = os.environ.get("XDG_STATE_HOME")
++    if override:
++        return Path(override) / "anthracite"
++    return Path.home() / ".local" / "state" / "anthracite"
++
++
++def default_discovery_path() -> Path:
++    return state_directory() / "bridge.json"
++
++
++class BridgeError(RuntimeError):
++    """Raised for connection and transport failures against the bridge."""
++
++
++class Bridge:
++    """Line-delimited JSON client to the Anthracite bridge, connected lazily."""
++
++    def __init__(self, host: str, port: int, token: str):
++        self._host = host
++        self._port = port
++        self._token = token
++        self._socket: socket.socket | None = None
++        self._reader = None
++        self._writer = None
++        self._lock = threading.Lock()
++        self._request_id = 0
++
++    def _connect(self) -> None:
++        try:
++            connection = socket.create_connection((self._host, self._port), timeout=30.0)
++        except OSError as error:
++            raise BridgeError(
++                "Anthracite bridge is not running. Open FreeCAD with Anthracite, "
++                f"then retry. ({error})"
++            ) from error
++        # CAD operations can legitimately run longer than the connect timeout; the
++        # session must block until the bridge answers rather than time out mid-call.
++        connection.settimeout(None)
++        connection.sendall(f"{self._token}\n".encode("utf-8"))
++        self._socket = connection
++        self._reader = connection.makefile("rb")
++        self._writer = connection.makefile("wb")
++
++    def close(self) -> None:
++        for stream in (self._reader, self._writer):
++            try:
++                stream is not None and stream.close()
++            except OSError:
++                pass
++        if self._socket is not None:
++            try:
++                self._socket.close()
++            except OSError:
++                pass
++        self._socket = None
++        self._reader = None
++        self._writer = None
++
++    def send(self, request_type: str, params: dict | None = None) -> dict:
++        with self._lock:
++            if self._socket is None:
++                self._connect()
++            self._request_id += 1
++            request = {"id": self._request_id, "type": request_type, "params": params or {}}
++            try:
++                assert self._writer is not None and self._reader is not None
++                self._writer.write(
++                    (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
++                )
++                self._writer.flush()
++                line = self._reader.readline()
++            except OSError as error:
++                self.close()
++                raise BridgeError(
++                    f"Lost the connection to the Anthracite bridge: {error}"
++                ) from error
++            if not line:
++                self.close()
++                raise BridgeError(
++                    "The Anthracite bridge closed the connection. Is FreeCAD still running?"
++                )
++            try:
++                response = json.loads(line.decode("utf-8"))
++            except (ValueError, UnicodeDecodeError) as error:
++                self.close()
++                raise BridgeError(f"The Anthracite bridge returned invalid data: {error}") from error
++            if response.get("status") != "ok":
++                raise BridgeError(response.get("message") or "The Anthracite bridge rejected the call.")
++            return response
++
++
++def resolve_connection(args) -> tuple[str, int, str]:
++    path = Path(args.bridge).expanduser() if args.bridge else default_discovery_path()
++    host = args.host
++    port = args.port
++    token = args.token
++    if host is None or port is None or token is None:
++        try:
++            discovery = json.loads(path.read_text(encoding="utf-8"))
++        except FileNotFoundError:
++            raise BridgeError(
++                f"No Anthracite bridge discovery file at {path}. Open FreeCAD with Anthracite running."
++            )
++        except (OSError, ValueError) as error:
++            raise BridgeError(f"Could not read the Anthracite bridge discovery file {path}: {error}")
++        host = host or discovery.get("host")
++        port = port if port is not None else discovery.get("port")
++        token = token or discovery.get("token")
++    if not host or not port or not token:
++        raise BridgeError(f"The Anthracite bridge discovery file {path} is incomplete.")
++    return host, int(port), token
++
++
++def image_content(data_url: str) -> dict | None:
++    if not isinstance(data_url, str) or not data_url.startswith("data:"):
++        return None
++    header, _, encoded = data_url.partition(",")
++    if not encoded:
++        return None
++    mime = header[len("data:") :].split(";", 1)[0] or "image/png"
++    if ";base64" not in header:
++        return None
++    return {"type": "image", "data": encoded, "mimeType": mime}
++
++
++def call_tool(bridge: Bridge, client: str, arguments: dict) -> dict:
++    code = arguments.get("code")
++    if not isinstance(code, str) or not code.strip():
++        return {
++            "content": [{"type": "text", "text": "The freecad tool needs a non-empty 'code' string."}],
++            "isError": True,
++        }
++    try:
++        response = bridge.send("execute", {"code": code, "client": client})
++    except BridgeError as error:
++        return {"content": [{"type": "text", "text": str(error)}], "isError": True}
++    result = response.get("result", {})
++    content: list[dict] = [
++        {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}
++    ]
++    for data_url in response.get("images", []):
++        image = image_content(data_url)
++        if image is not None:
++            content.append(image)
++    return {"content": content, "isError": False}
++
++
++def error_response(request_id, code: int, message: str) -> dict:
++    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
++
++
++def handle_message(message: dict, bridge: Bridge, client: str) -> dict | None:
++    method = message.get("method")
++    request_id = message.get("id")
++    is_notification = "id" not in message or request_id is None
++
++    if method == "initialize":
++        requested = message.get("params", {}).get("protocolVersion")
++        return {
++            "jsonrpc": "2.0",
++            "id": request_id,
++            "result": {
++                "protocolVersion": requested if isinstance(requested, str) else DEFAULT_PROTOCOL_VERSION,
++                "capabilities": {"tools": {}},
++                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
++                "instructions": INSTRUCTIONS,
++            },
++        }
++    if method in ("notifications/initialized", "initialized"):
++        return None
++    if method == "ping":
++        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
++    if method == "tools/list":
++        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": [TOOL]}}
++    if method == "tools/call":
++        params = message.get("params", {})
++        if params.get("name") != TOOL["name"]:
++            if is_notification:
++                return None
++            return error_response(request_id, -32602, f"Unknown tool: {params.get('name')!r}")
++        result = call_tool(bridge, client, params.get("arguments") or {})
++        return {"jsonrpc": "2.0", "id": request_id, "result": result}
++    if is_notification:
++        return None
++    return error_response(request_id, -32601, f"Method not found: {method}")
++
++
++def write_message(message: dict) -> None:
++    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
++    sys.stdout.flush()
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(add_help=False)
++    parser.add_argument("--bridge", default=None)
++    parser.add_argument("--host", default=None)
++    parser.add_argument("--port", type=int, default=None)
++    parser.add_argument("--token", default=None)
++    parser.add_argument("--client", default=os.environ.get("ANTHRACITE_CLIENT", "agent"))
++    args, unknown = parser.parse_known_args(argv)
++    if unknown:
++        print(f"anthracite-mcp: ignoring unrecognized arguments: {unknown}", file=sys.stderr)
++
++    try:
++        host, port, token = resolve_connection(args)
++    except BridgeError as error:
++        print(f"anthracite-mcp: {error}", file=sys.stderr)
++        # Serve an explicit error on the MCP stream so the client can surface it.
++        for line in sys.stdin:
++            try:
++                message = json.loads(line)
++            except ValueError:
++                continue
++            if message.get("method") == "initialize":
++                write_message(
++                    {
++                        "jsonrpc": "2.0",
++                        "id": message.get("id"),
++                        "result": {
++                            "protocolVersion": DEFAULT_PROTOCOL_VERSION,
++                            "capabilities": {"tools": {}},
++                            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
++                            "instructions": str(error),
++                        },
++                    }
++                )
++            elif message.get("method") == "tools/list":
++                write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": {"tools": [TOOL]}})
++            elif message.get("method") == "tools/call" and "id" in message:
++                write_message(
++                    {
++                        "jsonrpc": "2.0",
++                        "id": message.get("id"),
++                        "result": {
++                            "content": [{"type": "text", "text": str(error)}],
++                            "isError": True,
++                        },
++                    }
++                )
++            elif message.get("method") == "ping":
++                write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": {}})
++        return 1
++
++    bridge = Bridge(host, port, token)
++    try:
++        for line in sys.stdin:
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                message = json.loads(line)
++            except ValueError:
++                write_message(error_response(None, -32700, "Parse error"))
++                continue
++            response = handle_message(message, bridge, args.client)
++            if response is not None:
++                write_message(response)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        bridge.close()
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 """FreeCAD-embedded assertions, launched by tests/runtests.nu."""
 import os
-from pathlib import Path
 import traceback
 import unittest
 
@@ -20,11 +19,6 @@ try:
     App.ParamGet("User parameter:BaseApp/Preferences/NotificationArea").SetBool(
         "NotificationAreaEnabled", False)
     QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-
-    # The GUI-only checks must not start the user's real agent installation.
-    preferences = App.ParamGet("User parameter:BaseApp/Preferences/Mod/Anthracite")
-    preferences.SetString("CodexBinary", str(Path(os.environ["XDG_STATE_HOME"]) / "disabled-provider"))
-    preferences.SetString("OpenCodeBinary", str(Path(os.environ["XDG_STATE_HOME"]) / "disabled-provider"))
 
     for workbench in ("PartDesignWorkbench", "PartWorkbench", "SketcherWorkbench"):
         if workbench not in Gui.listWorkbenches():

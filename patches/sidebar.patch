@@ -1,1122 +1,12 @@
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/AgentBridge.cpp
-@@ -0,0 +1,993 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#include "AgentBridge.h"
-+
-+#include "Sidebar.h"
-+
-+#include <Python.h>
-+
-+#include <QApplication>
-+#include <QElapsedTimer>
-+#include <QDir>
-+#include <QFileDialog>
-+#include <QFileInfo>
-+#include <QJsonDocument>
-+#include <QJsonArray>
-+#include <QJsonObject>
-+#include <QProcessEnvironment>
-+#include <QStandardPaths>
-+#include <QThread>
-+#include <QPointer>
-+#include <QScopedValueRollback>
-+#include <QUuid>
-+#include <functional>
-+
-+#include <App/Application.h>
-+#include <App/Document.h>
-+#include <Base/Console.h>
-+#include <Gui/Selection/Selection.h>
-+
-+
-+using namespace AnthraciteGui;
-+
-+namespace
-+{
-+constexpr auto preferencePath = "User parameter:BaseApp/Preferences/Mod/Anthracite";
-+
-+using ProgressCallback = std::function<void(const QString&)>;
-+PyObject* reportExecutionStage(PyObject* self, PyObject* stage)
-+{
-+    const char* text = PyUnicode_AsUTF8(stage);
-+    if (!text) return nullptr;
-+    auto* callback = static_cast<ProgressCallback*>(PyCapsule_GetPointer(self, "anthracite.progress"));
-+    if (!callback) return nullptr;
-+    (*callback)(QString::fromUtf8(text));
-+    Py_RETURN_NONE;
-+}
-+PyMethodDef progressMethod = {"report_stage", reportExecutionStage, METH_O, nullptr};
-+
-+QString pythonError()
-+{
-+    if (!PyErr_Occurred()) {
-+        return QStringLiteral("Unknown embedded Python error.");
-+    }
-+
-+    PyObject* type = nullptr;
-+    PyObject* value = nullptr;
-+    PyObject* traceback = nullptr;
-+    PyErr_Fetch(&type, &value, &traceback);
-+    PyErr_NormalizeException(&type, &value, &traceback);
-+
-+    QString result = QStringLiteral("Embedded Python error.");
-+    if (value) {
-+        PyObject* text = PyObject_Str(value);
-+        if (text) {
-+            result = QString::fromUtf8(PyUnicode_AsUTF8(text));
-+            Py_DECREF(text);
-+        }
-+    }
-+
-+    Py_XDECREF(type);
-+    Py_XDECREF(value);
-+    Py_XDECREF(traceback);
-+    return result;
-+}
-+}  // namespace
-+
-+AgentBridge::AgentBridge(SidebarController* controller, QObject* parent)
-+    : QObject(parent)
-+    , sidebar(controller)
-+{
-+    connect(sidebar, &SidebarController::promptSubmitted, this, &AgentBridge::submit, Qt::QueuedConnection);
-+    connect(qobject_cast<ConversationModel*>(sidebar->messages()), &ConversationModel::earlierRequested,
-+            this, [this](const QString& before) {
-+                send(QStringLiteral("timeline.earlier"), {{"before", before}});
-+            });
-+    connect(qobject_cast<ConversationModel*>(sidebar->messages()), &ConversationModel::detailsRequested,
-+            this, [this](const QString& id, int offset) {
-+                send(QStringLiteral("timeline.details"), {{"id", id}, {"offset", offset}});
-+            });
-+    connect(sidebar, &SidebarController::stopRequested, this, &AgentBridge::stop);
-+    connect(sidebar, &SidebarController::chooseProviderRequested, this, &AgentBridge::chooseProvider);
-+    connect(sidebar, &SidebarController::providerSelected, this, &AgentBridge::selectProvider);
-+    connect(sidebar, &SidebarController::busyChanged, this, [this]() {
-+        if (sidebar->busy() || pendingProvider.isEmpty()) return;
-+        QTimer::singleShot(0, this, [this]() {
-+            if (!pendingProvider.isEmpty() && !sidebar->busy() && !executingTool) {
-+                const QString provider = pendingProvider;
-+                selectProvider(provider);
-+            }
-+        });
-+    });
-+    connect(sidebar, &SidebarController::newThreadRequested, this, &AgentBridge::newThread);
-+    connect(sidebar, &SidebarController::threadSelected, this, &AgentBridge::selectThread);
-+    connect(sidebar, &SidebarController::draftEdited, this, &AgentBridge::draftEdited);
-+    connect(sidebar, &SidebarController::modelSelectionEdited, this, &AgentBridge::modelSelectionEdited);
-+    connect(sidebar, &SidebarController::approvalResponded, this, &AgentBridge::respondToApproval);
-+    connect(sidebar, &SidebarController::userInputResponded, this, &AgentBridge::respondToUserInput);
-+    connect(&runtime, &QProcess::started, this, &AgentBridge::processStarted);
-+    connect(&runtime, &QProcess::readyReadStandardOutput, this, &AgentBridge::readStandardOutput);
-+    connect(&runtime, &QProcess::readyReadStandardError, this, &AgentBridge::readStandardError);
-+    connect(&runtime, &QProcess::errorOccurred, this, &AgentBridge::processError);
-+    connect(
-+        &runtime,
-+        qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-+        this,
-+        &AgentBridge::processFinished
-+    );
-+    draftTimer.setSingleShot(true);
-+    draftTimer.setInterval(250);
-+    connect(&draftTimer, &QTimer::timeout, this, &AgentBridge::persistDraft);
-+
-+    activeDocumentConnection = App::GetApplication().signalActiveDocument.connect(
-+        [this](const App::Document&) { scheduleDocumentSync(); }
-+    );
-+    savedDocumentConnection = App::GetApplication().signalSaveDocument.connect(
-+        [this](const App::Document&) { scheduleDocumentSync(); }
-+    );
-+    deletedDocumentConnection = App::GetApplication().signalDeleteDocument.connect(
-+        [this](const App::Document& document) { documentDeleted(document); }
-+    );
-+
-+    sidebar->restoreProvider(providerKind());
-+    selectionConnection = Gui::Selection().signalSelectionChanged2.connect(
-+        [this](const Gui::SelectionChanges& selection) {
-+            if (!sidebar->picking() || selection.Type != Gui::SelectionChanges::AddSelection) return;
-+            const auto gil = PyGILState_Ensure();
-+            PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
-+            PyObject* result = module ? PyObject_CallMethod(module, "picked_reference_json", "sssddd",
-+                selection.pDocName, selection.pObjectName, selection.pSubName,
-+                double(selection.x), double(selection.y), double(selection.z)) : nullptr;
-+            const char* encoded = result ? PyUnicode_AsUTF8(result) : nullptr;
-+            const auto attachment = encoded ? QJsonDocument::fromJson(encoded).object() : QJsonObject();
-+            const QString error = encoded ? QString() : pythonError();
-+            Py_XDECREF(result);
-+            Py_XDECREF(module);
-+            PyGILState_Release(gil);
-+            sidebar->setPicking(false);
-+            if (!error.isEmpty()) sidebar->appendActivity(error + tr(" Pick a direct face, edge, vertex or object; nested references are not guessed."));
-+            else sidebar->addAttachment(attachment.toVariantMap());
-+        });
-+    QTimer::singleShot(0, this, [this]() {
-+        if (!providerPath().isEmpty() && QFileInfo::exists(runtimePath())) {
-+            ensureRuntime();
-+        }
-+    });
-+}
-+
-+AgentBridge::~AgentBridge()
-+{
-+    sidebar->setPicking(false);
-+    draftTimer.stop();
-+    if (runtime.state() == QProcess::NotRunning) {
-+        return;
-+    }
-+
-+    send(QStringLiteral("session.shutdown"));
-+    runtime.closeWriteChannel();
-+    if (!runtime.waitForFinished(1500)) {
-+        runtime.terminate();
-+        if (!runtime.waitForFinished(1000)) {
-+            runtime.kill();
-+            runtime.waitForFinished(1000);
-+        }
-+    }
-+}
-+
-+void AgentBridge::submit(const QString& prompt)
-+{
-+    queuedAttachments = QJsonArray::fromVariantList(sidebar->attachments());
-+    const auto gil = PyGILState_Ensure();
-+    PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
-+    const auto encoded = QJsonDocument(queuedAttachments).toJson(QJsonDocument::Compact);
-+    PyObject* checked = module ? PyObject_CallMethod(module, "validate_picks_json", "s", encoded.constData()) : nullptr;
-+    const QString error = checked ? QString() : pythonError();
-+    Py_XDECREF(checked);
-+    Py_XDECREF(module);
-+    PyGILState_Release(gil);
-+    if (!error.isEmpty()) {
-+        queuedPrompt.clear();
-+        queuedAttachments = {};
-+        awaitingSubmission = false;
-+        sidebar->failTurn(error + tr(" Remove the stale reference and pick again."));
-+        return;
-+    }
-+    queuedPrompt = prompt;
-+    stopping = false;
-+
-+    if (runtimeReady) {
-+        QJsonObject payload {{"prompt", queuedPrompt}, {"attachments", queuedAttachments}};
-+        if (!selectedModel.isEmpty()) {
-+            payload.insert(QStringLiteral("model"), selectedModel);
-+        }
-+        if (!selectedEffort.isEmpty()) {
-+            payload.insert(QStringLiteral("effort"), selectedEffort);
-+        }
-+        send(QStringLiteral("turn.start"), payload);
-+        awaitingSubmission = true;
-+        queuedPrompt.clear();
-+        return;
-+    }
-+
-+    ensureRuntime();
-+}
-+
-+void AgentBridge::stop()
-+{
-+    stopping = true;
-+    if (!awaitingSubmission && (!queuedPrompt.isEmpty() || !queuedAttachments.isEmpty())) {
-+        queuedPrompt.clear();
-+        queuedAttachments = {};
-+        sidebar->completeTurn();
-+        return;
-+    }
-+    send(QStringLiteral("turn.interrupt"));
-+}
-+
-+void AgentBridge::chooseProvider()
-+{
-+    const QString provider = providerKind();
-+    const QString displayName =
-+        provider == QLatin1String("opencode") ? QStringLiteral("OpenCode") : QStringLiteral("Codex");
-+    const QString selected = QFileDialog::getOpenFileName(
-+        QApplication::activeWindow(),
-+        tr("Choose the %1 executable").arg(displayName),
-+        providerPath()
-+    );
-+    if (selected.isEmpty()) {
-+        return;
-+    }
-+
-+    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
-+    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
-+    preferences->SetASCII(key, selected.toUtf8().constData());
-+    sidebar->appendActivity(tr("%1 executable set to %2").arg(displayName, selected));
-+
-+    if (runtime.state() != QProcess::NotRunning) {
-+        stopping = true;
-+        runtime.kill();
-+        runtime.waitForFinished(1000);
-+        stopping = false;
-+    }
-+    runtimeReady = false;
-+    ensureRuntime();
-+}
-+
-+void AgentBridge::selectProvider(const QString& provider)
-+{
-+    if (sidebar->busy()) {
-+        if (pendingProvider.isEmpty()) {
-+            runningProviderModels = sidebar->models();
-+            runningProviderModel = selectedModel;
-+            runningProviderEffort = selectedEffort;
-+        }
-+        if (provider == providerKind()) {
-+            pendingProvider.clear();
-+            sidebar->updateModelCatalog(runningProviderModels);
-+            sidebar->restoreModelSelection(runningProviderModel, runningProviderEffort);
-+        }
-+        else {
-+            pendingProvider = provider;
-+            // Never offer the running provider's models for a different harness.
-+            // Its catalog is loaded when the deferred connection starts.
-+            sidebar->updateModelCatalog({});
-+            sidebar->restoreModelSelection(QString(), QString());
-+        }
-+        return;
-+    }
-+    pendingProvider.clear();
-+    auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
-+    preferences->SetASCII("Provider", provider.toUtf8().constData());
-+    selectedLocalThreadId.clear();
-+    createNewThread = false;
-+    sidebar->appendActivity(
-+        tr("Using %1").arg(
-+            provider == QLatin1String("opencode") ? QStringLiteral("OpenCode")
-+                                                   : QStringLiteral("Codex")
-+        )
-+    );
-+    performSessionRestart(QString(), false);
-+}
-+
-+void AgentBridge::newThread()
-+{
-+    restartSession(QString(), true);
-+}
-+
-+void AgentBridge::selectThread(const QString& threadId)
-+{
-+    restartSession(threadId, false);
-+}
-+
-+void AgentBridge::draftEdited(const QString& body)
-+{
-+    pendingDraft = body;
-+    draftDirty = true;
-+    draftTimer.start();
-+}
-+
-+void AgentBridge::modelSelectionEdited(const QString& model, const QString& effort)
-+{
-+    if (!pendingProvider.isEmpty()) return;
-+    selectedModel = model;
-+    selectedEffort = effort;
-+    send(QStringLiteral("model.selection.save"), {{"model", selectedModel}, {"effort", selectedEffort}});
-+}
-+
-+void AgentBridge::persistDraft()
-+{
-+    persistDraftNow();
-+}
-+
-+void AgentBridge::respondToApproval(const QString& requestId, const QString& decision)
-+{
-+    send(QStringLiteral("request.resolve"), {{"requestId", requestId}, {"decision", decision}});
-+}
-+
-+void AgentBridge::respondToUserInput(const QString& requestId, const QVariantMap& answers)
-+{
-+    send(
-+        QStringLiteral("user_input.resolve"),
-+        {
-+            {"requestId", requestId},
-+            {"answers", QJsonObject::fromVariantMap(answers)},
-+        }
-+    );
-+}
-+
-+void AgentBridge::processStarted()
-+{
-+    sidebar->updateStatus(tr("Connecting"));
-+    runtimeDocumentIdentity = documentIdentity();
-+    QJsonObject session {
-+        {
-+            "provider",
-+            QJsonObject {
-+                {"kind", providerKind()},
-+                {"binary", providerPath()},
-+            },
-+        },
-+        {"cwd", workingDirectory()},
-+        {"storagePath", databasePath()},
-+        {"document", documentContext()},
-+        {"createThread", createNewThread},
-+    };
-+    if (!selectedLocalThreadId.isEmpty()) {
-+        session.insert(QStringLiteral("localThreadId"), selectedLocalThreadId);
-+    }
-+    send(QStringLiteral("session.start"), session);
-+    createNewThread = false;
-+}
-+
-+void AgentBridge::readStandardOutput()
-+{
-+    standardOutputBuffer += runtime.readAllStandardOutput();
-+    QElapsedTimer budget;
-+    budget.start();
-+    while (true) {
-+        if (budget.elapsed() >= 8) {
-+            QTimer::singleShot(0, this, &AgentBridge::readStandardOutput);
-+            return;
-+        }
-+        const qsizetype newline = standardOutputBuffer.indexOf('\n');
-+        if (newline < 0) {
-+            break;
-+        }
-+
-+        const QByteArray line = standardOutputBuffer.left(newline).trimmed();
-+        standardOutputBuffer.remove(0, newline + 1);
-+        if (line.isEmpty()) {
-+            continue;
-+        }
-+
-+        QJsonParseError error;
-+        const auto document = QJsonDocument::fromJson(line, &error);
-+        if (error.error != QJsonParseError::NoError || !document.isObject()) {
-+            Base::Console().warning("Anthracite runtime returned invalid JSON: %s\n", line.constData());
-+            continue;
-+        }
-+        handleMessage(document.object());
-+    }
-+}
-+
-+void AgentBridge::readStandardError()
-+{
-+    const QString text = QString::fromUtf8(runtime.readAllStandardError()).trimmed();
-+    if (!text.isEmpty()) {
-+        Base::Console().warning("Anthracite runtime: %s\n", text.toUtf8().constData());
-+    }
-+}
-+
-+void AgentBridge::processError(QProcess::ProcessError error)
-+{
-+    Q_UNUSED(error);
-+    if (!stopping) {
-+        fail(tr("Agent runtime failed: %1").arg(runtime.errorString()));
-+    }
-+}
-+
-+void AgentBridge::processFinished(int exitCode, QProcess::ExitStatus exitStatus)
-+{
-+    runtimeReady = false;
-+    if (!stopping && sidebar->busy()) {
-+        const QString reason = exitStatus == QProcess::CrashExit
-+            ? tr("Agent runtime crashed.")
-+            : tr("Agent runtime exited with code %1.").arg(exitCode);
-+        fail(reason);
-+    }
-+}
-+
-+void AgentBridge::ensureRuntime()
-+{
-+    if (runtime.state() != QProcess::NotRunning) {
-+        return;
-+    }
-+
-+    const QString provider = providerPath();
-+    if (provider.isEmpty() || !QFileInfo::exists(provider)) {
-+        const QString displayName = providerKind() == QLatin1String("opencode")
-+            ? QStringLiteral("OpenCode")
-+            : QStringLiteral("Codex");
-+        fail(
-+            tr("%1 was not found. Use Configure… to select your existing executable.")
-+                .arg(displayName)
-+        );
-+        return;
-+    }
-+
-+    const QString executable = runtimePath();
-+    if (!QFileInfo::exists(executable)) {
-+        fail(tr("Anthracite runtime was not found at %1").arg(executable));
-+        return;
-+    }
-+
-+    sidebar->appendActivity(
-+        tr("Starting %1").arg(
-+            providerKind() == QLatin1String("opencode") ? QStringLiteral("OpenCode")
-+                                                        : QStringLiteral("Codex")
-+        )
-+    );
-+    runtime.setProgram(executable);
-+    runtime.setWorkingDirectory(workingDirectory());
-+    runtime.start();
-+}
-+
-+void AgentBridge::restartSession(const QString& threadId, bool createThread)
-+{
-+    draftTimer.stop();
-+    if (draftDirty && runtimeReady) {
-+        restartPending = true;
-+        pendingRestartThreadId = threadId;
-+        pendingRestartCreateThread = createThread;
-+        pendingRestartSaveId = persistDraftNow();
-+        return;
-+    }
-+    performSessionRestart(threadId, createThread);
-+}
-+
-+void AgentBridge::performSessionRestart(const QString& threadId, bool createThread)
-+{
-+    restartPending = false;
-+    pendingRestartSaveId = 0;
-+    selectedLocalThreadId = threadId;
-+    createNewThread = createThread;
-+    documentRevision.reset();
-+    standardOutputBuffer.clear();
-+    sidebar->clearInteraction();
-+    sidebar->clearUsage();
-+    selectedModel.clear();
-+    selectedEffort.clear();
-+    sidebar->restoreModelSelection(QString(), QString());
-+
-+    if (runtime.state() != QProcess::NotRunning) {
-+        stopping = true;
-+        runtime.kill();
-+        runtime.waitForFinished(1000);
-+        stopping = false;
-+    }
-+    runtimeReady = false;
-+    ensureRuntime();
-+}
-+
-+qint64 AgentBridge::persistDraftNow()
-+{
-+    if (!draftDirty || !runtimeReady) {
-+        return 0;
-+    }
-+    const qint64 saveId = nextDraftSaveId++;
-+    send(QStringLiteral("draft.save"), {{"body", pendingDraft}, {"saveId", saveId},
-+        {"attachments", QJsonArray::fromVariantList(sidebar->attachments())}});
-+    draftDirty = false;
-+    return saveId;
-+}
-+
-+void AgentBridge::send(const QString& type, const QJsonObject& payload)
-+{
-+    if (runtime.state() == QProcess::NotRunning) {
-+        return;
-+    }
-+    const QJsonObject message {
-+        {"protocolVersion", 2},
-+        {"type", type},
-+        {"payload", payload},
-+    };
-+    runtime.write(QJsonDocument(message).toJson(QJsonDocument::Compact));
-+    runtime.write("\n");
-+}
-+
-+void AgentBridge::handleMessage(const QJsonObject& message)
-+{
-+    const QString type = message.value("type").toString();
-+    const QJsonObject payload = message.value("payload").toObject();
-+    if (type == QLatin1String("thread.local.ready")) {
-+        selectedLocalThreadId = payload.value("localThreadId").toString();
-+    }
-+    else if (type == QLatin1String("thread.list")) {
-+        sidebar->updateThreads(
-+            payload.value("currentThreadId").toString(),
-+            payload.value("threads").toArray().toVariantList()
-+        );
-+    }
-+    else if (type == QLatin1String("timeline.edit")) {
-+        sidebar->applyTimelineEdit(payload.toVariantMap());
-+    }
-+    else if (type == QLatin1String("draft.loaded")) {
-+        if (sidebar->busy() || sidebar->processingAttachments() || draftDirty) return;
-+        pendingDraft = payload.value("body").toString();
-+        draftDirty = false;
-+        sidebar->loadDraft(pendingDraft);
-+        sidebar->loadAttachments(payload.value("attachments").toArray().toVariantList());
-+    }
-+    else if (type == QLatin1String("draft.saved")) {
-+        const qint64 saveId = payload.value("saveId").toInteger();
-+        if (restartPending && saveId == pendingRestartSaveId) {
-+            performSessionRestart(pendingRestartThreadId, pendingRestartCreateThread);
-+        }
-+    }
-+    else if (type == QLatin1String("model.selection")) {
-+        if (!pendingProvider.isEmpty()) return;
-+        selectedModel = payload.value("model").toString();
-+        selectedEffort = payload.value("effort").toString();
-+        sidebar->restoreModelSelection(selectedModel, selectedEffort);
-+        selectedModel = sidebar->selectedModel();
-+        selectedEffort = sidebar->selectedEffort();
-+    }
-+    else if (type == QLatin1String("model.catalog")) {
-+        if (!pendingProvider.isEmpty()) {
-+            runningProviderModels = payload.value("models").toArray().toVariantList();
-+            return;
-+        }
-+        sidebar->updateModelCatalog(payload.value("models").toArray().toVariantList());
-+        selectedModel = sidebar->selectedModel();
-+        selectedEffort = sidebar->selectedEffort();
-+    }
-+    else if (type == QLatin1String("usage.updated")) {
-+        sidebar->updateUsage(payload.toVariantMap());
-+    }
-+    else if (type == QLatin1String("runtime.ready")) {
-+        runtimeReady = true;
-+        sidebar->appendActivity(
-+            tr("%1 connected").arg(
-+                payload.value("provider").toString() == QLatin1String("opencode")
-+                    ? QStringLiteral("OpenCode")
-+                    : QStringLiteral("Codex")
-+            )
-+        );
-+        sidebar->updateStatus(queuedPrompt.isEmpty() ? tr("Ready") : tr("Thinking"));
-+        persistDraft();
-+        if (!queuedPrompt.isEmpty() || !queuedAttachments.isEmpty()) {
-+            submit(queuedPrompt);
-+        }
-+    }
-+    else if (type == QLatin1String("content.delta")) {
-+        sidebar->updateStatus(tr("Responding"));
-+    }
-+    else if (type == QLatin1String("tool.call")) {
-+        // Inspect without executing model code. The runtime must durably acknowledge
-+        // this context before sending tool.execute.
-+        const PyGILState_STATE state = PyGILState_Ensure();
-+        PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
-+        PyObject* context = module ? PyObject_CallMethod(module, "context_json", nullptr) : nullptr;
-+        const char* encoded = context ? PyUnicode_AsUTF8(context) : nullptr;
-+        const QByteArray bytes = encoded ? QByteArray(encoded) : QByteArray();
-+        const QString error = encoded ? QString() : pythonError();
-+        Py_XDECREF(context);
-+        Py_XDECREF(module);
-+        PyGILState_Release(state);
-+        const auto document = QJsonDocument::fromJson(bytes);
-+        if (!document.isObject()) {
-+            const QJsonObject rejected {
-+                {"ok", false},
-+                {"notExecuted", true},
-+                {"error", QJsonObject {{"type", "PreflightError"}, {"message", error}}},
-+            };
-+            send(QStringLiteral("tool.result"), {
-+                {"requestId", payload.value("requestId")},
-+                {"result", QString::fromUtf8(QJsonDocument(rejected).toJson(QJsonDocument::Compact))},
-+                {"success", false},
-+            });
-+            return;
-+        }
-+        QJsonObject preparation = payload;
-+        preparation.insert("context", document.object());
-+        send(QStringLiteral("tool.prepare"), preparation);
-+    }
-+    else if (type == QLatin1String("tool.execute")) {
-+        scheduleFreeCADTool(payload, runtime.processId());
-+    }
-+    else if (type == QLatin1String("request.opened")) {
-+        sidebar->showApproval(
-+            payload.value("requestId").toString(),
-+            payload.value("title").toString(tr("Approval needed")),
-+            payload.value("detail").toString(),
-+            payload.value("allowSession").toBool()
-+        );
-+    }
-+    else if (type == QLatin1String("user_input.requested")) {
-+        sidebar->showUserInput(
-+            payload.value("requestId").toString(),
-+            payload.value("questions").toArray().toVariantList()
-+        );
-+    }
-+    else if (type == QLatin1String("runtime.warning") && !payload.contains("timestampMs")) {
-+        sidebar->appendActivity(payload.value("message").toString());
-+    }
-+    else if (type == QLatin1String("turn.completed")) {
-+        const QString status = payload.value("status").toString();
-+        if (status == QLatin1String("failed")) {
-+            queuedPrompt.clear();
-+            sidebar->failTurn(payload.value("error").toString(tr("The provider turn failed.")),
-+                              false);
-+        }
-+        else {
-+            sidebar->completeTurn();
-+        }
-+    }
-+    else if (type == QLatin1String("session.state") && payload.value("state").toString() == QLatin1String("running") && awaitingSubmission) {
-+        awaitingSubmission = false;
-+        queuedAttachments = {};
-+        sidebar->acceptSubmission();
-+    }
-+    else if (type == QLatin1String("runtime.error")) {
-+        queuedPrompt.clear();
-+        queuedAttachments = {};
-+        awaitingSubmission = false;
-+        sidebar->failTurn(payload.value("message").toString(tr("Unknown agent error.")), !payload.contains("timestampMs"));
-+    }
-+}
-+
-+void AgentBridge::scheduleFreeCADTool(const QJsonObject& payload, qint64 processId, bool notified)
-+{
-+    // Do not run stale queued work after its runtime exits or is replaced.
-+    if (runtime.state() != QProcess::Running || runtime.processId() != processId) return;
-+    if (executingTool || QApplication::mouseButtons() != Qt::NoButton
-+        || QApplication::activePopupWidget() || QApplication::activeModalWidget()) {
-+        if (!notified) {
-+            send(QStringLiteral("tool.progress"), {{"requestId", payload.value("requestId")},
-+                {"operationId", payload.value("operationId")}, {"stage", "waiting-for-interaction"}});
-+        }
-+        QTimer::singleShot(100, this, [this, payload, processId]() {
-+            scheduleFreeCADTool(payload, processId, true);
-+        });
-+        return;
-+    }
-+    runFreeCADTool(payload);
-+}
-+
-+void AgentBridge::runFreeCADTool(const QJsonObject& payload)
-+{
-+    Q_ASSERT(QThread::currentThread() == qApp->thread());
-+    QScopedValueRollback<bool> executionGuard(executingTool, true);
-+    const QString operationId = payload.value("operationId").toString();
-+    if (operationId.isEmpty() || executedOperations.contains(operationId)) {
-+        fail(tr("Missing or duplicate CAD operation ID; Python was not executed."));
-+        return;
-+    }
-+    executedOperations.insert(operationId);
-+    if (documentSyncPending || documentIdentity() != runtimeDocumentIdentity) {
-+        send(
-+            QStringLiteral("tool.result"),
-+            {
-+                {"requestId", payload.value("requestId")},
-+                {
-+                    "result",
-+                    QStringLiteral(
-+                        R"({"ok":false,"notExecuted":true,"error":{"type":"DocumentContextChanged","message":"The active FreeCAD document changed before this call could run."}})"
-+                    ),
-+                },
-+                {"success", false},
-+            }
-+        );
-+        return;
-+    }
-+    sidebar->updateStatus(tr("Editing"));
-+
-+    const auto context = payload.value("context").toObject();
-+    if (!context.value("revision").isDouble()) {
-+        fail(tr("Missing prepared CAD revision; Python was not executed."));
-+        return;
-+    }
-+    if (!documentRevision) {
-+        documentRevision = context.value("revision").toInt();
-+    }
-+
-+    bool success = false;
-+    QString result
-+        = executePython(payload.value("arguments").toObject().value("code").toString(), success, payload);
-+    auto resultDocument = QJsonDocument::fromJson(result.toUtf8());
-+    QJsonArray images;
-+    if (resultDocument.isObject()) {
-+        auto resultObject = resultDocument.object();
-+        images = resultObject.take(QStringLiteral("images")).toArray();
-+        resultDocument.setObject(resultObject);
-+        result = QString::fromUtf8(resultDocument.toJson(QJsonDocument::Compact));
-+        if (resultObject.value("revision").isDouble()) {
-+            documentRevision = resultObject.value("revision").toInt();
-+        }
-+    }
-+
-+    send(
-+        QStringLiteral("tool.result"),
-+        {
-+            {"requestId", payload.value("requestId")},
-+            {"result", result},
-+            {"success", success},
-+            {"images", images},
-+        }
-+    );
-+}
-+
-+QString AgentBridge::executePython(const QString& source, bool& success, const QJsonObject& payload)
-+{
-+    success = false;
-+    const PyGILState_STATE state = PyGILState_Ensure();
-+    PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
-+    if (!module) {
-+        const QString error = pythonError();
-+        PyGILState_Release(state);
-+        return QString::fromUtf8(
-+            QJsonDocument(
-+                QJsonObject {
-+                    {"ok", false},
-+                    {"error", QJsonObject {{"type", "ImportError"}, {"message", error}}},
-+                }
-+            )
-+                .toJson(QJsonDocument::Compact)
-+        );
-+    }
-+
-+    const QByteArray encoded = source.toUtf8();
-+    QPointer<AgentBridge> bridge(this);
-+    const auto processId = runtime.processId();
-+    auto* callback = new ProgressCallback([bridge, payload, processId](const QString& stage) {
-+        if (!bridge || bridge->runtime.processId() != processId) return;
-+        bridge->send(QStringLiteral("tool.progress"), {{"requestId", payload.value("requestId")},
-+            {"operationId", payload.value("operationId")}, {"stage", stage}});
-+        // Flush before entering native work, without pumping user events.
-+        if (bridge->runtime.bytesToWrite()) bridge->runtime.waitForBytesWritten(1000);
-+    });
-+    PyObject* capsule = PyCapsule_New(callback, "anthracite.progress", [](PyObject* value) {
-+        delete static_cast<ProgressCallback*>(PyCapsule_GetPointer(value, "anthracite.progress"));
-+    });
-+    PyObject* progress = capsule ? PyCFunction_New(&progressMethod, capsule) : nullptr;
-+    if (!capsule) delete callback;
-+    Py_XDECREF(capsule);
-+    PyObject* result = progress ? PyObject_CallMethod(module, "execute_json", "siO",
-+        encoded.constData(), documentRevision.value_or(0), progress) : nullptr;
-+    Py_XDECREF(progress);
-+    Py_DECREF(module);
-+
-+    if (!result) {
-+        const QString error = pythonError();
-+        PyGILState_Release(state);
-+        return QString::fromUtf8(
-+            QJsonDocument(
-+                QJsonObject {
-+                    {"ok", false},
-+                    {"error", QJsonObject {{"type", "PythonError"}, {"message", error}}},
-+                }
-+            )
-+                .toJson(QJsonDocument::Compact)
-+        );
-+    }
-+
-+    const char* encodedResult = PyUnicode_AsUTF8(result);
-+    const QString text = encodedResult
-+        ? QString::fromUtf8(encodedResult)
-+        : QStringLiteral(
-+              R"({"ok":false,"error":{"type":"EncodingError","message":"Executor returned non-text."}})"
-+          );
-+    Py_DECREF(result);
-+    PyGILState_Release(state);
-+
-+    const auto document = QJsonDocument::fromJson(text.toUtf8());
-+    success = document.isObject() && document.object().value("ok").toBool();
-+    return text;
-+}
-+
-+QString AgentBridge::runtimePath() const
-+{
-+    return QDir(QString::fromStdString(App::Application::getHomePath()))
-+        .filePath(QStringLiteral("Mod/Anthracite/anthracite-runtime"));
-+}
-+
-+QString AgentBridge::providerKind() const
-+{
-+    const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
-+    const QString configured = QString::fromStdString(preferences->GetASCII("Provider", "codex"));
-+    return configured == QLatin1String("opencode") ? configured : QStringLiteral("codex");
-+}
-+
-+QString AgentBridge::providerPath() const
-+{
-+    return findProviderExecutable(providerKind());
-+}
-+
-+QString AgentBridge::findProviderExecutable(const QString& provider) const
-+{
-+    const auto preferences = App::GetApplication().GetParameterGroupByPath(preferencePath);
-+    const char* key = provider == QLatin1String("opencode") ? "OpenCodeBinary" : "CodexBinary";
-+    const QString configured = QString::fromStdString(preferences->GetASCII(key, ""));
-+    if (!configured.isEmpty()) {
-+        return configured;
-+    }
-+    const QString executable = QStandardPaths::findExecutable(provider);
-+    if (!executable.isEmpty()) {
-+        return executable;
-+    }
-+
-+    const QString home = QDir::homePath();
-+    const QStringList candidates =
-+        provider == QLatin1String("opencode")
-+        ? QStringList {
-+              QDir(home).filePath(QStringLiteral(".opencode/bin/opencode")),
-+              QStringLiteral("/opt/homebrew/bin/opencode"),
-+              QStringLiteral("/usr/local/bin/opencode"),
-+          }
-+        : QStringList {
-+              QDir(home).filePath(QStringLiteral(".local/bin/codex")),
-+              QStringLiteral("/opt/homebrew/bin/codex"),
-+              QStringLiteral("/usr/local/bin/codex"),
-+          };
-+    for (const QString& candidate : candidates) {
-+        if (QFileInfo(candidate).isExecutable()) {
-+            return candidate;
-+        }
-+    }
-+
-+    QProcess shell;
-+#ifdef Q_OS_WIN
-+    shell.start(QStringLiteral("cmd.exe"), {QStringLiteral("/C"), QStringLiteral("where"), provider});
-+#else
-+    const QString shellProgram = QProcessEnvironment::systemEnvironment().value(
-+        QStringLiteral("SHELL"),
-+        QStringLiteral("/bin/sh")
-+    );
-+    shell.start(
-+        shellProgram,
-+        {QStringLiteral("-lc"), QStringLiteral("command -v %1").arg(provider)}
-+    );
-+#endif
-+    if (shell.waitForFinished(2000) && shell.exitCode() == 0) {
-+        const QString resolved = QString::fromUtf8(shell.readAllStandardOutput()).trimmed();
-+        if (QFileInfo(resolved).isExecutable()) {
-+            return resolved;
-+        }
-+    }
-+    return {};
-+}
-+
-+QString AgentBridge::workingDirectory() const
-+{
-+    if (const auto* document = App::GetApplication().getActiveDocument()) {
-+        const std::string fileName = document->getFileName();
-+        if (!fileName.empty()) {
-+            return QFileInfo(QString::fromStdString(fileName)).absolutePath();
-+        }
-+    }
-+    return QDir::currentPath();
-+}
-+
-+QString AgentBridge::databasePath() const
-+{
-+    QString root = qEnvironmentVariable("XDG_STATE_HOME");
-+    if (root.isEmpty() || !QDir::isAbsolutePath(root)) {
-+        root = QDir::home().filePath(QStringLiteral(".local/state"));
-+    }
-+    return QDir(root).filePath(QStringLiteral("anthracite/anthracite.sqlite3"));
-+}
-+
-+QJsonObject AgentBridge::documentContext()
-+{
-+    const auto* document = App::GetApplication().getActiveDocument();
-+    const QString name = document ? QString::fromUtf8(document->getName()) : QStringLiteral("none");
-+    const QString contextKey = document ? QStringLiteral("document:%1").arg(name)
-+                                        : QStringLiteral("no-document");
-+    QString sessionKey = documentSessionKeys.value(contextKey);
-+    if (sessionKey.isEmpty()) {
-+        sessionKey = QUuid::createUuid().toString(QUuid::WithoutBraces);
-+        documentSessionKeys.insert(contextKey, sessionKey);
-+    }
-+
-+    if (!document) {
-+        return {
-+            {"displayName", tr("Unsaved FreeCAD document")},
-+            {"sessionKey", sessionKey},
-+        };
-+    }
-+
-+    const QString fileName = QString::fromStdString(document->getFileName());
-+    return {
-+        {"path", fileName},
-+        {"displayName", fileName.isEmpty() ? name : QFileInfo(fileName).fileName()},
-+        {"sessionKey", sessionKey},
-+    };
-+}
-+
-+QString AgentBridge::documentIdentity() const
-+{
-+    if (const auto* document = App::GetApplication().getActiveDocument()) {
-+        return QStringLiteral("%1\n%2").arg(
-+            QString::fromUtf8(document->getName()),
-+            QString::fromStdString(document->getFileName())
-+        );
-+    }
-+    return QStringLiteral("<no-active-document>");
-+}
-+
-+void AgentBridge::scheduleDocumentSync()
-+{
-+    if (documentSyncPending) {
-+        return;
-+    }
-+    documentSyncPending = true;
-+    QTimer::singleShot(0, this, [this]() {
-+        documentSyncPending = false;
-+        synchronizeDocumentContext();
-+    });
-+}
-+
-+void AgentBridge::synchronizeDocumentContext()
-+{
-+    const QString currentIdentity = documentIdentity();
-+    if (currentIdentity == runtimeDocumentIdentity) {
-+        return;
-+    }
-+
-+    queuedPrompt.clear();
-+    queuedAttachments = {};
-+    awaitingSubmission = false;
-+    draftTimer.stop();
-+    draftDirty = false;
-+    restartPending = false;
-+    pendingRestartSaveId = 0;
-+    pendingDraft.clear();
-+    sidebar->documentContextChanged();
-+    const QString currentProviderPath = providerPath();
-+    if (runtime.state() == QProcess::NotRunning
-+        && (currentProviderPath.isEmpty() || !QFileInfo::exists(currentProviderPath)
-+            || !QFileInfo::exists(runtimePath()))) {
-+        runtimeDocumentIdentity = currentIdentity;
-+        selectedLocalThreadId.clear();
-+        runtimeReady = false;
-+        sidebar->updateStatus(tr("Ready"));
-+        return;
-+    }
-+    performSessionRestart(QString(), false);
-+}
-+
-+void AgentBridge::documentDeleted(const App::Document& document)
-+{
-+    documentSessionKeys.remove(
-+        QStringLiteral("document:%1").arg(QString::fromUtf8(document.getName()))
-+    );
-+    scheduleDocumentSync();
-+}
-+
-+void AgentBridge::fail(const QString& message)
-+{
-+    queuedPrompt.clear();
-+    queuedAttachments = {};
-+    awaitingSubmission = false;
-+    sidebar->failTurn(message);
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/AgentBridge.h
-@@ -0,0 +1,115 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#ifndef ANTHRACITEGUI_AGENTBRIDGE_H
-+#define ANTHRACITEGUI_AGENTBRIDGE_H
-+
-+#include <QJsonValue>
-+#include <QJsonArray>
-+#include <QJsonObject>
-+#include <QHash>
-+#include <QObject>
-+#include <QProcess>
-+#include <QSet>
-+#include <QTimer>
-+#include <QVariantMap>
-+
-+#include <optional>
-+
-+#include <boost/signals2/connection.hpp>
-+
-+namespace App
-+{
-+class Document;
-+}
-+
-+namespace AnthraciteGui
-+{
-+class SidebarController;
-+
-+class AgentBridge: public QObject
-+{
-+    Q_OBJECT
-+
-+public:
-+    explicit AgentBridge(SidebarController* controller, QObject* parent = nullptr);
-+    ~AgentBridge() override;
-+
-+private Q_SLOTS:
-+    void submit(const QString& prompt);
-+    void stop();
-+    void chooseProvider();
-+    void selectProvider(const QString& provider);
-+    void newThread();
-+    void selectThread(const QString& threadId);
-+    void draftEdited(const QString& body);
-+    void modelSelectionEdited(const QString& model, const QString& effort);
-+    void persistDraft();
-+    void respondToApproval(const QString& requestId, const QString& decision);
-+    void respondToUserInput(const QString& requestId, const QVariantMap& answers);
-+    void processStarted();
-+    void readStandardOutput();
-+    void readStandardError();
-+    void processError(QProcess::ProcessError error);
-+    void processFinished(int exitCode, QProcess::ExitStatus exitStatus);
-+
-+private:
-+    void ensureRuntime();
-+    void restartSession(const QString& threadId, bool createThread);
-+    void performSessionRestart(const QString& threadId, bool createThread);
-+    qint64 persistDraftNow();
-+    void send(const QString& type, const QJsonObject& payload = {});
-+    void handleMessage(const QJsonObject& message);
-+    void runFreeCADTool(const QJsonObject& payload);
-+    void scheduleFreeCADTool(const QJsonObject& payload, qint64 processId, bool notified = false);
-+    QString executePython(const QString& source, bool& success, const QJsonObject& payload);
-+    QString runtimePath() const;
-+    QString providerKind() const;
-+    QString providerPath() const;
-+    QString findProviderExecutable(const QString& provider) const;
-+    QString workingDirectory() const;
-+    QString databasePath() const;
-+    QJsonObject documentContext();
-+    QString documentIdentity() const;
-+    void scheduleDocumentSync();
-+    void synchronizeDocumentContext();
-+    void documentDeleted(const App::Document& document);
-+    void fail(const QString& message);
-+
-+    SidebarController* sidebar;
-+    QProcess runtime;
-+    QByteArray standardOutputBuffer;
-+    QString queuedPrompt;
-+    QJsonArray queuedAttachments;
-+    bool awaitingSubmission = false;
-+    bool runtimeReady = false;
-+    bool stopping = false;
-+    bool executingTool = false;
-+    bool createNewThread = false;
-+    bool draftDirty = false;
-+    bool restartPending = false;
-+    QHash<QString, QString> documentSessionKeys;
-+    QString selectedLocalThreadId;
-+    QString pendingDraft;
-+    QString selectedModel;
-+    QString selectedEffort;
-+    QString pendingProvider;
-+    QVariantList runningProviderModels;
-+    QString runningProviderModel;
-+    QString runningProviderEffort;
-+    QString pendingRestartThreadId;
-+    bool pendingRestartCreateThread = false;
-+    qint64 nextDraftSaveId = 1;
-+    qint64 pendingRestartSaveId = 0;
-+    QTimer draftTimer;
-+    QString runtimeDocumentIdentity;
-+    bool documentSyncPending = false;
-+    boost::signals2::scoped_connection activeDocumentConnection;
-+    boost::signals2::scoped_connection savedDocumentConnection;
-+    boost::signals2::scoped_connection deletedDocumentConnection;
-+    boost::signals2::scoped_connection selectionConnection;
-+    std::optional<int> documentRevision;
-+    QSet<QString> executedOperations;
-+};
-+}  // namespace AnthraciteGui
-+
-+#endif  // ANTHRACITEGUI_AGENTBRIDGE_H
---- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,113 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QJsonParseError>
 +#include <QResource>
 +#include <QTimer>
 +
@@ -1145,7 +35,52 @@
 +    Module()
 +        : Py::ExtensionModule<Module>("AnthraciteGui")
 +    {
++        add_varargs_method(
++            "push_activity",
++            &Module::pushActivity,
++            "push_activity(json) -- Append one bridge operation to the activity history."
++        );
++        add_varargs_method(
++            "push_bridge_status",
++            &Module::pushBridgeStatus,
++            "push_bridge_status(json) -- Update the bridge status shown in the sidebar and status bar."
++        );
 +        initialize("Native GUI integration for Anthracite.");
++    }
++
++private:
++    Py::Object pushActivity(const Py::Tuple& args)
++    {
++        const char* text = nullptr;
++        if (!PyArg_ParseTuple(args.ptr(), "s", &text)) {
++            throw Py::Exception();
++        }
++        QJsonParseError error;
++        const auto document = QJsonDocument::fromJson(QByteArray(text), &error);
++        if (error.error != QJsonParseError::NoError || !document.isObject()) {
++            throw Py::ValueError("push_activity expects a JSON object.");
++        }
++        const auto event = document.object();
++        sidebarController()->pushOperation(
++            event.value(QStringLiteral("operation")).toObject().toVariantMap(),
++            event.value(QStringLiteral("images")).toArray().toVariantList()
++        );
++        return Py::None();
++    }
++
++    Py::Object pushBridgeStatus(const Py::Tuple& args)
++    {
++        const char* text = nullptr;
++        if (!PyArg_ParseTuple(args.ptr(), "s", &text)) {
++            throw Py::Exception();
++        }
++        QJsonParseError error;
++        const auto document = QJsonDocument::fromJson(QByteArray(text), &error);
++        if (error.error != QJsonParseError::NoError || !document.isObject()) {
++            throw Py::ValueError("push_bridge_status expects a JSON object.");
++        }
++        sidebarController()->applyBridgeStatus(document.object().toVariantMap());
++        return Py::None();
 +    }
 +};
 +
@@ -1181,7 +116,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,75 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -1190,51 +125,10 @@
 +    COMPONENTS Qml Quick QuickWidgets Concurrent
 +)
 +
-+find_program(CARGO_EXECUTABLE cargo REQUIRED)
-+
-+set(AnthraciteRuntime_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime)
-+set(AnthraciteRuntime_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/runtime-target)
-+set(AnthraciteRuntime_BUILD_BINARY
-+    ${AnthraciteRuntime_TARGET_DIR}/release/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
-+)
-+set(AnthraciteRuntime_BINARY
-+    ${CMAKE_BINARY_DIR}/Mod/Anthracite/anthracite-runtime${CMAKE_EXECUTABLE_SUFFIX}
-+)
-+
-+add_custom_command(
-+    OUTPUT ${AnthraciteRuntime_BINARY}
-+    COMMAND
-+        ${CARGO_EXECUTABLE} build
-+        --locked
-+        --release
-+        --manifest-path ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
-+        --target-dir ${AnthraciteRuntime_TARGET_DIR}
-+    COMMAND
-+        ${CMAKE_COMMAND} -E copy_if_different
-+        ${AnthraciteRuntime_BUILD_BINARY}
-+        ${AnthraciteRuntime_BINARY}
-+    DEPENDS
-+        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.lock
-+        ${AnthraciteRuntime_SOURCE_DIR}/Cargo.toml
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/main.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/composer.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/process.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/protocol.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/store.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/timeline.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/mod.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/codex.rs
-+        ${AnthraciteRuntime_SOURCE_DIR}/src/providers/opencode.rs
-+    COMMENT "Building Anthracite agent runtime"
-+    VERBATIM
-+)
-+
-+add_custom_target(AnthraciteRuntime ALL DEPENDS ${AnthraciteRuntime_BINARY})
-+
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptView TranscriptText ActivityEntry AgentSettings StatusBar Hint UserNotifications ConsoleNavigation)
++foreach(component Main TranscriptView TranscriptText ActivityEntry StatusBar Hint UserNotifications ConsoleNavigation)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -1250,14 +144,11 @@
 +
 +set(AnthraciteGui_SRCS
 +    ${AnthraciteGui_QRC}
-+    AgentBridge.cpp
-+    AgentBridge.h
 +    AppAnthraciteGui.cpp
 +    Command.cpp
 +    Chrome.cpp
 +    Chrome.h
 +    ConversationModel.cpp
-+    Composer.cpp
 +    ConversationModel.h
 +    Sidebar.cpp
 +    Sidebar.h
@@ -1272,7 +163,6 @@
 +    target_link_libraries(AnthraciteGui PRIVATE "-framework AppKit")
 +endif()
 +target_compile_definitions(AnthraciteGui PRIVATE ANTHRACITE_QML_VERSION="${AnthraciteQml_VERSION}")
-+add_dependencies(AnthraciteGui AnthraciteRuntime)
 +
 +target_include_directories(
 +    AnthraciteGui
@@ -1301,7 +191,6 @@
 +SET_PYTHON_PREFIX_SUFFIX(AnthraciteGui)
 +
 +install(TARGETS AnthraciteGui DESTINATION ${CMAKE_INSTALL_LIBDIR})
-+install(PROGRAMS ${AnthraciteRuntime_BINARY} DESTINATION Mod/Anthracite)
 +install(FILES Resources/qml/Main.qml DESTINATION Mod/Anthracite/qml)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Command.cpp
@@ -1321,8 +210,8 @@
 +{
 +    sGroup = "Anthracite";
 +    sMenuText = QT_TR_NOOP("&Anthracite");
-+    sToolTipText = QT_TR_NOOP("Show the Anthracite agent sidebar");
-+    sStatusTip = QT_TR_NOOP("Show the Anthracite agent sidebar");
++    sToolTipText = QT_TR_NOOP("Show the Anthracite activity history");
++    sStatusTip = QT_TR_NOOP("Show the Anthracite activity history");
 +    sWhatsThis = "Anthracite_ToggleSidebar";
 +}
 +
@@ -1344,7 +233,7 @@
 +{
 +    sGroup = "Anthracite";
 +    sMenuText = QT_TR_NOOP("Reload Anthracite UI");
-+    sToolTipText = QT_TR_NOOP("Reload the local QML override while preserving the agent session");
++    sToolTipText = QT_TR_NOOP("Reload the local QML override while preserving the live bridge");
 +}
 +
 +void AnthraciteCmdReloadSidebar::activated(int message)
@@ -1634,7 +523,7 @@
 +#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,30 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite/icons">
@@ -1650,7 +539,6 @@
 +        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="overlay.qss">@CMAKE_CURRENT_SOURCE_DIR@/Resources/overlay.qss</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
-+        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
@@ -1661,7 +549,6 @@
 +        <file alias="qml/Hint.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Hint.qml</file>
 +        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
-+        <file alias="qml/AgentSettings.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/AgentSettings.qml</file>
 +        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
 +        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
 +        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
@@ -1669,7 +556,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,950 @@
+@@ -0,0 +1,573 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -1689,9 +576,8 @@
 +            timeline.latest()
 +        }
 +    }
-+    property string pendingThreadId: ""
 +    function observeWheel(position) {
-+        if (agentSettings.visible || imagePreview.visible) return
++        if (imagePreview.visible) return
 +        const point = timeline.mapFromItem(root, position.x, position.y)
 +        if (point.x >= 0 && point.y >= 0 && point.x < timeline.width && point.y < timeline.height)
 +            timeline.navigate()
@@ -1704,26 +590,8 @@
 +        target: Qt.application
 +        function onStateChanged() { root.refreshMotion() }
 +    }
-+    Connections {
-+        target: anthraciteController
-+        function onThreadsChanged() {
-+            if (root.pendingThreadId === anthraciteController.currentThreadId
-+                || (root.pendingThreadId === "new" && anthraciteController.currentThreadId.length))
-+                root.pendingThreadId = ""
-+        }
-+        function onStatusChanged() {
-+            if (anthraciteController.status === "Error") root.pendingThreadId = ""
-+        }
-+    }
 +
 +    padding: 0
-+    Transcript.AgentSettings {
-+        id: agentSettings
-+        controller: anthraciteController
-+        returnFocus: agentSettingsButton
-+        reducedMotion: root.reducedMotion
-+        onOpening: root.refreshMotion()
-+    }
 +
 +    Popup {
 +        id: imagePreview
@@ -1781,68 +649,85 @@
 +
 +        Rectangle {
 +            Layout.fillWidth: true
-+            Layout.preferredHeight: threadControls.implicitHeight + 8
++            Layout.preferredHeight: bridgeHeader.implicitHeight + 8
 +            color: systemPalette.window
 +
-+            ColumnLayout {
++            RowLayout {
++                id: bridgeHeader
 +                anchors.fill: parent
 +                anchors.leftMargin: 14
 +                anchors.rightMargin: 14
 +                anchors.topMargin: 4
 +                anchors.bottomMargin: 4
-+                spacing: 4
++                spacing: 8
 +
-+
-+                RowLayout {
-+                    id: threadControls
++                Rectangle {
++                    objectName: "AnthraciteBridgeStatusDot"
++                    Layout.preferredWidth: 8
++                    Layout.preferredHeight: 8
++                    radius: 4
++                    color: anthraciteController.bridgeRunning ? "#4caf50" : systemPalette.mid
++                }
++                Label {
++                    objectName: "AnthraciteBridgeStatusLabel"
 +                    Layout.fillWidth: true
-+
-+                    ComboBox {
-+                        id: threadPicker
-+                        objectName: "AnthraciteThreadPicker"
-+                        Layout.fillWidth: true
-+                        Layout.preferredHeight: root.compactControlHeight
-+                        topPadding: 4
-+                        bottomPadding: 4
-+                        model: anthraciteController.threads
-+                        textRole: "title"
-+                        enabled: !root.pendingThreadId.length && !anthraciteController.busy && !anthraciteController.processingAttachments && count > 0
-+                        displayText: root.pendingThreadId === "new" ? qsTr("Creating conversation…")
-+                            : root.pendingThreadId.length ? qsTr("Opening %1…").arg(currentText) : currentText
-+
-+                        currentIndex: {
-+                            for (let index = 0; index < count; ++index) {
-+                                if (model[index].id === (root.pendingThreadId.length && root.pendingThreadId !== "new"
-+                                    ? root.pendingThreadId : anthraciteController.currentThreadId)) {
-+                                    return index
-+                                }
-+                            }
-+                            return count > 0 ? 0 : -1
-+                        }
-+
-+                        onActivated: function(index) {
-+                            if (model[index].id === anthraciteController.currentThreadId) return
-+                            root.pendingThreadId = model[index].id
-+                            anthraciteController.selectThread(model[index].id)
-+                        }
++                    Layout.minimumWidth: 0
++                    text: anthraciteController.bridgeRunning
++                          ? qsTr("Anthracite bridge · port %1").arg(anthraciteController.bridgePort)
++                          : qsTr("Anthracite bridge offline")
++                    color: systemPalette.windowText
++                    elide: Text.ElideRight
++                }
++                Label {
++                    objectName: "AnthraciteBridgeDocument"
++                    visible: text.length > 0
++                    Layout.maximumWidth: 200
++                    text: anthraciteController.bridgeDocument.length > 0
++                          ? anthraciteController.bridgeDocument
++                            + (anthraciteController.bridgeRevision > 0
++                               ? qsTr(" · r%1").arg(anthraciteController.bridgeRevision) : "")
++                          : ""
++                    color: systemPalette.windowText
++                    opacity: 0.65
++                    elide: Text.ElideRight
++                }
++                ToolButton {
++                    id: geometryPickerButton
++                    objectName: "AnthraciteGeometryPicker"
++                    Layout.preferredHeight: root.compactControlHeight
++                    Layout.preferredWidth: root.compactControlHeight
++                    checked: anthraciteController.picking
++                    Accessible.name: qsTr("Pick CAD geometry")
++                    icon.source: "qrc:/Anthracite/icons/color-picker.svg"
++                    icon.width: 20; icon.height: 20
++                    icon.color: "transparent"
++                    onClicked: anthraciteController.togglePicker()
++                    Transcript.Hint {
++                        hovered: parent.hovered
++                        text: anthraciteController.picking
++                              ? qsTr("Click a face, edge, vertex or object · Esc cancels")
++                              : qsTr("Copy a model reference to the clipboard")
 +                    }
-+
-+                    ToolButton {
-+                        id: newThreadButton
-+                        objectName: "AnthraciteNewThread"
-+                        Layout.preferredHeight: root.compactControlHeight
-+                        Layout.preferredWidth: root.compactControlHeight
-+                        padding: 4
-+                        icon.source: "qrc:/Anthracite/icons/plus.svg"
-+                        icon.width: 18; icon.height: 18
-+                        icon.color: "transparent"
-+                        Accessible.name: qsTr("New conversation")
-+                        enabled: !root.pendingThreadId.length && !anthraciteController.busy && !anthraciteController.processingAttachments
-+                        Transcript.Hint {
-+                            hovered: parent.hovered
-+                            text: qsTr("New conversation")
-+                        }
-+                        onClicked: { root.pendingThreadId = "new"; anthraciteController.newThread() }
++                }
++                ToolButton {
++                    id: copyBridgeButton
++                    objectName: "AnthraciteBridgeCopy"
++                    Layout.preferredHeight: root.compactControlHeight
++                    Layout.preferredWidth: copyBridgeLabel.implicitWidth + 20
++                    Accessible.name: qsTr("Copy MCP configuration")
++                    onClicked: anthraciteController.copyBridgeConfig()
++                    contentItem: Text {
++                        id: copyBridgeLabel
++                        text: qsTr("Copy MCP config")
++                        color: systemPalette.windowText
++                        verticalAlignment: Text.AlignVCenter
++                        horizontalAlignment: Text.AlignHCenter
++                    }
++                    Transcript.Hint {
++                        hovered: parent.hovered
++                        text: anthraciteController.bridgeConfig.length > 0
++                              ? qsTr("Copy the MCP server configuration to the clipboard")
++                              : qsTr("Bridge is not running")
 +                    }
 +                }
 +            }
@@ -2213,421 +1098,46 @@
 +            }
 +        }
 +
-+        Rectangle {
-+            id: interactionCard
-+            objectName: "AnthraciteInteractionCard"
-+            visible: anthraciteController.interactionPending
-+            Layout.fillWidth: true
-+            Layout.leftMargin: 10
-+            Layout.rightMargin: 10
-+            Layout.bottomMargin: 8
-+            Layout.preferredHeight: Math.min(320, interactionContent.implicitHeight + 22)
-+            radius: 8
-+            color: Qt.rgba(0.78, 0.57, 0.18, 0.13)
-+            border.color: Qt.rgba(0.78, 0.57, 0.18, 0.48)
-+
-+            ScrollView {
-+                id: interactionScroll
-+                anchors.fill: parent
-+                anchors.margins: 10
-+                clip: true
-+
-+                ColumnLayout {
-+                    id: interactionContent
-+                    width: interactionScroll.availableWidth
-+                    spacing: 9
-+
-+                    Label {
-+                        Layout.fillWidth: true
-+                        text: anthraciteController.interactionTitle
-+                        font.weight: Font.DemiBold
-+                        color: systemPalette.windowText
-+                    }
-+
-+                    Label {
-+                        visible: text.length > 0
-+                        Layout.fillWidth: true
-+                        text: anthraciteController.interactionDetail
-+                        wrapMode: Text.Wrap
-+                        color: systemPalette.windowText
-+                    }
-+
-+                    RowLayout {
-+                        visible: anthraciteController.interactionKind === "approval"
-+                        Layout.fillWidth: true
-+
-+                        Button {
-+                            text: qsTr("Decline")
-+                            onClicked: anthraciteController.respondToApproval("decline")
-+                        }
-+
-+                        Item {
-+                            Layout.fillWidth: true
-+                        }
-+
-+                        Button {
-+                            text: qsTr("Approve once")
-+                            highlighted: true
-+                            onClicked: anthraciteController.respondToApproval("approve")
-+                        }
-+
-+                        Button {
-+                            visible: anthraciteController.interactionAllowSession
-+                            text: qsTr("Approve session")
-+                            onClicked: anthraciteController.respondToApproval("approve_session")
-+                        }
-+                    }
-+
-+                    ColumnLayout {
-+                        id: requestedInput
-+                        objectName: "AnthraciteRequestedInput"
-+                        visible: anthraciteController.interactionKind === "user_input"
-+                        Layout.fillWidth: true
-+                        spacing: 12
-+
-+                        Repeater {
-+                            model: anthraciteController.interactionQuestions
-+
-+                            delegate: ColumnLayout {
-+                                property var questionData: modelData
-+                                Layout.fillWidth: true
-+                                spacing: 5
-+
-+                                Label {
-+                                    Layout.fillWidth: true
-+                                    text: questionData.header || ""
-+                                    font.pixelSize: 11
-+                                    font.weight: Font.DemiBold
-+                                    color: systemPalette.windowText
-+                                    opacity: 0.72
-+                                }
-+
-+                                Label {
-+                                    Layout.fillWidth: true
-+                                    text: questionData.question || ""
-+                                    wrapMode: Text.Wrap
-+                                    color: systemPalette.windowText
-+                                }
-+
-+                                Repeater {
-+                                    model: questionData.options || []
-+
-+                                    delegate: Button {
-+                                        property var optionData: modelData
-+                                        Layout.fillWidth: true
-+                                        text: optionData.label || ""
-+                                        checkable: true
-+                                        checked: anthraciteController.inputAnswer(
-+                                                     questionData.id) === text
-+                                        onClicked: anthraciteController.setInputAnswer(
-+                                                       questionData.id, text)
-+
-+                                        Transcript.Hint {
-+                                            hovered: parent.hovered && (optionData.description || "").length > 0
-+                                            text: optionData.description || ""
-+                                        }
-+                                    }
-+                                }
-+
-+                                TextField {
-+                                    Layout.fillWidth: true
-+                                    placeholderText: qsTr("Or type another answer…")
-+                                    echoMode: questionData.isSecret
-+                                              ? TextInput.Password
-+                                              : TextInput.Normal
-+                                    onTextEdited: anthraciteController.setInputAnswer(
-+                                                      questionData.id, text)
-+                                }
-+                            }
-+                        }
-+
-+                        RowLayout {
-+                            Layout.fillWidth: true
-+
-+                            Item {
-+                                Layout.fillWidth: true
-+                            }
-+
-+                            Button {
-+                                text: qsTr("Answer")
-+                                highlighted: true
-+                                enabled: anthraciteController.inputComplete
-+                                onClicked: anthraciteController.submitInputAnswers()
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-+        }
-+
-+        Rectangle {
-+            Layout.fillWidth: true
-+            Layout.preferredHeight: composerLayout.implicitHeight + 12
-+            color: systemPalette.window
-+
-+            Rectangle {
-+                width: parent.width
-+                height: 1
-+                color: systemPalette.mid
-+                opacity: 0.45
-+            }
-+
-+            ColumnLayout {
-+                id: composerLayout
-+                anchors.left: parent.left
-+                anchors.right: parent.right
-+                anchors.bottom: parent.bottom
-+                anchors.margins: 10
-+                anchors.bottomMargin: 6
-+                spacing: 6
-+
-+                ScrollView {
-+                    id: attachmentTray
-+                    objectName: "AnthraciteAttachmentTray"
-+                    property var visibleAttachments: anthraciteController.attachments.map((item, index) => ({item: item, index: index})).filter(entry => entry.item.type !== "cad")
-+                    Layout.fillWidth: true
-+                    Layout.preferredHeight: visibleAttachments.length > 0 ? 88 : 0
-+                    visible: visibleAttachments.length > 0
-+                    clip: true
-+                    Row {
-+                        spacing: 6
-+                        Repeater {
-+                            model: attachmentTray.visibleAttachments
-+                            delegate: Rectangle {
-+                                property var attachment: modelData.item
-+                                width: 154
-+                                height: 80
-+                                radius: 6
-+                                color: Qt.rgba(0.5, 0.5, 0.5, 0.07)
-+                                border.color: systemPalette.mid
-+                                Column {
-+                                    anchors.left: parent.left
-+                                    anchors.right: parent.right
-+                                    anchors.top: parent.top
-+                                    anchors.margins: 4
-+                                    Image {
-+                                        width: parent.width - 24
-+                                        height: attachment.type === "image" ? 42 : 0
-+                                        source: attachment.type === "image" ? attachment.dataUrl : ""
-+                                        fillMode: Image.PreserveAspectFit
-+                                        MouseArea {
-+                                            anchors.fill: parent
-+                                            onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
-+                                        }
-+                                    }
-+                                    Label {
-+                                        width: parent.width
-+                                        text: attachment.name
-+                                        elide: Text.ElideMiddle
-+                                        font.pixelSize: 11
-+                                    }
-+                                    Label {
-+                                        visible: attachment.type !== "image"
-+                                        text: qsTr("File for agent tools")
-+                                        font.pixelSize: 10
-+                                        opacity: 0.65
-+                                    }
-+                                }
-+                                ToolButton {
-+                                    anchors.right: parent.right
-+                                    anchors.top: parent.top
-+                                    width: 24; height: 24
-+                                    icon.source: "qrc:/Anthracite/icons/xmark.svg"
-+                                    icon.width: 16; icon.height: 16
-+                                    icon.color: "transparent"
-+                                    enabled: !anthraciteController.busy
-+                                    Accessible.name: qsTr("Remove attachment")
-+                                    onClicked: anthraciteController.removeAttachment(modelData.index)
-+                                }
-+                                Transcript.Hint {
-+                                    hovered: attachmentHover.hovered
-+                                    text: attachment.name
-+                                }
-+                                HoverHandler { id: attachmentHover }
-+                            }
-+                        }
-+                    }
-+                }
-+
-+                Label {
-+                    Layout.fillWidth: true
-+                    visible: text.length > 0
-+                    wrapMode: Text.Wrap
-+                    text: anthraciteController.processingAttachments ? qsTr("Preparing attachments…")
-+                        : anthraciteController.picking ? qsTr("Click model geometry · Esc to cancel") : ""
-+                    font.pixelSize: 11
-+                }
-+
-+                TextArea {
-+                    id: composer
-+                    objectName: "AnthraciteComposer"
-+                    Layout.fillWidth: true
-+                    Layout.preferredHeight: Math.max(70, Math.min(140, implicitHeight))
-+                    placeholderText: qsTr("Describe what you want to make or change…")
-+                    wrapMode: TextEdit.Wrap
-+                    textFormat: TextEdit.RichText
-+                    persistentSelection: true
-+                    leftPadding: 12
-+                    rightPadding: 12
-+                    topPadding: 10
-+                    background: Rectangle {
-+                        radius: 10
-+                        color: systemPalette.alternateBase
-+                        border.width: 1
-+                        border.color: composer.activeFocus ? systemPalette.highlight : systemPalette.mid
-+                    }
-+                    enabled: !anthraciteController.submitting
-+                    // Keep the final text line above the overlaid actions.
-+                    bottomPadding: composerActions.height + 10
-+                    Row {
-+                        id: composerActions
-+                        objectName: "AnthraciteComposerActions"
-+                        anchors.right: parent.right
-+                        anchors.bottom: parent.bottom
-+                        anchors.rightMargin: 6
-+                        anchors.bottomMargin: 4
-+                        spacing: 2
-+                        z: 2
-+                        ToolButton {
-+                            width: 30; height: 30
-+                            padding: 4
-+                            objectName: "AnthraciteAttachFiles"
-+                            icon.source: "qrc:/Anthracite/icons/plus.svg"
-+                            icon.width: 18; icon.height: 18
-+                            icon.color: "transparent"
-+                            enabled: !anthraciteController.busy
-+                            Accessible.name: qsTr("Attach files")
-+                            Transcript.Hint {
-+                                hovered: parent.hovered
-+                                text: qsTr("Attach images or files (up to 8 MiB each). You can also paste images.")
-+                            }
-+                            onClicked: anthraciteController.attachFiles()
-+                        }
-+                        ToolButton {
-+                            width: 30; height: 30
-+                            padding: 4
-+                            objectName: "AnthraciteGeometryPicker"
-+                            checked: anthraciteController.picking
-+                            enabled: !anthraciteController.busy && !anthraciteController.processingAttachments
-+                            Accessible.name: qsTr("Pick CAD geometry")
-+                            Transcript.Hint {
-+                                hovered: parent.hovered
-+                                text: qsTr("Pick a face, edge, vertex or object in the model. Escape cancels.")
-+                            }
-+                            icon.source: "qrc:/Anthracite/icons/color-picker.svg"
-+                            icon.width: 22; icon.height: 22
-+                            icon.color: "transparent"
-+                            onClicked: anthraciteController.togglePicker()
-+                        }
-+                    }
-+                    Component.onCompleted: anthraciteController.bindComposer(textDocument)
-+                    onSelectionStartChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
-+                    onSelectionEndChanged: anthraciteController.setComposerSelection(selectionStart, selectionEnd)
-+
-+                    Keys.onPressed: function(event) {
-+                        if (event.matches(StandardKey.Copy) || event.matches(StandardKey.Cut)) {
-+                            anthraciteController.copyComposerSelection(event.matches(StandardKey.Cut))
-+                            event.accepted = true
-+                            return
-+                        }
-+                        if (event.matches(StandardKey.Paste)) {
-+                            if (!anthraciteController.pasteAttachments()) anthraciteController.pasteComposerText()
-+                            event.accepted = true
-+                            return
-+                        }
-+                        if ((event.modifiers & (Qt.ControlModifier | Qt.MetaModifier))
-+                                && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
-+                            send()
-+                            event.accepted = true
-+                        }
-+                    }
-+                }
-+
-+                Connections {
-+                    target: anthraciteController
-+
-+                    function onComposerCursorRequested(position) {
-+                        composer.cursorPosition = position
-+                    }
-+                }
-+
-+                RowLayout {
-+                    Layout.fillWidth: true
-+                    ToolButton {
-+                        id: agentSettingsButton
-+                        objectName: "AnthraciteAgentSettingsButton"
-+                        Layout.preferredHeight: root.compactControlHeight
-+                        topPadding: 4
-+                        bottomPadding: 4
-+                        Layout.fillWidth: true
-+                        Layout.minimumWidth: 0
-+                        text: agentSettings.summary
-+                        icon.source: "qrc:/Anthracite/icons/nav-arrow-down.svg"
-+                        icon.width: 16; icon.height: 16
-+                        icon.color: "transparent"
-+                        Accessible.name: qsTr("Choose agent, model, and reasoning: ") + agentSettings.summary
-+                        contentItem: RowLayout {
-+                            Text {
-+                                Layout.fillWidth: true
-+                                text: agentSettings.summary
-+                                color: systemPalette.windowText
-+                                elide: Text.ElideRight
-+                            }
-+                            Image {
-+                                source: "qrc:/Anthracite/icons/nav-arrow-down.svg"
-+                                sourceSize.width: 16; sourceSize.height: 16
-+                            }
-+                        }
-+                        Transcript.Hint {
-+                            hovered: parent.hovered
-+                            text: agentSettings.summary
-+                        }
-+                        onClicked: agentSettings.open()
-+                    }
-+
-+                    Button {
-+                        id: submitButton
-+                        objectName: "AnthraciteSubmitButton"
-+                        Layout.preferredHeight: root.compactControlHeight
-+                        topPadding: 4
-+                        bottomPadding: 4
-+                        Layout.preferredWidth: 112
-+                        text: anthraciteController.submitting ? qsTr("Sending…")
-+                            : anthraciteController.status === "Stopping" ? qsTr("Stopping…")
-+                            : anthraciteController.busy ? qsTr("Stop") : qsTr("Send")
-+                        highlighted: !anthraciteController.busy
-+                        enabled: !root.pendingThreadId.length && !anthraciteController.submitting
-+                            && anthraciteController.status !== "Stopping"
-+                            && (anthraciteController.busy || (!anthraciteController.processingAttachments
-+                                && (anthraciteController.draft.trim().length > 0 || anthraciteController.attachments.length > 0)))
-+                        onClicked: { if (anthraciteController.busy) anthraciteController.stop(); else send() }
-+                    }
-+                }
-+            }
-+        }
 +    }
 +
-+    function focusComposer() {
-+        if (composer.enabled) composer.forceActiveFocus()
-+    }
-+
-+    function send() {
-+        const text = anthraciteController.draft.trim()
-+        if ((text.length === 0 && anthraciteController.attachments.length === 0) || anthraciteController.busy) {
-+            return
++    Rectangle {
++        id: toast
++        objectName: "AnthraciteToast"
++        visible: anthraciteController.toastMessage.length > 0
++        anchors.horizontalCenter: parent.horizontalCenter
++        anchors.bottom: parent.bottom
++        anchors.bottomMargin: 16
++        width: Math.min(parent.width - 24, toastLabel.implicitWidth + 28)
++        height: toastLabel.implicitHeight + 16
++        radius: 8
++        color: Qt.rgba(0.06, 0.06, 0.06, 0.94)
++        border.color: systemPalette.mid
++        z: 5
++        Label {
++            id: toastLabel
++            anchors.centerIn: parent
++            width: parent.width - 24
++            text: anthraciteController.toastMessage
++            color: systemPalette.windowText
++            wrapMode: Text.WordWrap
++            horizontalAlignment: Text.AlignHCenter
 +        }
-+        timeline.pendingTurn = true
-+        anthraciteController.submit(text)
++        Timer {
++            id: toastDismiss
++            interval: 4000
++            running: toast.visible
++            onTriggered: anthraciteController.dismissToast()
++        }
 +    }
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,978 @@
+@@ -0,0 +1,416 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
 +
-+#include "AgentBridge.h"
++#include <Python.h>
 +
 +#include <QDockWidget>
 +#include <QApplication>
@@ -2635,19 +1145,11 @@
 +#include <App/Application.h>
 +#include <QClipboard>
 +#include <QQmlAbstractUrlInterceptor>
-+#include <QMimeData>
-+#include <QImageReader>
-+#include <QBuffer>
-+#include <QFileDialog>
-+#include <QSaveFile>
-+#include <QStandardPaths>
-+#include <QUuid>
++#include <QJsonDocument>
++#include <QJsonObject>
 +#include <QKeyEvent>
 +#include <QMouseEvent>
 +#include <QWheelEvent>
-+#include <QtConcurrent/QtConcurrentRun>
-+#include <QFutureWatcher>
-+#include <QTextDocument>
 +#include <QDir>
 +#include <QFileInfo>
 +#include <QFile>
@@ -2662,11 +1164,9 @@
 +
 +#include <QStringList>
 +
-+#include <algorithm>
-+#include <utility>
-+
 +#include <Gui/DockWindowManager.h>
 +#include <Base/Console.h>
++#include <Gui/Selection/Selection.h>
 +
 +
 +using namespace AnthraciteGui;
@@ -2695,49 +1195,78 @@
 +
 +namespace
 +{
-+QString formatTokens(qint64 tokens)
++QString pythonError()
 +{
-+    if (tokens >= 1'000'000) {
-+        return QStringLiteral("%1m").arg(tokens / 1'000'000.0, 0, 'f', 1);
++    if (!PyErr_Occurred()) {
++        return QStringLiteral("Unknown embedded Python error.");
 +    }
-+    if (tokens >= 1'000) {
-+        return QStringLiteral("%1k").arg(tokens / 1'000.0, 0, 'f', 1);
++
++    PyObject* type = nullptr;
++    PyObject* value = nullptr;
++    PyObject* traceback = nullptr;
++    PyErr_Fetch(&type, &value, &traceback);
++    PyErr_NormalizeException(&type, &value, &traceback);
++
++    QString result = QStringLiteral("Embedded Python error.");
++    if (value) {
++        PyObject* text = PyObject_Str(value);
++        if (text) {
++            result = QString::fromUtf8(PyUnicode_AsUTF8(text));
++            Py_DECREF(text);
++        }
 +    }
-+    return QString::number(tokens);
++
++    Py_XDECREF(type);
++    Py_XDECREF(value);
++    Py_XDECREF(traceback);
++    return result;
 +}
 +}  // namespace
 +
 +SidebarController::SidebarController(QObject* parent)
 +    : QObject(parent)
 +    , conversation(this)
-+    , currentStatus(QStringLiteral("Ready"))
 +{
-+    attachmentPool.setMaxThreadCount(1);
-+    showWelcome();
-+}
-+
-+void SidebarController::showWelcome()
-+{
-+    conversation.append(
-+        QStringLiteral("Anthracite"),
-+        QStringLiteral("Connect an existing agent and describe what you want to make in FreeCAD."),
-+        QStringLiteral("system")
-+    );
++    toastTimer.setSingleShot(true);
++    toastTimer.setInterval(4000);
++    connect(&toastTimer, &QTimer::timeout, this, [this]() {
++        if (currentToast.isEmpty()) return;
++        currentToast.clear();
++        Q_EMIT toastChanged();
++    });
++    selectionConnection = Gui::Selection().signalSelectionChanged2.connect(
++        [this](const Gui::SelectionChanges& selection) {
++            if (!pickActive || selection.Type != Gui::SelectionChanges::AddSelection) return;
++            const auto gil = PyGILState_Ensure();
++            PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
++            PyObject* result = module ? PyObject_CallMethod(module, "picked_reference_json", "sssddd",
++                selection.pDocName, selection.pObjectName, selection.pSubName,
++                double(selection.x), double(selection.y), double(selection.z)) : nullptr;
++            const char* encoded = result ? PyUnicode_AsUTF8(result) : nullptr;
++            const auto attachment = encoded ? QJsonDocument::fromJson(encoded).object() : QJsonObject();
++            const QString error = encoded ? QString() : pythonError();
++            Py_XDECREF(result);
++            Py_XDECREF(module);
++            PyGILState_Release(gil);
++            setPicking(false);
++            if (!error.isEmpty()) {
++                showToast(error);
++                return;
++            }
++            QString literal = attachment.value("inspect").toString();
++            if (literal.isEmpty()) {
++                literal = QString::fromUtf8(
++                    QJsonDocument(attachment.value("reference").toObject()).toJson(QJsonDocument::Compact)
++                );
++            }
++            QApplication::clipboard()->setText(literal);
++            showToast(tr("Copied %1").arg(attachment.value("name").toString()));
++        });
 +}
 +
 +QAbstractItemModel* SidebarController::messages()
 +{
 +    return &conversation;
-+}
-+
-+QString SidebarController::status() const
-+{
-+    return currentStatus;
-+}
-+
-+bool SidebarController::busy() const
-+{
-+    return turnBusy;
 +}
 +
 +bool SidebarController::reducedMotion() const
@@ -2751,320 +1280,7 @@
 +    return qApp->style()->styleHint(QStyle::SH_Widget_Animation_Duration) == 0;
 +}
 +
-+bool SidebarController::interactionPending() const
-+{
-+    return !pendingInteractionKind.isEmpty();
-+}
-+
-+QString SidebarController::interactionKind() const
-+{
-+    return pendingInteractionKind;
-+}
-+
-+QString SidebarController::interactionTitle() const
-+{
-+    return pendingInteractionTitle;
-+}
-+
-+QString SidebarController::interactionDetail() const
-+{
-+    return pendingInteractionDetail;
-+}
-+
-+bool SidebarController::interactionAllowSession() const
-+{
-+    return pendingAllowSession;
-+}
-+
-+QVariantList SidebarController::interactionQuestions() const
-+{
-+    return pendingQuestions;
-+}
-+
-+bool SidebarController::inputComplete() const
-+{
-+    if (pendingInteractionKind != QLatin1String("user_input") || pendingQuestions.isEmpty()) {
-+        return false;
-+    }
-+    for (const auto& value : pendingQuestions) {
-+        const QString id = value.toMap().value(QStringLiteral("id")).toString();
-+        if (id.isEmpty() || pendingAnswers.value(id).toString().trimmed().isEmpty()) {
-+            return false;
-+        }
-+    }
-+    return true;
-+}
-+
-+QVariantList SidebarController::threads() const
-+{
-+    return availableThreads;
-+}
-+
-+QString SidebarController::currentThreadId() const
-+{
-+    return activeThreadId;
-+}
-+
-+QString SidebarController::draft() const
-+{
-+    return currentDraft;
-+}
-+
-+QVariantList SidebarController::models() const
-+{
-+    return availableModels;
-+}
-+
-+QString SidebarController::selectedModel() const
-+{
-+    return currentModel;
-+}
-+
-+QVariantList SidebarController::reasoningEfforts() const
-+{
-+    return availableEfforts;
-+}
-+
-+QString SidebarController::selectedEffort() const
-+{
-+    return currentEffort;
-+}
-+
-+bool SidebarController::modelControlsAvailable() const
-+{
-+    return !availableModels.isEmpty();
-+}
-+
-+QString SidebarController::usageLabel() const
-+{
-+    return currentUsageLabel;
-+}
-+
-+QString SidebarController::usageDetail() const
-+{
-+    return currentUsageDetail;
-+}
-+
-+double SidebarController::usageFraction() const
-+{
-+    return currentUsageFraction;
-+}
-+
-+bool SidebarController::usageVisible() const
-+{
-+    return !currentUsageLabel.isEmpty();
-+}
-+
-+QVariantList SidebarController::providers() const
-+{
-+    return {
-+        QVariantMap {
-+            {QStringLiteral("id"), QStringLiteral("codex")},
-+            {QStringLiteral("name"), QStringLiteral("Codex")},
-+        },
-+        QVariantMap {
-+            {QStringLiteral("id"), QStringLiteral("opencode")},
-+            {QStringLiteral("name"), QStringLiteral("OpenCode")},
-+        },
-+    };
-+}
-+
-+QString SidebarController::selectedProvider() const
-+{
-+    return currentProvider;
-+}
-+
-+void SidebarController::submit(const QString& prompt)
-+{
-+    QString text = prompt.trimmed();
-+    for (const auto& item : currentAttachments) {
-+        const auto token = item.toMap();
-+        if (token.value("type").toString() == QLatin1String("cad") && !token.value("token").toString().isEmpty()) {
-+            text.replace(token.value("token").toString(), QStringLiteral("@[%1]").arg(token.value("name").toString()));
-+        }
-+    }
-+    if ((text.isEmpty() && currentAttachments.isEmpty()) || turnBusy || processingAttachments()) {
-+        return;
-+    }
-+
-+    clearInteraction();
-+    setPicking(false);
-+    submissionPending = true;
-+    setBusy(true);
-+    setStatus(QStringLiteral("Starting agent"));
-+    Q_EMIT promptSubmitted(text);
-+}
-+
-+void SidebarController::acceptSubmission()
-+{
-+    submissionPending = false;
-+    currentAttachments.clear();
-+    currentDraft.clear();
-+    composerTokens.clear();
-+    renderComposer();
-+    Q_EMIT attachmentsChanged();
-+    Q_EMIT draftChanged();
-+    Q_EMIT draftEdited(currentDraft);
-+    Q_EMIT busyChanged();
-+}
-+
-+void SidebarController::loadAttachments(const QVariantList& attachments)
-+{
-+    ++composerGeneration;
-+    currentAttachments = attachments;
-+    composerTokens.clear();
-+    for (auto& item : currentAttachments) {
-+        auto token = item.toMap();
-+        if (token.value("type").toString() != QLatin1String("cad")) continue;
-+        if (token.value("id").toString().isEmpty()) token.insert("id", QUuid::createUuid().toString(QUuid::WithoutBraces));
-+        if (token.value("token").toString().isEmpty()) token.insert("token", QStringLiteral("@[%1]").arg(token.value("name").toString()));
-+        composerTokens.insert(token.value("id").toString(), token);
-+        item = token;
-+    }
-+    renderComposer();
-+    Q_EMIT attachmentsChanged();
-+}
-+
-+void SidebarController::addAttachment(const QVariantMap& attachment)
-+{
-+    if (currentAttachments.size() >= 8) {
-+        appendActivity(tr("At most 8 attachments per message. Remove one first."));
-+        return;
-+    }
-+    qsizetype size = attachment.value("dataUrl").toString().size();
-+    for (const auto& item : currentAttachments) {
-+        size += item.toMap().value("dataUrl").toString().size();
-+    }
-+    if (size > 24 * 1024 * 1024) {
-+        appendActivity(tr("Images exceed the 24 MiB message limit."));
-+        return;
-+    }
-+    if (attachment.value("type").toString() == QLatin1String("cad")) {
-+        insertPick(attachment);
-+        return;
-+    }
-+    currentAttachments.append(attachment);
-+    Q_EMIT attachmentsChanged();
-+    Q_EMIT draftEdited(currentDraft);
-+}
-+
-+void SidebarController::removeAttachment(int index)
-+{
-+    if (index < 0 || index >= currentAttachments.size() || turnBusy) return;
-+    const auto removed = currentAttachments.takeAt(index).toMap();
-+    if (removed.value("type").toString() == QLatin1String("cad")) {
-+        setDraft(QString(currentDraft).replace(removed.value("token").toString(), QString()));
-+        Q_EMIT draftChanged();
-+    }
-+    Q_EMIT attachmentsChanged();
-+    Q_EMIT draftEdited(currentDraft);
-+}
-+
-+namespace {
-+QVariantMap imageAttachment(QImage image, const QString& name)
-+{
-+    if (image.isNull()) return {};
-+    if (image.width() > 2048 || image.height() > 2048) {
-+        image = image.scaled(2048, 2048, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-+    }
-+    QByteArray bytes;
-+    QBuffer buffer(&bytes);
-+    buffer.open(QIODevice::WriteOnly);
-+    if (!image.save(&buffer, "PNG")) return {};
-+    return {{"type", "image"}, {"name", name},
-+            {"dataUrl", QStringLiteral("data:image/png;base64,") + QString::fromLatin1(bytes.toBase64())}};
-+}
-+}
-+
-+bool SidebarController::pasteAttachments()
-+{
-+    if (turnBusy) return false;
-+    const auto* mime = QApplication::clipboard()->mimeData();
-+    if (mime->hasImage()) {
-+        const auto image = QApplication::clipboard()->image();
-+        prepareAttachment([image]() { return imageAttachment(image, tr("Pasted image.png")); });
-+        return true;
-+    }
-+    if (mime->hasUrls()) {
-+        bool local = false;
-+        for (const auto& url : mime->urls()) {
-+            if (url.isLocalFile()) { attachFile(url.toLocalFile()); local = true; }
-+        }
-+        return local;
-+    }
-+    return false; // Let Qt handle ordinary text paste.
-+}
-+
-+void SidebarController::attachFiles()
-+{
-+    if (turnBusy) return;
-+    for (const auto& path : QFileDialog::getOpenFileNames(QApplication::activeWindow(), tr("Attach images or files"))) {
-+        attachFile(path);
-+    }
-+}
-+
-+void SidebarController::attachFile(const QString& path)
-+{
-+    prepareAttachment([path]() -> QVariantMap {
-+    QFile file(path);
-+    const QFileInfo info(file);
-+    if (!info.isFile() || info.size() > 8 * 1024 * 1024 || !file.open(QIODevice::ReadOnly)) {
-+        return {{"error", tr("Cannot attach %1: choose a readable file up to 8 MiB.").arg(info.fileName())}};
-+    }
-+    QImageReader reader(path);
-+    if (reader.canRead()) {
-+        reader.setAutoTransform(true);
-+        if (!reader.size().isValid() || qint64(reader.size().width()) * reader.size().height() > 64 * 1024 * 1024) {
-+            return {{"error", tr("Image dimensions are too large or invalid.")}};
-+        }
-+        reader.setScaledSize(reader.size().scaled(2048, 2048, Qt::KeepAspectRatio));
-+        const auto attachment = imageAttachment(reader.read(), info.fileName());
-+        return attachment;
-+    }
-+    // Snapshot native file-dialog input so later edits to the original cannot change a sent attachment.
-+    const QString root = qEnvironmentVariable("XDG_STATE_HOME", QDir::homePath() + QStringLiteral("/.local/state"));
-+    const QString directory = QDir(root).filePath(QStringLiteral("anthracite/attachments/") + QUuid::createUuid().toString(QUuid::WithoutBraces));
-+    if (!QDir().mkpath(directory)) return {{"error", tr("Cannot create attachment directory.")}};
-+    const QString destination = QDir(directory).filePath(info.fileName());
-+    QSaveFile saved(destination);
-+    const auto bytes = file.read(8 * 1024 * 1024 + 1);
-+    if (bytes.size() > 8 * 1024 * 1024 || !saved.open(QIODevice::WriteOnly)
-+        || saved.write(bytes) != bytes.size() || !saved.commit()) {
-+        return {{"error", tr("Cannot save attachment.")}};
-+    }
-+    return {{"type", "file"}, {"name", info.fileName()}, {"path", destination}};
-+    });
-+}
-+
-+void SidebarController::prepareAttachment(std::function<QVariantMap()> read)
-+{
-+    if (turnBusy) return;
-+    setPicking(false);
-+    if (currentAttachments.size() + pendingAttachments >= 8) {
-+        appendActivity(tr("At most 8 attachments per message."));
-+        return;
-+    }
-+    ++pendingAttachments;
-+    Q_EMIT attachmentsChanged();
-+    const auto generation = composerGeneration;
-+    auto* watcher = new QFutureWatcher<QVariantMap>(this);
-+    connect(watcher, &QFutureWatcher<QVariantMap>::finished, this, [this, watcher, generation]() {
-+        --pendingAttachments;
-+        const auto result = watcher->result();
-+        watcher->deleteLater();
-+        if (generation != composerGeneration) {
-+            appendActivity(tr("Document changed while reading an attachment. Attach it again in the intended document."));
-+        } else if (result.isEmpty() || result.contains("error")) {
-+            appendActivity(result.value("error", tr("Could not decode image.")).toString());
-+        } else {
-+            addAttachment(result);
-+        }
-+        Q_EMIT attachmentsChanged();
-+    });
-+    watcher->setFuture(QtConcurrent::run(&attachmentPool, std::move(read)));
-+}
-+
-+void SidebarController::togglePicker() { if (!turnBusy && !processingAttachments()) setPicking(!pickActive); }
++void SidebarController::togglePicker() { setPicking(!pickActive); }
 +
 +void SidebarController::setPicking(bool active)
 +{
@@ -3090,389 +1306,132 @@
 +    return QObject::eventFilter(watched, event);
 +}
 +
-+void SidebarController::stop()
++void SidebarController::showToast(const QString& message)
 +{
-+    if (turnBusy) {
-+        Q_EMIT stopRequested();
-+        setStatus(QStringLiteral("Stopping"));
-+    }
++    currentToast = message;
++    toastTimer.start();
++    Q_EMIT toastChanged();
 +}
 +
-+void SidebarController::chooseProvider()
++void SidebarController::dismissToast()
 +{
-+    Q_EMIT chooseProviderRequested();
++    toastTimer.stop();
++    if (currentToast.isEmpty()) return;
++    currentToast.clear();
++    Q_EMIT toastChanged();
 +}
 +
-+void SidebarController::selectProvider(const QString& provider)
++QString SidebarController::operationObservation(const QVariantMap& operation) const
 +{
-+    if ((provider != QLatin1String("codex") && provider != QLatin1String("opencode"))
-+        || provider == currentProvider) {
-+        return;
++    QStringList parts;
++    const QString stdoutText = operation.value("stdout").toString().trimmed();
++    if (!stdoutText.isEmpty()) parts.append(stdoutText);
++    const QString stderrText = operation.value("stderr").toString().trimmed();
++    if (!stderrText.isEmpty()) parts.append(stderrText);
++    const QVariant error = operation.value("error");
++    if (error.isValid() && !error.isNull()) {
++        const QString message = error.toMap().value("message").toString();
++        parts.append(message.isEmpty() ? error.toString() : message);
 +    }
-+    currentProvider = provider;
-+    Q_EMIT providerChanged();
-+    Q_EMIT providerSelected(provider);
++    if (operation.value("conflict").toBool()) {
++        parts.append(tr("Document changed; inspect before editing."));
++    }
++    if (operation.value("requiresInspection").toBool()) {
++        parts.append(tr("Result requires inspection before trusting it."));
++    }
++    return parts.join(QStringLiteral("\n\n"));
 +}
 +
-+void SidebarController::newThread()
++void SidebarController::pushOperation(const QVariantMap& operation, const QVariantList& images)
 +{
-+    if (!turnBusy && !processingAttachments()) {
-+        Q_EMIT newThreadRequested();
-+    }
-+}
++    const QString id = operation.value("id").toString();
++    if (id.isEmpty()) return;
 +
-+void SidebarController::selectThread(const QString& threadId)
-+{
-+    if (!turnBusy && !processingAttachments() && !threadId.isEmpty() && threadId != activeThreadId) {
-+        Q_EMIT threadSelected(threadId);
++    const QString status = operation.value("status").toString();
++    const QString label = operation.value("label").toString();
++    const QString document = operation.value("document").toString();
++    QString summary = status.isEmpty() ? tr("Operation") : status;
++    if (!label.isEmpty()) summary += QStringLiteral(" · ") + label;
++    if (!document.isEmpty()) summary += QStringLiteral(" · ") + document;
++    const QVariant revisionBefore = operation.value("revisionBefore");
++    const QVariant revisionAfter = operation.value("revisionAfter");
++    if (!revisionBefore.isNull() || !revisionAfter.isNull()) {
++        summary += QStringLiteral(" · r%1→r%2").arg(revisionBefore.toInt()).arg(revisionAfter.toInt());
 +    }
-+}
++    const int duration = operation.value("durationMs").toInt();
++    if (duration > 0) summary += QStringLiteral(" · %1 ms").arg(duration);
 +
-+void SidebarController::setDraft(const QString& body)
-+{
-+    if (currentDraft == body) {
-+        return;
++    QVariantList entries;
++    const QString code = operation.value("code").toString();
++    if (!code.trimmed().isEmpty()) {
++        entries.append(QVariantMap {
++            {QStringLiteral("kind"), QStringLiteral("text")},
++            {QStringLiteral("title"), tr("Code")},
++            {QStringLiteral("content"), code},
++        });
 +    }
-+    currentDraft = body;
-+    renderComposer();
-+    readComposer();
-+    Q_EMIT draftChanged();
-+    Q_EMIT draftEdited(currentDraft);
-+}
++    const QString observation = operationObservation(operation);
++    if (!observation.isEmpty()) {
++        entries.append(QVariantMap {
++            {QStringLiteral("kind"), QStringLiteral("text")},
++            {QStringLiteral("title"), tr("Observation")},
++            {QStringLiteral("content"), observation},
++        });
++    }
++    for (const auto& image : images) {
++        const QString dataUrl = image.toString();
++        if (dataUrl.isEmpty()) continue;
++        entries.append(QVariantMap {
++            {QStringLiteral("kind"), QStringLiteral("image")},
++            {QStringLiteral("title"), tr("After")},
++            {QStringLiteral("body"), dataUrl},
++        });
++    }
 +
-+void SidebarController::selectModel(const QString& model)
-+{
-+    if (model != currentModel) {
-+        applyModelSelection(model, QString(), true);
-+    }
-+}
-+
-+void SidebarController::selectEffort(const QString& effort)
-+{
-+    if (effort != currentEffort) {
-+        applyModelSelection(currentModel, effort, true);
-+    }
-+}
-+
-+void SidebarController::respondToApproval(const QString& decision)
-+{
-+    if (pendingInteractionKind != QLatin1String("approval") || pendingRequestId.isEmpty()) {
-+        return;
-+    }
-+    const QString requestId = pendingRequestId;
-+    appendActivity(
-+        decision.startsWith(QLatin1String("approve")) ? tr("Approved provider request")
-+                                                      : tr("Declined provider request")
-+    );
-+    clearInteraction();
-+    setStatus(QStringLiteral("Thinking"));
-+    Q_EMIT approvalResponded(requestId, decision);
-+}
-+
-+void SidebarController::setInputAnswer(const QString& questionId, const QString& answer)
-+{
-+    if (pendingInteractionKind != QLatin1String("user_input") || questionId.isEmpty()) {
-+        return;
-+    }
-+    const QString text = answer.trimmed();
-+    if (text.isEmpty()) {
-+        pendingAnswers.remove(questionId);
++    const QVariantMap row {
++        {QStringLiteral("id"), id},
++        {QStringLiteral("author"), summary},
++        {QStringLiteral("body"), QString()},
++        {QStringLiteral("kind"), QStringLiteral("work")},
++        {QStringLiteral("title"), summary},
++        {QStringLiteral("entries"), entries},
++        {QStringLiteral("entryCount"), entries.size()},
++    };
++    if (conversation.indexOfId(id) >= 0) {
++        conversation.apply({{QStringLiteral("op"), QStringLiteral("update")}, {QStringLiteral("row"), row}});
 +    }
 +    else {
-+        pendingAnswers.insert(questionId, text);
++        conversation.apply({{QStringLiteral("op"), QStringLiteral("append")}, {QStringLiteral("row"), row}});
 +    }
-+    Q_EMIT interactionChanged();
 +}
 +
-+QString SidebarController::inputAnswer(const QString& questionId) const
++void SidebarController::applyBridgeStatus(const QVariantMap& status)
 +{
-+    return pendingAnswers.value(questionId).toString();
++    bridgeRunningValue = status.value(QStringLiteral("running")).toBool();
++    bridgePortValue = QString::number(status.value(QStringLiteral("port")).toInt());
++    bridgeClientsValue = status.value(QStringLiteral("clients")).toInt();
++    bridgeDocumentValue = status.value(QStringLiteral("document")).toString();
++    bridgeRevisionValue = status.value(QStringLiteral("revision")).toInt();
++    bridgeConfigValue = status.value(QStringLiteral("mcpConfig")).toString();
++    bridgeCommandValue = status.value(QStringLiteral("mcpCommand")).toString();
++    Q_EMIT bridgeStatusChanged();
 +}
 +
-+void SidebarController::submitInputAnswers()
++void SidebarController::copyBridgeConfig()
 +{
-+    if (!inputComplete() || pendingRequestId.isEmpty()) {
-+        return;
-+    }
-+    const QString requestId = pendingRequestId;
-+    const QVariantMap answers = pendingAnswers;
-+    appendActivity(tr("Answered provider question"));
-+    clearInteraction();
-+    setStatus(QStringLiteral("Thinking"));
-+    Q_EMIT userInputResponded(requestId, answers);
-+}
-+
-+void SidebarController::appendActivity(const QString& text)
-+{
-+    conversation.append(QStringLiteral("Activity"), text, QStringLiteral("activity"));
-+}
-+
-+void SidebarController::resetHistory()
-+{
-+    conversation.clear();
++    if (bridgeConfigValue.isEmpty()) return;
++    QApplication::clipboard()->setText(bridgeConfigValue);
++    showToast(tr("MCP configuration copied"));
 +}
 +
 +void SidebarController::applyTimelineEdit(const QVariantMap& edit)
 +{
 +    conversation.apply(edit);
-+    if (edit.value("op").toString() == QLatin1String("reset") && conversation.rowCount() == 0) {
-+        showWelcome();
-+    }
-+}
-+
-+void SidebarController::showApproval(
-+    const QString& requestId,
-+    const QString& title,
-+    const QString& detail,
-+    bool allowSession
-+)
-+{
-+    clearInteraction();
-+    pendingRequestId = requestId;
-+    pendingInteractionKind = QStringLiteral("approval");
-+    pendingInteractionTitle = title;
-+    pendingInteractionDetail = detail;
-+    pendingAllowSession = allowSession;
-+    setStatus(QStringLiteral("Approval needed"));
-+    Q_EMIT interactionChanged();
-+}
-+
-+void SidebarController::showUserInput(const QString& requestId, const QVariantList& questions)
-+{
-+    clearInteraction();
-+    pendingRequestId = requestId;
-+    pendingInteractionKind = QStringLiteral("user_input");
-+    pendingInteractionTitle = tr("Input needed");
-+    pendingQuestions = questions;
-+    setStatus(QStringLiteral("Input needed"));
-+    Q_EMIT interactionChanged();
-+}
-+
-+void SidebarController::clearInteraction()
-+{
-+    if (!interactionPending() && pendingRequestId.isEmpty()) {
-+        return;
-+    }
-+    pendingRequestId.clear();
-+    pendingInteractionKind.clear();
-+    pendingInteractionTitle.clear();
-+    pendingInteractionDetail.clear();
-+    pendingQuestions.clear();
-+    pendingAnswers.clear();
-+    pendingAllowSession = false;
-+    Q_EMIT interactionChanged();
-+}
-+
-+void SidebarController::restoreProvider(const QString& provider)
-+{
-+    const QString normalized = provider == QLatin1String("opencode") ? provider
-+                                                                     : QStringLiteral("codex");
-+    if (currentProvider != normalized) {
-+        currentProvider = normalized;
-+        Q_EMIT providerChanged();
-+    }
-+}
-+
-+void SidebarController::completeTurn()
-+{
-+    clearInteraction();
-+    setBusy(false);
-+    setStatus(QStringLiteral("Ready"));
-+}
-+
-+void SidebarController::failTurn(const QString& error, bool appendMessage)
-+{
-+    clearInteraction();
-+    if (appendMessage) {
-+        conversation.append(QStringLiteral("Error"), error, QStringLiteral("error"));
-+    }
-+    setBusy(false);
-+    setStatus(QStringLiteral("Error"));
-+}
-+
-+void SidebarController::updateStatus(const QString& status)
-+{
-+    setStatus(status);
-+}
-+
-+void SidebarController::updateThreads(const QString& currentThreadId, const QVariantList& threads)
-+{
-+    activeThreadId = currentThreadId;
-+    availableThreads = threads;
-+    Q_EMIT threadsChanged();
-+}
-+
-+void SidebarController::loadDraft(const QString& body)
-+{
-+    if (currentDraft == body) {
-+        return;
-+    }
-+    currentDraft = body;
-+    renderComposer();
-+    Q_EMIT draftChanged();
-+}
-+
-+void SidebarController::updateModelCatalog(const QVariantList& models)
-+{
-+    availableModels = models;
-+    applyModelSelection(currentModel, currentEffort, false);
-+}
-+
-+void SidebarController::restoreModelSelection(const QString& model, const QString& effort)
-+{
-+    applyModelSelection(model, effort, false);
-+}
-+
-+void SidebarController::updateUsage(const QVariantMap& usage)
-+{
-+    const qint64 used = usage.value(QStringLiteral("usedTokens")).toLongLong();
-+    const qint64 maximum = usage.value(QStringLiteral("maxTokens")).toLongLong();
-+    const qint64 processed = usage.value(QStringLiteral("totalProcessedTokens")).toLongLong();
-+    if (used <= 0) {
-+        clearUsage();
-+        return;
-+    }
-+
-+    currentUsageLabel = maximum > 0 ? tr("%1 / %2").arg(formatTokens(used), formatTokens(maximum))
-+                                    : tr("%1 tokens").arg(formatTokens(used));
-+    currentUsageDetail = maximum > 0
-+        ? tr("Context window: %1 of %2 tokens").arg(formatTokens(used), formatTokens(maximum))
-+        : tr("Context window: %1 tokens").arg(formatTokens(used));
-+    if (processed > used) {
-+        currentUsageDetail += tr("; %1 processed in this conversation").arg(formatTokens(processed));
-+    }
-+    currentUsageFraction = maximum > 0
-+        ? std::clamp(static_cast<double>(used) / static_cast<double>(maximum), 0.0, 1.0)
-+        : 0.0;
-+    Q_EMIT usageChanged();
-+}
-+
-+void SidebarController::clearUsage()
-+{
-+    if (currentUsageLabel.isEmpty()) {
-+        return;
-+    }
-+    currentUsageLabel.clear();
-+    currentUsageDetail.clear();
-+    currentUsageFraction = 0.0;
-+    Q_EMIT usageChanged();
-+}
-+
-+void SidebarController::documentContextChanged()
-+{
-+    setPicking(false);
-+    loadAttachments({});
-+    clearInteraction();
-+    setBusy(false);
-+    resetHistory();
-+    showWelcome();
-+    updateThreads(QString(), {});
-+    loadDraft(QString());
-+    availableModels.clear();
-+    currentModel.clear();
-+    currentEffort.clear();
-+    availableEfforts.clear();
-+    Q_EMIT modelsChanged();
-+    clearUsage();
-+    setStatus(QStringLiteral("Connecting"));
-+}
-+
-+void SidebarController::applyModelSelection(
-+    const QString& requestedModel,
-+    const QString& requestedEffort,
-+    bool edited
-+)
-+{
-+    if (availableModels.isEmpty()) {
-+        const bool changed = currentModel != requestedModel || currentEffort != requestedEffort
-+            || !availableEfforts.isEmpty();
-+        currentModel = requestedModel;
-+        currentEffort = requestedEffort;
-+        availableEfforts.clear();
-+        if (changed) {
-+            Q_EMIT modelsChanged();
-+        }
-+        if (edited) {
-+            Q_EMIT modelSelectionEdited(currentModel, currentEffort);
-+        }
-+        return;
-+    }
-+
-+    QString model = requestedModel;
-+    QVariantMap modelData;
-+    for (const auto& value : availableModels) {
-+        const QVariantMap candidate = value.toMap();
-+        if (candidate.value(QStringLiteral("model")).toString() == model) {
-+            modelData = candidate;
-+            break;
-+        }
-+    }
-+    if (modelData.isEmpty() && !availableModels.isEmpty()) {
-+        for (const auto& value : availableModels) {
-+            const QVariantMap candidate = value.toMap();
-+            if (candidate.value(QStringLiteral("isDefault")).toBool()) {
-+                modelData = candidate;
-+                break;
-+            }
-+        }
-+        if (modelData.isEmpty()) {
-+            modelData = availableModels.constFirst().toMap();
-+        }
-+        model = modelData.value(QStringLiteral("model")).toString();
-+    }
-+
-+    QVariantList efforts = modelData.value(QStringLiteral("efforts")).toList();
-+    QString effort = requestedEffort;
-+    bool effortSupported = false;
-+    for (const auto& value : efforts) {
-+        if (value.toMap().value(QStringLiteral("id")).toString() == effort) {
-+            effortSupported = true;
-+            break;
-+        }
-+    }
-+    if (!effortSupported) {
-+        effort = modelData.value(QStringLiteral("defaultEffort")).toString();
-+        if (effort.isEmpty() && !efforts.isEmpty()) {
-+            effort = efforts.constFirst().toMap().value(QStringLiteral("id")).toString();
-+        }
-+    }
-+
-+    const bool changed = model != currentModel || effort != currentEffort
-+        || efforts != availableEfforts;
-+    currentModel = model;
-+    currentEffort = effort;
-+    availableEfforts = efforts;
-+    if (changed) {
-+        Q_EMIT modelsChanged();
-+    }
-+    if (edited) {
-+        Q_EMIT modelSelectionEdited(currentModel, currentEffort);
-+    }
-+}
-+
-+void SidebarController::setStatus(QString status)
-+{
-+    if (currentStatus == status) {
-+        return;
-+    }
-+    currentStatus = std::move(status);
-+    Q_EMIT statusChanged();
-+}
-+
-+void SidebarController::setBusy(bool busy)
-+{
-+    if (!busy) submissionPending = false;
-+    if (turnBusy == busy) {
-+        return;
-+    }
-+    turnBusy = busy;
-+    Q_EMIT busyChanged();
 +}
 +
 +Sidebar::Sidebar(QWidget* parent)
 +    : QWidget(parent)
 +    , sidebarController(this)
-+    , agentBridge(new AgentBridge(&sidebarController, this))
 +    , quickView(nullptr)
 +{
 +    setWindowTitle(tr("Anthracite"));
@@ -3481,15 +1440,6 @@
 +    auto* layout = new QVBoxLayout(this);
 +    layout->setContentsMargins(0, 0, 0, 0);
 +    reloadUi();
-+    connect(&sidebarController, &SidebarController::pickingChanged, this, [this]() {
-+        if (sidebarController.picking() || !quickView || !quickView->isVisible()) return;
-+        // Selection is emitted inside the viewport's mouse handler. Wait for it
-+        // to finish, then transfer native keyboard focus as well as QML focus.
-+        quickView->window()->activateWindow();
-+        quickView->setFocus(Qt::OtherFocusReason);
-+        if (auto* root = quickView->rootObject())
-+            QMetaObject::invokeMethod(root, "focusComposer");
-+    }, Qt::QueuedConnection);
 +}
 +
 +bool Sidebar::eventFilter(QObject* watched, QEvent* event)
@@ -3565,8 +1515,6 @@
 +{
 +    delete quickView;
 +    quickView = nullptr;
-+    delete agentBridge;
-+    agentBridge = nullptr;
 +}
 +
 +SidebarController* Sidebar::controller()
@@ -3603,214 +1551,89 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,108 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
 +#define ANTHRACITEGUI_SIDEBAR_H
 +
-+#include <QPointer>
++#include <QObject>
 +#include <QString>
++#include <QTimer>
 +#include <QVariantList>
 +#include <QVariantMap>
 +#include <QWidget>
-+#include <functional>
-+#include <QThreadPool>
++
++#include <boost/signals2/connection.hpp>
 +
 +#include "ConversationModel.h"
 +
 +class QQuickWidget;
-+class QTextDocument;
-+class QTextCursor;
 +
 +namespace AnthraciteGui
 +{
-+class AgentBridge;
-+
 +class SidebarController: public QObject
 +{
 +    Q_OBJECT
 +    Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
-+    Q_PROPERTY(QString status READ status NOTIFY statusChanged)
-+    Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
-+    Q_PROPERTY(bool submitting READ submitting NOTIFY busyChanged)
-+    Q_PROPERTY(bool interactionPending READ interactionPending NOTIFY interactionChanged)
-+    Q_PROPERTY(QString interactionKind READ interactionKind NOTIFY interactionChanged)
-+    Q_PROPERTY(QString interactionTitle READ interactionTitle NOTIFY interactionChanged)
-+    Q_PROPERTY(QString interactionDetail READ interactionDetail NOTIFY interactionChanged)
-+    Q_PROPERTY(bool interactionAllowSession READ interactionAllowSession NOTIFY interactionChanged)
-+    Q_PROPERTY(QVariantList interactionQuestions READ interactionQuestions NOTIFY interactionChanged)
-+    Q_PROPERTY(bool inputComplete READ inputComplete NOTIFY interactionChanged)
-+    Q_PROPERTY(QVariantList threads READ threads NOTIFY threadsChanged)
-+    Q_PROPERTY(QString currentThreadId READ currentThreadId NOTIFY threadsChanged)
-+    Q_PROPERTY(QString draft READ draft NOTIFY draftChanged)
-+    Q_PROPERTY(QVariantList attachments READ attachments NOTIFY attachmentsChanged)
 +    Q_PROPERTY(bool picking READ picking NOTIFY pickingChanged)
-+    Q_PROPERTY(bool processingAttachments READ processingAttachments NOTIFY attachmentsChanged)
-+    Q_PROPERTY(QVariantList models READ models NOTIFY modelsChanged)
-+    Q_PROPERTY(QString selectedModel READ selectedModel NOTIFY modelsChanged)
-+    Q_PROPERTY(QVariantList reasoningEfforts READ reasoningEfforts NOTIFY modelsChanged)
-+    Q_PROPERTY(QString selectedEffort READ selectedEffort NOTIFY modelsChanged)
-+    Q_PROPERTY(bool modelControlsAvailable READ modelControlsAvailable NOTIFY modelsChanged)
-+    Q_PROPERTY(QString usageLabel READ usageLabel NOTIFY usageChanged)
-+    Q_PROPERTY(QString usageDetail READ usageDetail NOTIFY usageChanged)
-+    Q_PROPERTY(double usageFraction READ usageFraction NOTIFY usageChanged)
-+    Q_PROPERTY(bool usageVisible READ usageVisible NOTIFY usageChanged)
-+    Q_PROPERTY(QVariantList providers READ providers CONSTANT)
-+    Q_PROPERTY(QString selectedProvider READ selectedProvider NOTIFY providerChanged)
++    Q_PROPERTY(bool bridgeRunning READ bridgeRunning NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(QString bridgePort READ bridgePort NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(int bridgeClients READ bridgeClients NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(QString bridgeDocument READ bridgeDocument NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(int bridgeRevision READ bridgeRevision NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(QString bridgeConfig READ bridgeConfig NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(QString bridgeCommand READ bridgeCommand NOTIFY bridgeStatusChanged)
++    Q_PROPERTY(QString toastMessage READ toastMessage NOTIFY toastChanged)
 +
 +public:
 +    explicit SidebarController(QObject* parent = nullptr);
 +
 +    QAbstractItemModel* messages();
-+    QString status() const;
-+    bool busy() const;
-+    bool submitting() const { return submissionPending; }
-+    bool interactionPending() const;
-+    QString interactionKind() const;
-+    QString interactionTitle() const;
-+    QString interactionDetail() const;
-+    bool interactionAllowSession() const;
-+    QVariantList interactionQuestions() const;
-+    bool inputComplete() const;
-+    QVariantList threads() const;
-+    QString currentThreadId() const;
-+    QString draft() const;
-+    QVariantList attachments() const { return currentAttachments; }
 +    bool picking() const { return pickActive; }
-+    bool processingAttachments() const { return pendingAttachments > 0; }
++    bool bridgeRunning() const { return bridgeRunningValue; }
++    QString bridgePort() const { return bridgePortValue; }
++    int bridgeClients() const { return bridgeClientsValue; }
++    QString bridgeDocument() const { return bridgeDocumentValue; }
++    int bridgeRevision() const { return bridgeRevisionValue; }
++    QString bridgeConfig() const { return bridgeConfigValue; }
++    QString bridgeCommand() const { return bridgeCommandValue; }
++    QString toastMessage() const { return currentToast; }
++
 +    Q_INVOKABLE bool reducedMotion() const;
-+    Q_INVOKABLE bool pasteAttachments();
-+    Q_INVOKABLE void attachFiles();
-+    Q_INVOKABLE void attachFile(const QString& path);
-+    Q_INVOKABLE void removeAttachment(int index);
-+    Q_INVOKABLE void bindComposer(QObject* quickDocument);
-+    Q_INVOKABLE void setComposerSelection(int start, int end);
-+    Q_INVOKABLE void copyComposerSelection(bool cut);
-+    Q_INVOKABLE void pasteComposerText();
 +    Q_INVOKABLE void togglePicker();
 +    void setPicking(bool active);
-+    void addAttachment(const QVariantMap& attachment);
-+    void loadAttachments(const QVariantList& attachments);
-+    void acceptSubmission();
-+    QVariantList models() const;
-+    QString selectedModel() const;
-+    QVariantList reasoningEfforts() const;
-+    QString selectedEffort() const;
-+    bool modelControlsAvailable() const;
-+    QString usageLabel() const;
-+    QString usageDetail() const;
-+    double usageFraction() const;
-+    bool usageVisible() const;
-+    QVariantList providers() const;
-+    QString selectedProvider() const;
 +
-+    Q_INVOKABLE void submit(const QString& prompt);
-+    Q_INVOKABLE void stop();
-+    Q_INVOKABLE void chooseProvider();
-+    Q_INVOKABLE void selectProvider(const QString& provider);
-+    Q_INVOKABLE void newThread();
-+    Q_INVOKABLE void selectThread(const QString& threadId);
-+    Q_INVOKABLE void setDraft(const QString& body);
-+    Q_INVOKABLE void selectModel(const QString& model);
-+    Q_INVOKABLE void selectEffort(const QString& effort);
-+    Q_INVOKABLE void respondToApproval(const QString& decision);
-+    Q_INVOKABLE void setInputAnswer(const QString& questionId, const QString& answer);
-+    Q_INVOKABLE QString inputAnswer(const QString& questionId) const;
-+    Q_INVOKABLE void submitInputAnswers();
-+
-+    void appendActivity(const QString& text);
-+    void resetHistory();
-+    void showWelcome();
++    void pushOperation(const QVariantMap& operation, const QVariantList& images = {});
++    void applyBridgeStatus(const QVariantMap& status);
++    Q_INVOKABLE void copyBridgeConfig();
++    Q_INVOKABLE void dismissToast();
 +    void applyTimelineEdit(const QVariantMap& edit);
-+    void showApproval(
-+        const QString& requestId,
-+        const QString& title,
-+        const QString& detail,
-+        bool allowSession
-+    );
-+    void showUserInput(const QString& requestId, const QVariantList& questions);
-+    void clearInteraction();
-+    void completeTurn();
-+    void failTurn(const QString& error, bool appendMessage = true);
-+    void updateStatus(const QString& status);
-+    void updateThreads(const QString& currentThreadId, const QVariantList& threads);
-+    void loadDraft(const QString& body);
-+    void updateModelCatalog(const QVariantList& models);
-+    void restoreModelSelection(const QString& model, const QString& effort);
-+    void updateUsage(const QVariantMap& usage);
-+    void clearUsage();
-+    void documentContextChanged();
-+    void restoreProvider(const QString& provider);
 +
 +Q_SIGNALS:
-+    void promptSubmitted(const QString& prompt);
-+    void stopRequested();
-+    void chooseProviderRequested();
-+    void providerSelected(const QString& provider);
-+    void newThreadRequested();
-+    void threadSelected(const QString& threadId);
-+    void draftEdited(const QString& body);
-+    void modelSelectionEdited(const QString& model, const QString& effort);
-+    void approvalResponded(const QString& requestId, const QString& decision);
-+    void userInputResponded(const QString& requestId, const QVariantMap& answers);
-+    void statusChanged();
-+    void busyChanged();
-+    void interactionChanged();
-+    void threadsChanged();
-+    void draftChanged();
-+    void attachmentsChanged();
 +    void pickingChanged();
-+    void composerCursorRequested(int position);
-+    void modelsChanged();
-+    void usageChanged();
-+    void providerChanged();
++    void bridgeStatusChanged();
++    void toastChanged();
 +
 +private:
 +    bool eventFilter(QObject* watched, QEvent* event) override;
-+    void prepareAttachment(std::function<QVariantMap()> read);
-+    void renderComposer();
-+    void readComposer();
-+    void insertComposerText(QTextCursor& cursor, const QString& text);
-+    void insertComposerToken(QTextCursor& cursor, const QVariantMap& token);
-+    QString composerPlainText(QTextDocument* document) const;
-+    void insertPick(QVariantMap attachment);
-+    void setStatus(QString status);
-+    void setBusy(bool busy);
-+    void applyModelSelection(const QString& model, const QString& effort, bool edited);
++    void showToast(const QString& message);
++    QString operationObservation(const QVariantMap& operation) const;
 +
 +    ConversationModel conversation;
-+    QString currentStatus;
-+    QString pendingRequestId;
-+    QString pendingInteractionKind;
-+    QString pendingInteractionTitle;
-+    QString pendingInteractionDetail;
-+    QVariantList pendingQuestions;
-+    QVariantMap pendingAnswers;
-+    QVariantList availableThreads;
-+    QString activeThreadId;
-+    QString currentDraft;
-+    QPointer<QTextDocument> composerDocument;
-+    QHash<QString, QVariantMap> composerTokens;
-+    bool updatingComposer = false;
-+    int composerSelectionStart = 0;
-+    int composerSelectionEnd = 0;
-+    QVariantList currentAttachments;
 +    bool pickActive = false;
-+    int pendingAttachments = 0;
-+    unsigned composerGeneration = 0;
-+    QThreadPool attachmentPool;
-+    QVariantList availableModels;
-+    QVariantList availableEfforts;
-+    QString currentModel;
-+    QString currentEffort;
-+    QString currentUsageLabel;
-+    QString currentUsageDetail;
-+    double currentUsageFraction = 0.0;
-+    bool pendingAllowSession = false;
-+    bool turnBusy = false;
-+    bool submissionPending = false;
-+    QString currentProvider = QStringLiteral("codex");
++
++    bool bridgeRunningValue = false;
++    QString bridgePortValue;
++    int bridgeClientsValue = 0;
++    QString bridgeDocumentValue;
++    int bridgeRevisionValue = 0;
++    QString bridgeConfigValue;
++    QString bridgeCommandValue;
++
++    QString currentToast;
++    QTimer toastTimer;
++    boost::signals2::scoped_connection selectionConnection;
 +};
 +
 +class Sidebar: public QWidget
@@ -3828,7 +1651,6 @@
 +
 +private:
 +    SidebarController sidebarController;
-+    AgentBridge* agentBridge;
 +    QQuickWidget* quickView;
 +};
 +
@@ -3840,7 +1662,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,1031 @@
+@@ -0,0 +1,733 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -3858,184 +1680,6 @@
 +
 +import AnthraciteExecutor
 +import AnthraciteGui  # noqa: F401 - importing registers the dock window
-+
-+
-+def run_agent_settings_test(quick_widget, root, dock):
-+    preferences = App.ParamGet('User parameter:BaseApp/Preferences/Mod/Anthracite')
-+    original_motion = preferences.GetBool('ReduceMotion', False)
-+    preferences.SetBool('ReduceMotion', True)
-+    root.refreshMotion()
-+    assert root.property('reducedMotion')
-+    settings = root.findChild(QtCore.QObject, 'AnthraciteAgentSettings')
-+    assert settings is not None
-+    original_width = root.property('width')
-+    original_min_width, original_max_width = quick_widget.minimumWidth(), quick_widget.maximumWidth()
-+
-+    def evaluate(source):
-+        expression = QtQml.QQmlExpression(quick_widget.rootContext(), settings, source)
-+        result = expression.evaluate()
-+        assert not expression.hasError(), expression.error().toString()
-+        return result
-+
-+    # Exercise the real QML component with a deterministic catalog, without
-+    # connecting a provider or changing the user's thread/model preferences.
-+    fixture = '''import QtQml 2.15
-+        QtObject {
-+            property bool busy: false
-+            property bool processingAttachments: false
-+            property bool modelControlsAvailable: models.length > 0
-+            property var providers: [{id: "codex", name: "Codex"}, {id: "opencode", name: "OpenCode"}]
-+            property var models: [{model: "a", name: "Model A"}, {model: "b", name: "Model B"}]
-+            property var reasoningEfforts: [{id: "low", label: "Low"}, {id: "high", label: "High"}]
-+            property string selectedProvider: "codex"
-+            property string selectedModel: "a"
-+            property string selectedEffort: "low"
-+            function selectProvider(id) { selectedProvider = id; models = []; reasoningEfforts = []; selectedModel = ""; selectedEffort = "" }
-+            function selectModel(id) { selectedModel = id; reasoningEfforts = [{id: "high", label: "High"}]; selectedEffort = "high" }
-+            function selectEffort(id) { selectedEffort = id }
-+        }'''
-+    evaluate('controller = Qt.createQmlObject(' + json.dumps(fixture) + ', this, "AgentSettingsFixture")')
-+    fixture_controller = settings.property('controller')
-+    try:
-+        dock.show()
-+        Gui.getMainWindow().activateWindow()
-+        QtWidgets.QApplication.setActiveWindow(Gui.getMainWindow())
-+        quick_widget.setFocus()
-+        quick_widget.setFixedWidth(320)
-+        button = root.findChild(QtCore.QObject, 'AnthraciteAgentSettingsButton')
-+        QtTest.QTest.qWait(100)
-+        latencies = []
-+        frames = []
-+        def rendered():
-+            frames.append(time.monotonic())
-+        window = quick_widget.quickWindow()
-+        window.afterRendering.connect(rendered)
-+        try:
-+            point = button.mapToScene(QtCore.QPointF(button.width() / 2, button.height() / 2)).toPoint()
-+            for _ in range(5):
-+                frames.clear()
-+                pressed_at = time.monotonic()
-+                QtTest.QTest.mousePress(quick_widget, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
-+                assert button.property('down'), 'Pressed state did not acknowledge input synchronously'
-+                QtTest.QTest.qWait(100)
-+                assert frames, 'Pressed control did not produce a rendered frame'
-+                latencies.append((frames[0] - pressed_at) * 1000)
-+                QtTest.QTest.mouseRelease(quick_widget, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, point)
-+                assert settings.property('visible'), 'Popup did not acknowledge release'
-+                evaluate('close()')
-+                QtTest.QTest.qWait(120)
-+        finally:
-+            window.afterRendering.disconnect(rendered)
-+        report = {'measurement': 'input to next QQuickWidget rendered frame, not display scanout',
-+                  'samples_ms': latencies, 'p50_ms': sorted(latencies)[len(latencies) // 2],
-+                  'max_ms': max(latencies), 'target_ms': 100}
-+        path = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/interaction-latency.json'
-+        path.write_text(json.dumps(report, indent=2))
-+        assert max(latencies) < 100, report
-+        QtCore.QMetaObject.invokeMethod(button, 'clicked')
-+        QtTest.QTest.qWait(100)
-+        assert settings.property('visible')
-+        assert settings.property('width') <= 320
-+        capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/agent-settings-main.png'
-+        assert quick_widget.grab().save(str(capture))
-+        choices = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoices')
-+        row = settings.findChild(QtCore.QObject, 'AnthraciteEffortRow')
-+        QtCore.QMetaObject.invokeMethod(row, 'clicked')
-+        QtTest.QTest.qWait(100)
-+        assert choices.property('visible') and settings.property('visible'), 'Choices must overlay the settings popup'
-+        assert choices.property('section') == 'effort'
-+        capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/agent-settings.png'
-+        assert quick_widget.grab().save(str(capture))
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Down)
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Return)
-+        QtTest.QTest.qWait(100)
-+        assert fixture_controller.property('selectedEffort') == 'high'
-+        assert not choices.property('visible') and settings.property('visible')
-+        evaluate('openSection("model")')
-+        QtTest.QTest.qWait(50)
-+        evaluate('selectChoice(1)')
-+        assert fixture_controller.property('selectedModel') == 'b'
-+        assert 'Model B' in settings.property('summary')
-+        evaluate('openSection("effort")')
-+        QtTest.QTest.qWait(50)
-+        options = choices.property('options')
-+        options = options.toVariant() if hasattr(options, 'toVariant') else options
-+        assert len(options) == 1, 'Efforts must follow the selected model'
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(100)
-+        assert not choices.property('visible') and settings.property('visible'), 'Escape must dismiss only the top sheet'
-+        evaluate('controller.models = Array.from({length: 50}, (_, i) => ({model: "m" + i, name: "Model " + i})); controller.selectedModel = "m49"')
-+        evaluate('openSection("model")')
-+        QtTest.QTest.qWait(100)
-+        choice_list = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoiceList')
-+        assert choice_list.property('count') == 50
-+        assert choice_list.property('currentIndex') == 49
-+        assert choice_list.property('contentY') > 0, 'Long catalogs must scroll to the selected model'
-+        assert choices.property('height') <= 360
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(100)
-+        fixture_controller.setProperty('processingAttachments', True)
-+        evaluate('openSection("agent")')
-+        assert choices.property('visible'), 'Attachment preparation must not lock settings'
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(100)
-+        fixture_controller.setProperty('processingAttachments', False)
-+        fixture_controller.setProperty('busy', True)
-+        evaluate('openSection("model")')
-+        assert choices.property('visible'), 'Model picker must work during a run'
-+        evaluate('selectChoice(0)')
-+        assert fixture_controller.property('selectedModel') == 'm0'
-+        evaluate('openSection("effort")')
-+        assert choices.property('visible'), 'Effort picker must work during a run'
-+        evaluate('selectChoice(0)')
-+        evaluate('openSection("agent")')
-+        assert choices.property('visible'), 'Next-run harness picker must work during a run'
-+        evaluate('selectChoice(1)')
-+        fixture_controller.setProperty('busy', False)
-+        assert fixture_controller.property('selectedProvider') == 'opencode'
-+        assert 'OpenCode' in settings.property('summary')
-+        assert 'Provider default' in settings.property('summary')
-+        evaluate('openSection("model")')
-+        assert not choices.property('visible'), 'Empty catalog must not expose stale models'
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(100)
-+        assert not settings.property('visible')
-+        assert button.property('activeFocus'), 'Closing settings must restore keyboard focus'
-+        # Reversing a popup transition must converge to the latest user intent,
-+        # not leave a transparent modal surface or let an old close steal focus.
-+        preferences.SetBool('ReduceMotion', False)
-+        root.refreshMotion()
-+        evaluate('open()')
-+        QtTest.QTest.qWait(30)
-+        evaluate('close()')
-+        QtTest.QTest.qWait(20)
-+        evaluate('open()')
-+        QtTest.QTest.qWait(180)
-+        assert settings.property('visible') and settings.property('opacity') == 1
-+        evaluate('openSection("agent")')
-+        QtTest.QTest.qWait(30)
-+        QtCore.QMetaObject.invokeMethod(choices, 'close')
-+        QtTest.QTest.qWait(20)
-+        evaluate('openSection("agent")')
-+        QtTest.QTest.qWait(180)
-+        assert choices.property('visible') and choices.property('opacity') == 1
-+        choice_list = settings.findChild(QtCore.QObject, 'AnthraciteAgentChoiceList')
-+        assert choice_list.property('activeFocus'), 'Interrupted sheet transition lost keyboard focus'
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(120)
-+        assert not choices.property('visible') and settings.property('visible')
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Escape)
-+        QtTest.QTest.qWait(120)
-+        assert not settings.property('visible') and button.property('activeFocus')
-+    finally:
-+        evaluate('close()')
-+        evaluate('controller = anthraciteController')
-+        fixture_controller.deleteLater()
-+        quick_widget.setMinimumWidth(original_min_width)
-+        quick_widget.setMaximumWidth(original_max_width)
-+        root.setProperty('width', original_width)
-+        preferences.SetBool('ReduceMotion', original_motion)
-+        root.refreshMotion()
 +
 +
 +def run_smoke_test():
@@ -4110,9 +1754,6 @@
 +        raise AssertionError("AnthraciteSidebar does not contain its native widget.")
 +    dock.show()
 +    assert dock.titleBarWidget() is not None and dock.titleBarWidget().height() == 0
-+    chrome.toggleChat()
-+    assert not dock.isVisible()
-+    chrome.toggleChat()
 +    assert dock.isVisible()
 +    assert not dock.features() & QtWidgets.QDockWidget.DockWidgetFloatable
 +    assert not dock.features() & QtWidgets.QDockWidget.DockWidgetMovable
@@ -4120,8 +1761,6 @@
 +    dock.setFloating(True)  # Simulate restoration of an old floating profile.
 +    assert not dock.isFloating() and dock.titleBarWidget().height() == 0
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Button).name() == '#111111'
-+    chat_toggle = status.rootObject().findChild(QtCore.QObject, 'AnthraciteChatToggle')
-+    assert not chat_toggle.property('text'), 'Chat toggle should be icon-only'
 +    assert QtCore.QFile.exists(':/Anthracite/icons/hexagon.svg')
 +    icon_map = QtCore.QFile(':/Anthracite/icons/map.json')
 +    assert icon_map.open(QtCore.QIODevice.ReadOnly)
@@ -4131,7 +1770,9 @@
 +        assert QtSvg.QSvgRenderer(':/Anthracite/icons/' + alias + '.svg').isValid(), alias
 +    assert not QtCore.QDir.searchPaths('iconOverrides'), 'Native icons must not be overridden'
 +    assert not Gui.getIcon('PartDesign_Pad').isNull()
-+    hint = chat_toggle.findChild(QtCore.QObject, 'AnthraciteHint')
++    bridge_indicator = status.rootObject().findChild(QtCore.QObject, 'AnthraciteBridgeIndicator')
++    assert bridge_indicator is not None, 'Status bar must expose the bridge indicator'
++    hint = bridge_indicator.findChild(QtCore.QObject, 'AnthraciteHint')
 +    assert hint is not None
 +    hint.setProperty('hovered', True)
 +    QtTest.QTest.qWait(200)
@@ -4141,8 +1782,8 @@
 +    hint_content = hint.property('contentItem')
 +    hint_rect = QtCore.QRectF(hint_content.mapToGlobal(QtCore.QPointF(0, 0)),
 +                             QtCore.QSizeF(hint_content.width(), hint_content.height()))
-+    button_rect = QtCore.QRectF(QtCore.QPointF(status.mapToGlobal(chat_toggle.mapToScene(QtCore.QPointF(0, 0)).toPoint())),
-+                               QtCore.QSizeF(chat_toggle.width(), chat_toggle.height()))
++    button_rect = QtCore.QRectF(QtCore.QPointF(status.mapToGlobal(bridge_indicator.mapToScene(QtCore.QPointF(0, 0)).toPoint())),
++                               QtCore.QSizeF(bridge_indicator.width(), bridge_indicator.height()))
 +    assert not hint_rect.intersects(button_rect), ('Tooltip covered its button', hint_rect, button_rect)
 +    hint.setProperty('hovered', False)
 +    style_sheet = QtWidgets.QApplication.instance().styleSheet().lower()
@@ -4211,41 +1852,20 @@
 +        raise AssertionError(f"Anthracite QML did not load: {errors}")
 +    root = quick_widget.rootObject()
 +    compact_height = root.property('compactControlHeight')
-+    for name in ('AnthraciteThreadPicker', 'AnthraciteNewThread',
-+                 'AnthraciteAgentSettingsButton', 'AnthraciteSubmitButton'):
-+        control = root.findChild(QtCore.QObject, name)
-+        assert control is not None
-+        assert abs(control.property('height') - compact_height) <= 1, (name, control.property('height'), compact_height)
-+    if root.findChild(QtCore.QObject, "AnthraciteInteractionCard") is None:
-+        raise AssertionError("Anthracite QML does not expose the interaction card.")
-+    if root.findChild(QtCore.QObject, "AnthraciteRequestedInput") is None:
-+        raise AssertionError("Anthracite QML does not expose requested-input controls.")
-+    if root.findChild(QtCore.QObject, "AnthraciteThreadPicker") is None:
-+        raise AssertionError("Anthracite QML does not expose the conversation picker.")
-+    if root.findChild(QtCore.QObject, "AnthraciteNewThread") is None:
-+        raise AssertionError("Anthracite QML does not expose the new-conversation control.")
-+    if root.findChild(QtCore.QObject, "AnthraciteComposer") is None:
-+        raise AssertionError("Anthracite QML does not expose the persistent composer.")
-+    if root.findChild(QtCore.QObject, "AnthraciteAgentSettingsButton") is None:
-+        raise AssertionError("Anthracite QML does not expose unified agent settings.")
-+    if root.findChild(QtCore.QObject, "AnthraciteContextUsage") is not None:
-+        raise AssertionError("Anthracite QML must not display context-window usage.")
-+
-+    run_agent_settings_test(quick_widget, root, dock)
-+
-+    composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
-+    actions = root.findChild(QtCore.QObject, 'AnthraciteComposerActions')
-+    assert actions is not None and actions.parentItem() == composer
-+    for width in (320, 520):
-+        original_min, original_max = quick_widget.minimumWidth(), quick_widget.maximumWidth()
-+        quick_widget.setFixedWidth(width)
-+        QtTest.QTest.qWait(100)
-+        assert abs(actions.x() + actions.width() - composer.width() + 6) < 1
-+        assert abs(actions.y() + actions.height() - composer.height() + 4) < 1
-+        assert composer.property('bottomPadding') >= actions.height() + 4
-+        assert actions.width() >= 60, 'Both actions must fit inside the input'
-+        quick_widget.setMinimumWidth(original_min)
-+        quick_widget.setMaximumWidth(original_max)
++    copy_button = root.findChild(QtCore.QObject, 'AnthraciteBridgeCopy')
++    assert copy_button is not None, 'Anthracite QML must expose the bridge copy control.'
++    assert abs(copy_button.property('height') - compact_height) <= 1
++    if root.findChild(QtCore.QObject, 'AnthraciteGeometryPicker') is None:
++        raise AssertionError("Anthracite QML does not expose the geometry picker.")
++    if root.findChild(QtCore.QObject, "AnthraciteTimeline") is None:
++        raise AssertionError("Anthracite QML does not expose the activity timeline.")
++    if root.findChild(QtCore.QObject, "AnthraciteBridgeStatusLabel") is None:
++        raise AssertionError("Anthracite QML does not expose the bridge status header.")
++    for removed in ('AnthraciteInteractionCard', 'AnthraciteRequestedInput', 'AnthraciteThreadPicker',
++                    'AnthraciteNewThread', 'AnthraciteComposer', 'AnthraciteAgentSettingsButton',
++                    'AnthraciteSubmitButton', 'AnthraciteAttachmentTray', 'AnthraciteContextUsage'):
++        if root.findChild(QtCore.QObject, removed) is not None:
++            raise AssertionError(f"Removed chat control is still exposed: {removed}")
 +
 +    component = QtQml.QQmlComponent(quick_widget.engine())
 +    component.setData(b'import QtQuick 2.15; import "qrc:/Anthracite/qml" as Chat; Chat.TranscriptText { body: "Selectable response"; width: 250 }', QtCore.QUrl())
@@ -4275,6 +1895,36 @@
 +                for row in range(model.rowCount())]
 +    for row in original:
 +        row['id'] = row.pop('entryId')
++    # The Python bridge feeds one work row per freecad tool call. Exercise the
++    # exact extension method the bridge calls, not the model directly.
++    bridge_event = {
++        'operation': {
++            'id': 'bridge-operation-1', 'status': 'committed', 'document': 'TestDoc',
++            'revisionBefore': 3, 'revisionAfter': 4, 'label': 'Create box', 'durationMs': 42,
++            'code': 'box = doc.addObject("Part::Box", "Box")', 'stdout': 'committed',
++            'error': None, 'conflict': False, 'requiresInspection': False,
++        },
++        'images': [],
++    }
++    before_rows = model.rowCount()
++    AnthraciteGui.push_activity(json.dumps(bridge_event))
++    QtTest.QTest.qWait(50)
++    pushed = model.indexOfId('bridge-operation-1')
++    assert pushed >= 0 and model.kindAt(pushed) == 'work', (pushed, model.kindAt(pushed) if pushed >= 0 else None)
++    pushed_entries = model.data(model.index(pushed, 0), roles['entries'])
++    pushed_entries = pushed_entries.toVariant() if hasattr(pushed_entries, 'toVariant') else pushed_entries
++    assert any(entry.get('title') == 'Code' for entry in pushed_entries), pushed_entries
++    AnthraciteGui.push_activity(json.dumps(bridge_event))
++    QtTest.QTest.qWait(50)
++    assert model.rowCount() == before_rows + 1, 'Duplicate operation was appended'
++    AnthraciteGui.push_bridge_status(json.dumps({
++        'running': True, 'port': 43210, 'clients': 2, 'document': 'TestDoc', 'revision': 4,
++        'mcpConfig': '{"mcpServers": {}}', 'mcpCommand': 'python3 anthracite-mcp',
++    }))
++    QtTest.QTest.qWait(50)
++    assert controller.property('bridgeRunning')
++    assert controller.property('bridgePort') == '43210'
++    assert controller.property('bridgeClients') == 2
 +    rows = [{'id': str(i), 'author': 'You', 'kind': 'user', 'body': 'Message ' + str(i),
 +             'title': '', 'entries': [], 'entryCount': 0} for i in range(80)]
 +    apply_edit({'op': 'reset', 'rows': rows, 'hasEarlier': True})
@@ -4325,49 +1975,6 @@
 +    model.dataChanged.disconnect(changed)
 +    print(f'ANTHRACITE_STREAM_BURST: 250 updates, {len(notifications)} notifications, {time.monotonic() - started:.3f}s', flush=True)
 +    assert timeline.property('anchorId') == anchor
-+    # Keep output changing while typing, and record render acknowledgement and
-+    # frame gaps. This catches event-loop starvation that state-only tests miss.
-+    saved_draft = controller.property('draft')
-+    controller.setDraft('')
-+    root.focusComposer()
-+    timeline.latest()
-+    QtTest.QTest.qWait(100)
-+    render_times = []
-+    def rendered_under_load():
-+        render_times.append(time.monotonic())
-+    quick_widget.quickWindow().afterRendering.connect(rendered_under_load)
-+    stream_index = [0]
-+    def stream_tick():
-+        stream_index[0] += 1
-+        apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20 + str(stream_index[0]))})
-+    stream_timer = QtCore.QTimer()
-+    stream_timer.setInterval(8)
-+    stream_timer.timeout.connect(stream_tick)
-+    stream_timer.start()
-+    input_latencies = []
-+    try:
-+        typed = ''
-+        for letter in 'input':
-+            begin_frame = len(render_times)
-+            began = time.monotonic()
-+            QtTest.QTest.keyClicks(quick_widget, letter)
-+            typed += letter
-+            assert controller.property('draft') == typed, 'Typing acknowledgement waited for the stream'
-+            QtTest.QTest.qWait(100)
-+            assert len(render_times) > begin_frame
-+            input_latencies.append((render_times[begin_frame] - began) * 1000)
-+    finally:
-+        stream_timer.stop()
-+        quick_widget.quickWindow().afterRendering.disconnect(rendered_under_load)
-+        controller.setDraft(saved_draft)
-+    gaps = [(b - a) * 1000 for a, b in zip(render_times, render_times[1:])]
-+    report_path = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/interaction-latency.json'
-+    report = json.loads(report_path.read_text())
-+    report['streaming'] = {'input_samples_ms': input_latencies,
-+                           'p50_ms': sorted(input_latencies)[2], 'max_ms': max(input_latencies),
-+                           'frame_gaps_ms': gaps, 'max_frame_gap_ms': max(gaps, default=0)}
-+    report_path.write_text(json.dumps(report, indent=2))
-+    assert max(input_latencies) < 100, report['streaming']
 +    timeline.setProperty('scrollMode', 'reading')
 +    timeline.setProperty('anchorId', anchor)
 +    timeline.setProperty('anchorOffset', offset)
@@ -4401,7 +2008,7 @@
 +    original_width = root.property('width')
 +    root.setProperty('width', 320)
 +    QtTest.QTest.qWait(100)
-+    assert root.findChild(QtCore.QObject, 'AnthraciteAgentSettingsButton').property('width') > 0
++    assert root.findChild(QtCore.QObject, 'AnthraciteBridgeCopy').property('width') > 0
 +    assert timeline.property('anchorId') == anchor, 'Dock resize lost the reading anchor'
 +    assert abs(timeline.property('anchorOffset') - offset) < 3
 +    root.setProperty('width', original_width)
@@ -4624,52 +2231,10 @@
 +    workbenches = AnthraciteExecutor.execute("cad.api(kind='workbenches')")
 +    assert workbenches['ok'] and workbenches['readOnly'], workbenches
 +    assert workbenches['result']['workbenches']
-+    root = quick_widget.rootObject()
-+    assert root.findChild(QtCore.QObject, "AnthraciteAttachFiles") is not None
-+    assert root.findChild(QtCore.QObject, "AnthraciteGeometryPicker") is not None
-+    clipboard = QtWidgets.QApplication.clipboard()
-+    def await_attachments():
-+        deadline = time.monotonic() + 10
-+        while controller.property('processingAttachments') and time.monotonic() < deadline:
-+            QtWidgets.QApplication.processEvents()
-+        assert not controller.property('processingAttachments')
-+    previous_clipboard = QtCore.QMimeData()
-+    for format_name in clipboard.mimeData().formats():
-+        previous_clipboard.setData(format_name, clipboard.mimeData().data(format_name))
-+    try:
-+        image = QtGui.QImage(32, 24, QtGui.QImage.Format_RGB32)
-+        image.fill(QtGui.QColor("red"))
-+        clipboard.setImage(image)
-+        assert controller.pasteAttachments()
-+        await_attachments()
-+        attached = controller.property("attachments")
-+        assert attached[0]['type'] == 'image'
-+        assert attached[0]['dataUrl'].startswith('data:image/png;base64,')
-+        controller.removeAttachment(0)
-+        composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
-+        composer.forceActiveFocus()
-+        QtTest.QTest.keySequence(quick_widget, QtGui.QKeySequence(QtGui.QKeySequence.Paste))
-+        await_attachments()
-+        assert len(controller.property('attachments')) == 1, 'Native paste shortcut did not attach the image'
-+        controller.removeAttachment(0)
-+        clipboard.setText("ordinary text")
-+        assert not controller.pasteAttachments(), "Text paste must stay native"
-+    finally:
-+        clipboard.setMimeData(previous_clipboard)
-+    with tempfile.TemporaryDirectory() as directory:
-+        source = Path(directory) / 'reference.txt'
-+        source.write_text('Original reference')
-+        controller.attachFile(str(source))
-+        await_attachments()
-+        attached = controller.property('attachments')
-+        source.write_text('Changed after attachment')
-+        assert Path(attached[0]['path']).read_text() == 'Original reference'
-+        controller.removeAttachment(0)
 +    for subelement in ('Face1', 'Edge1', 'Vertex1', ''):
 +        dock.show()
 +        main_window.activateWindow()
 +        QtWidgets.QApplication.setActiveWindow(main_window)
-+        controller.setDraft('')
 +        Gui.Selection.clearSelection()
 +        controller.togglePicker()
 +        assert controller.property('picking')
@@ -4681,63 +2246,21 @@
 +        viewport.setFocus(QtCore.Qt.MouseFocusReason)
 +        QtTest.QTest.qWait(50)
 +        assert not controller.property('picking')
-+        picked = controller.property('attachments')[0]
-+        assert picked['reference']['subelement'] == subelement
-+        assert picked['reference']['object'] == 'RenderBox'
-+        assert picked['name'] in controller.property('draft')
-+        assert AnthraciteExecutor.validate_picks_json(json.dumps([picked])) == 'ok'
-+        composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
-+        assert composer.property('length') == 1, 'A CAD token must occupy exactly one editor character'
-+        assert not root.findChild(QtCore.QObject, 'AnthraciteAttachmentTray').property('visible'), 'CAD token duplicated in tray'
-+        assert quick_widget.hasFocus(), ('Picking did not return native keyboard focus to the sidebar',
-+                                        quick_widget.isVisible(), QtWidgets.QApplication.focusWidget())
-+        assert composer.property('activeFocus'), 'Picking did not focus the composer'
-+        attachment_signals = []
-+        def attachments_changed():
-+            attachment_signals.append(True)
-+        controller.attachmentsChanged.connect(attachments_changed)
-+        QtTest.QTest.keyClicks(QtWidgets.QApplication.focusWidget(), ' thinner')
-+        controller.attachmentsChanged.disconnect(attachments_changed)
-+        assert not attachment_signals, 'Typing rebuilt unchanged attachment previews'
-+        assert controller.property('draft').endswith(' thinner'), 'Typing after picking missed the composer'
-+        # Reset the typing undo group before checking atomic token deletion/undo.
-+        controller.setDraft(controller.property('draft').removesuffix(' thinner'))
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Backspace)
-+        assert not controller.property('attachments'), 'Backspace left a hidden model reference'
-+        assert controller.property('draft') == ''
-+        QtTest.QTest.keySequence(quick_widget, QtGui.QKeySequence(QtGui.QKeySequence.Undo))
-+        assert controller.property('attachments')[0]['reference'] == picked['reference'], 'Undo lost token identity'
-+        assert composer.property('length') == 1
++        expected = json.loads(AnthraciteExecutor.picked_reference_json(
++            render_document.Name, 'RenderBox', subelement, 1.0, 2.0, 3.0))
++        assert QtWidgets.QApplication.clipboard().text() == expected['inspect'], 'Picker did not copy the reference'
++        assert controller.property('toastMessage').startswith('Copied '), controller.property('toastMessage')
 +        if subelement == 'Face1':
 +            Gui.runCommand('Anthracite_ReloadSidebar')
 +            quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
 +            root = quick_widget.rootObject()
-+            composer = root.findChild(QtCore.QObject, 'AnthraciteComposer')
-+            assert composer.property('length') == 1, 'Reload expanded a token into ordinary text'
-+            assert controller.property('attachments')[0]['reference'] == picked['reference']
-+            composer.forceActiveFocus()
-+        composer.select(0, 1)
-+        QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Delete)
-+        assert not controller.property('attachments'), 'Selection deletion left a hidden reference'
-+    controller.setDraft('Make  thinner')
-+    composer.setProperty('cursorPosition', 5)
-+    Gui.Selection.clearSelection()
-+    controller.togglePicker()
-+    Gui.Selection.addSelection(render_document.Name, 'RenderBox', 'Face1')
-+    assert controller.property('draft').startswith('Make @[') and controller.property('draft').endswith(' thinner')
-+    assert composer.property('length') == len('Make  thinner') + 1
-+    QtWidgets.QApplication.processEvents()
-+    capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/picker-token.png'
-+    assert dock.grab().save(str(capture))
-+    composer.select(5, 6)
-+    QtTest.QTest.keyClick(quick_widget, QtCore.Qt.Key_Backspace)
-+    assert controller.property('draft') == 'Make  thinner'
-+    assert not controller.property('attachments')
++            assert controller.property('toastMessage').startswith('Copied ')
++    controller.dismissToast()
++    assert controller.property('toastMessage') == ''
 +    controller.togglePicker()
 +    QtWidgets.QApplication.sendEvent(main_window, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier))
 +    assert not controller.property('picking')
 +    picked = json.loads(AnthraciteExecutor.picked_reference_json(render_document.Name, 'RenderBox', 'Face1', 0, 0, 0))
-+    controller.setDraft('')
 +    camera = view.getCamera()
 +    multi = AnthraciteExecutor.execute("cad.render_views(width=256, height=192)")
 +    assert multi["ok"], multi
@@ -4821,12 +2344,13 @@
 +    controller.togglePicker()
 +    Gui.Selection.addSelection(render_document.Name, 'Body', 'BasePad.Face1')
 +    assert not controller.property('picking')
-+    picked_pad = controller.property('attachments')[0]
++    picked_pad = json.loads(AnthraciteExecutor.picked_reference_json(
++        render_document.Name, 'Body', 'BasePad.Face1', 0, 0, 0))
 +    assert picked_pad['reference']['object'] == 'BasePad', picked_pad
 +    assert picked_pad['reference']['subelement'] == 'Face1', picked_pad
-+    assert AnthraciteExecutor.validate_picks_json(json.dumps([picked_pad])) == 'ok'
-+    controller.removeAttachment(0)
-+    controller.setDraft('')
++    assert QtWidgets.QApplication.clipboard().text() == picked_pad['inspect']
++    assert controller.property('toastMessage').startswith('Copied ')
++    controller.dismissToast()
 +    Gui.Selection.clearSelection()
 +    diagram = AnthraciteExecutor.execute("cad.render_sketch('BaseSketch')")
 +    assert diagram["ok"], diagram
@@ -4872,211 +2396,6 @@
 +    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 +    QtWidgets.QApplication.instance().quit()
 +QtCore.QTimer.singleShot(0, finish)
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Composer.cpp
-@@ -0,0 +1,202 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+// Native text-document glue: a CAD mention is one inline image character, not editable label text.
-+#include "Sidebar.h"
-+
-+#include <QApplication>
-+#include <QBuffer>
-+#include <QClipboard>
-+#include <QPainter>
-+#include <QQuickTextDocument>
-+#include <QTextBlock>
-+#include <QTextCursor>
-+#include <QTextDocument>
-+#include <QTextDocumentFragment>
-+#include <QTextImageFormat>
-+#include <QUuid>
-+#include <QSet>
-+#include <algorithm>
-+
-+using namespace AnthraciteGui;
-+
-+namespace {
-+constexpr int tokenProperty = QTextFormat::UserProperty + 1;
-+}
-+
-+void SidebarController::bindComposer(QObject* quickDocument)
-+{
-+    auto* quick = qobject_cast<QQuickTextDocument*>(quickDocument);
-+    if (!quick) return;
-+    if (composerDocument) disconnect(composerDocument, nullptr, this, nullptr);
-+    composerDocument = quick->textDocument();
-+    connect(composerDocument, &QTextDocument::contentsChanged, this, &SidebarController::readComposer);
-+    renderComposer();
-+}
-+
-+void SidebarController::setComposerSelection(int start, int end)
-+{
-+    if (updatingComposer) return;
-+    composerSelectionStart = start;
-+    composerSelectionEnd = end;
-+}
-+
-+QString SidebarController::composerPlainText(QTextDocument* document) const
-+{
-+    QString result;
-+    for (auto block = document->begin(); block.isValid(); block = block.next()) {
-+        if (block != document->begin()) result += QLatin1Char('\n');
-+        for (auto it = block.begin(); !it.atEnd(); ++it) {
-+            const auto fragment = it.fragment();
-+            if (fragment.charFormat().isImageFormat()) {
-+                const auto id = fragment.charFormat().property(tokenProperty).toString();
-+                if (composerTokens.contains(id)) result += composerTokens.value(id).value("token").toString();
-+            } else {
-+                result += fragment.text();
-+            }
-+        }
-+    }
-+    return result;
-+}
-+
-+void SidebarController::readComposer()
-+{
-+    if (updatingComposer || !composerDocument) return;
-+    const QString nextDraft = composerPlainText(composerDocument);
-+    const bool draftChangedValue = nextDraft != currentDraft;
-+    currentDraft = nextDraft;
-+    QVariantList active;
-+    for (const auto& item : currentAttachments) {
-+        if (item.toMap().value("type").toString() != QLatin1String("cad")) active.append(item);
-+    }
-+    QSet<QString> seen;
-+    for (auto block = composerDocument->begin(); block.isValid(); block = block.next()) {
-+        for (auto it = block.begin(); !it.atEnd(); ++it) {
-+            if (!it.fragment().charFormat().isImageFormat()) continue;
-+            const auto id = it.fragment().charFormat().property(tokenProperty).toString();
-+            if (composerTokens.contains(id) && !seen.contains(id)) {
-+                active.append(composerTokens.value(id));
-+                seen.insert(id);
-+            }
-+        }
-+    }
-+    const bool attachmentsChangedValue = currentAttachments != active;
-+    if (attachmentsChangedValue) {
-+        currentAttachments = active;
-+        Q_EMIT attachmentsChanged();
-+    }
-+    if (draftChangedValue) Q_EMIT draftChanged();
-+    if (draftChangedValue || attachmentsChangedValue) Q_EMIT draftEdited(currentDraft);
-+}
-+
-+void SidebarController::insertComposerToken(QTextCursor& cursor, const QVariantMap& token)
-+{
-+    const QString id = token.value("id").toString();
-+    const QString label = token.value("name").toString();
-+    const QFont font = composerDocument->defaultFont();
-+    const QFontMetrics metrics(font);
-+    const QString display = metrics.elidedText(label, Qt::ElideMiddle, 250);
-+    const QSize size(metrics.horizontalAdvance(display) + 16, metrics.height() + 8);
-+    QImage image(size * 2, QImage::Format_ARGB32_Premultiplied);
-+    image.setDevicePixelRatio(2);
-+    image.fill(Qt::transparent);
-+    image.setText("anthracite-token", id);
-+    QPainter painter(&image);
-+    painter.setRenderHint(QPainter::Antialiasing);
-+    painter.setPen(Qt::NoPen);
-+    auto background = qApp->palette().highlight().color();
-+    background.setAlpha(65);
-+    painter.setBrush(background);
-+    painter.drawRoundedRect(QRectF(QPointF(0, 0), size), 5, 5);
-+    painter.setFont(font);
-+    painter.setPen(qApp->palette().text().color());
-+    painter.drawText(QRect(QPoint(), size), Qt::AlignCenter, display);
-+    painter.end();
-+    QByteArray png;
-+    QBuffer buffer(&png);
-+    buffer.open(QIODevice::WriteOnly);
-+    image.save(&buffer, "PNG");
-+    QTextImageFormat format;
-+    format.setName(QStringLiteral("data:image/png;base64,") + QString::fromLatin1(png.toBase64()));
-+    format.setWidth(size.width());
-+    format.setHeight(size.height());
-+    format.setToolTip(label);
-+    format.setProperty(tokenProperty, id);
-+    cursor.insertImage(format);
-+    // Following text must not inherit the object's identity.
-+    cursor.setCharFormat(QTextCharFormat());
-+}
-+
-+void SidebarController::insertComposerText(QTextCursor& cursor, const QString& text)
-+{
-+    int position = 0;
-+    while (position < text.size()) {
-+        int next = text.size();
-+        QVariantMap found;
-+        for (const auto& token : composerTokens) {
-+            const QString marker = token.value("token").toString();
-+            const int index = marker.isEmpty() ? -1 : text.indexOf(marker, position);
-+            if (index >= 0 && index < next) { next = index; found = token; }
-+        }
-+        cursor.insertText(text.mid(position, next - position));
-+        if (found.isEmpty()) break;
-+        insertComposerToken(cursor, found);
-+        position = next + found.value("token").toString().size();
-+    }
-+}
-+
-+void SidebarController::renderComposer()
-+{
-+    if (!composerDocument) return;
-+    updatingComposer = true;
-+    Q_EMIT composerCursorRequested(0);
-+    composerDocument->clear();
-+    QTextCursor cursor(composerDocument);
-+    insertComposerText(cursor, currentDraft);
-+    composerDocument->clearUndoRedoStacks();
-+    composerSelectionStart = composerSelectionEnd = cursor.position();
-+    updatingComposer = false;
-+    Q_EMIT composerCursorRequested(cursor.position());
-+}
-+
-+void SidebarController::insertPick(QVariantMap attachment)
-+{
-+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-+    attachment.insert("id", id);
-+    attachment.insert("token", QStringLiteral("@[%1 #%2]").arg(attachment.value("name").toString(), id));
-+    composerTokens.insert(id, attachment);
-+    if (!composerDocument) return;
-+    QTextCursor cursor(composerDocument);
-+    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
-+    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
-+    cursor.beginEditBlock();
-+    insertComposerToken(cursor, attachment);
-+    cursor.endEditBlock();
-+    Q_EMIT composerCursorRequested(cursor.position());
-+}
-+
-+void SidebarController::copyComposerSelection(bool cut)
-+{
-+    if (!composerDocument) return;
-+    QTextCursor cursor(composerDocument);
-+    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
-+    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
-+    if (!cursor.hasSelection()) return;
-+    QTextDocument selected;
-+    QTextCursor(&selected).insertFragment(cursor.selection());
-+    QApplication::clipboard()->setText(composerPlainText(&selected));
-+    if (cut) cursor.removeSelectedText();
-+}
-+
-+void SidebarController::pasteComposerText()
-+{
-+    if (!composerDocument) return;
-+    QTextCursor cursor(composerDocument);
-+    cursor.setPosition(std::clamp(composerSelectionStart, 0, composerDocument->characterCount() - 1));
-+    cursor.setPosition(std::clamp(composerSelectionEnd, 0, composerDocument->characterCount() - 1), QTextCursor::KeepAnchor);
-+    cursor.beginEditBlock();
-+    cursor.removeSelectedText();
-+    // Only restore known local tokens. Never load arbitrary clipboard HTML/image resources.
-+    insertComposerText(cursor, QApplication::clipboard()->text());
-+    cursor.endEditBlock();
-+    Q_EMIT composerCursorRequested(cursor.position());
-+}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/ActivityEntry.qml
 @@ -0,0 +1,61 @@
@@ -5181,280 +2500,6 @@
 +    }
 +}
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/qml/AgentSettings.qml
-@@ -0,0 +1,271 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+import QtQuick 2.15
-+import QtQuick.Controls 2.15
-+import QtQuick.Controls.Basic
-+import QtQuick.Layouts 1.15
-+
-+Popup {
-+    id: settings
-+    objectName: "AnthraciteAgentSettings"
-+    property var controller
-+    property bool reducedMotion: true
-+    signal opening()
-+    opacity: 0
-+    enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: settings.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
-+    exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: settings.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
-+    // The native controller can disappear while a dock is being reloaded.
-+    readonly property var agentState: controller || ({
-+        busy: true, processingAttachments: false, providers: [], models: [],
-+        reasoningEfforts: [], selectedProvider: "", selectedModel: "",
-+        selectedEffort: "", modelControlsAvailable: false
-+    })
-+    property Item returnFocus
-+    readonly property bool locked: !controller
-+    readonly property string providerLabel: labelFor(settings.agentState.providers, "id", settings.agentState.selectedProvider, "name", qsTr("Agent"))
-+    readonly property string modelLabel: labelFor(settings.agentState.models, "model", settings.agentState.selectedModel, "name", qsTr("Provider default"))
-+    readonly property string effortLabel: labelFor(settings.agentState.reasoningEfforts, "id", settings.agentState.selectedEffort, "label", qsTr("Default"))
-+    readonly property string summary: providerLabel + " · " + modelLabel
-+                                      + (settings.agentState.selectedEffort ? " · " + effortLabel : "")
-+    parent: Overlay.overlay
-+    width: Math.max(0, Math.min(400, parent.width - 16))
-+    height: Math.min(parent.height - 16, mainColumn.implicitHeight + padding * 2)
-+    x: (parent.width - width) / 2
-+    y: Math.max(8, parent.height - height - 8)
-+    padding: 12
-+    modal: true
-+    focus: true
-+    Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
-+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-+    onAboutToShow: { opening(); Qt.callLater(function() { agentRow.forceActiveFocus() }) }
-+    onClosed: {
-+        choices.close()
-+        if (returnFocus) returnFocus.forceActiveFocus()
-+    }
-+    SystemPalette { id: colors }
-+    background: Rectangle {
-+        radius: 12
-+        color: colors.window
-+        border.color: colors.mid
-+    }
-+
-+    function labelFor(items, key, selected, label, fallback) {
-+        for (let i = 0; i < items.length; ++i) {
-+            if (items[i][key] === selected) return items[i][label] || selected
-+        }
-+        return selected || fallback
-+    }
-+
-+    function openSection(section) {
-+        if (locked) return
-+        if (section === "model" && !settings.agentState.modelControlsAvailable) return
-+        if (section === "effort" && !settings.agentState.reasoningEfforts.length) return
-+        choices.section = section
-+        choices.open()
-+    }
-+
-+    // Return to the summary after every selection; the next sheet always reads
-+    // the current provider's catalog, including model-dependent effort choices.
-+    function selectChoice(index) {
-+        if (locked || index < 0 || index >= choices.options.length) return
-+        const item = choices.options[index]
-+        const section = choices.section
-+        choices.close()
-+        if (section === "agent") controller.selectProvider(item.id)
-+        else if (section === "model") controller.selectModel(item.model)
-+        else controller.selectEffort(item.id)
-+    }
-+
-+    component SettingRow: ItemDelegate {
-+        id: settingRow
-+        property string value
-+        Layout.fillWidth: true
-+        implicitHeight: 56
-+        contentItem: Column {
-+            spacing: 3
-+            Row {
-+                spacing: 6
-+                Text { text: settingRow.text; color: settingRow.down ? colors.highlightedText : colors.windowText; font.bold: true }
-+                Image { source: "qrc:/Anthracite/icons/nav-arrow-right.svg"; sourceSize.width: 16; sourceSize.height: 16 }
-+            }
-+            Text {
-+                width: parent.width
-+                text: parent.parent.value
-+                color: settingRow.down ? colors.highlightedText : colors.windowText
-+                opacity: 0.65
-+                elide: Text.ElideRight
-+            }
-+        }
-+        Accessible.name: text + ": " + value
-+        opacity: enabled ? 1 : 0.5
-+        background: Rectangle {
-+            radius: 8
-+            color: parent.down ? colors.highlight : parent.hovered ? colors.alternateBase : "transparent"
-+            border.color: parent.activeFocus ? colors.highlight : "transparent"
-+        }
-+    }
-+
-+    contentItem: ScrollView {
-+        clip: true
-+        contentWidth: availableWidth
-+        ColumnLayout {
-+            id: mainColumn
-+            width: parent.width
-+            spacing: 6
-+            Label {
-+                text: qsTr("Agent settings")
-+                color: colors.windowText
-+                font.bold: true
-+                Layout.bottomMargin: 4
-+            }
-+            SettingRow {
-+                id: agentRow
-+                objectName: "AnthraciteAgentRow"
-+                text: qsTr("Agent")
-+                value: settings.providerLabel
-+                enabled: !settings.locked
-+                onClicked: settings.openSection("agent")
-+            }
-+            SettingRow {
-+                id: modelRow
-+                objectName: "AnthraciteModelRow"
-+                text: qsTr("Model")
-+                value: settings.modelLabel
-+                enabled: !settings.locked && settings.agentState.modelControlsAvailable
-+                onClicked: settings.openSection("model")
-+            }
-+            SettingRow {
-+                id: effortRow
-+                objectName: "AnthraciteEffortRow"
-+                text: qsTr("Reasoning")
-+                value: settings.agentState.reasoningEfforts.length ? settings.effortLabel : qsTr("Provider default / unavailable")
-+                enabled: !settings.locked && settings.agentState.reasoningEfforts.length > 0
-+                onClicked: settings.openSection("effort")
-+            }
-+            Label {
-+                Layout.fillWidth: true
-+                visible: settings.agentState.busy
-+                text: qsTr("Changes apply to your next run.")
-+                wrapMode: Text.WordWrap
-+                color: colors.windowText
-+                opacity: 0.65
-+            }
-+            Button {
-+                Layout.fillWidth: true
-+                text: qsTr("Configure agent installation…")
-+                enabled: !settings.locked && !settings.agentState.busy
-+                onClicked: { settings.close(); controller.chooseProvider() }
-+            }
-+            Button {
-+                Layout.fillWidth: true
-+                text: qsTr("Done")
-+                onClicked: settings.close()
-+            }
-+        }
-+    }
-+
-+    Popup {
-+        id: choices
-+        objectName: "AnthraciteAgentChoices"
-+        opacity: 0
-+        enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: settings.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
-+        exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: settings.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
-+        property string section: "agent"
-+        readonly property var options: section === "agent" ? settings.agentState.providers
-+                                       : section === "model" ? settings.agentState.models : settings.agentState.reasoningEfforts
-+        readonly property string selected: section === "agent" ? settings.agentState.selectedProvider
-+                                           : section === "model" ? settings.agentState.selectedModel : settings.agentState.selectedEffort
-+        parent: Overlay.overlay
-+        width: settings.width
-+        height: Math.min(parent.height - 32, 360, choiceColumn.implicitHeight + padding * 2)
-+        x: settings.x
-+        y: Math.max(8, settings.y + settings.height - height)
-+        padding: 12
-+        modal: true
-+        focus: true
-+        Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.28) }
-+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-+        onAboutToShow: {
-+            choiceList.currentIndex = -1
-+            for (let i = 0; i < options.length; ++i) {
-+                if ((section === "model" ? options[i].model : options[i].id) === selected)
-+                    choiceList.currentIndex = i
-+            }
-+            if (choiceList.currentIndex < 0 && options.length) choiceList.currentIndex = 0
-+            choiceList.positionViewAtIndex(choiceList.currentIndex, ListView.Contain)
-+            Qt.callLater(function() { choiceList.forceActiveFocus() })
-+        }
-+        onClosed: {
-+            if (settings.opened) {
-+                const row = section === "agent" ? agentRow : section === "model" ? modelRow : effortRow
-+                if (row.enabled) row.forceActiveFocus()
-+                else agentRow.forceActiveFocus()
-+            }
-+        }
-+        background: Rectangle {
-+            radius: 12
-+            color: colors.window
-+            border.color: colors.mid
-+        }
-+        contentItem: ColumnLayout {
-+            id: choiceColumn
-+            spacing: 8
-+            Button {
-+                icon.source: "qrc:/Anthracite/icons/nav-arrow-left.svg"
-+                icon.width: 16; icon.height: 16
-+                icon.color: "transparent"
-+                text: (choices.section === "agent" ? qsTr("Agent")
-+                            : choices.section === "model" ? qsTr("Model") : qsTr("Reasoning"))
-+                Accessible.name: qsTr("Back to agent settings")
-+                onClicked: choices.close()
-+            }
-+            ListView {
-+                id: choiceList
-+                objectName: "AnthraciteAgentChoiceList"
-+                Layout.fillWidth: true
-+                Layout.fillHeight: true
-+                implicitHeight: contentHeight
-+                clip: true
-+                model: choices.options
-+                keyNavigationEnabled: true
-+                boundsBehavior: Flickable.StopAtBounds
-+                ScrollBar.vertical: ScrollBar {}
-+                Keys.onReturnPressed: settings.selectChoice(currentIndex)
-+                Keys.onEnterPressed: settings.selectChoice(currentIndex)
-+                delegate: ItemDelegate {
-+                    id: choiceRow
-+                    required property var modelData
-+                    required property int index
-+                    readonly property string optionId: choices.section === "model" ? modelData.model : modelData.id
-+                    readonly property bool selected: optionId === choices.selected
-+                    width: ListView.view.width
-+                    height: 48
-+                    enabled: !settings.locked
-+                    text: (choices.section === "effort" ? modelData.label : modelData.name) || optionId
-+                    Accessible.name: text
-+                    Accessible.role: Accessible.RadioButton
-+                    Accessible.checked: selected
-+                    background: Rectangle {
-+                        radius: 8
-+                        color: selected || parent.down ? colors.highlight : parent.hovered || parent.ListView.isCurrentItem
-+                               ? colors.alternateBase : "transparent"
-+                        border.color: parent.activeFocus ? colors.highlight : "transparent"
-+                    }
-+                    contentItem: RowLayout {
-+                        Text {
-+                            Layout.fillWidth: true
-+                            text: parent.parent.text
-+                            color: selected || choiceRow.down ? colors.highlightedText : colors.windowText
-+                            elide: Text.ElideRight
-+                        }
-+                        Image { visible: selected; source: "qrc:/Anthracite/icons/check.svg"; sourceSize.width: 16; sourceSize.height: 16 }
-+                    }
-+                    Hint {
-+                        hovered: parent.hovered
-+                        text: modelData.description || parent.text
-+                    }
-+                    onClicked: settings.selectChoice(index)
-+                }
-+            }
-+        }
-+    }
-+}
---- /dev/null
 +++ b/src/Mod/Anthracite/Gui/MotionMac.mm
 @@ -0,0 +1,7 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
@@ -5466,7 +2511,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.cpp
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,356 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#include "Chrome.h"
 +#include "Sidebar.h"
@@ -5552,7 +2597,6 @@
 +    setObjectName(QStringLiteral("AnthraciteChrome"));
 +    latest = tr("Console · No messages yet");
 +    position = QStringLiteral("X —   Y —   Z —");
-+    connect(chat, &QDockWidget::visibilityChanged, this, &Chrome::changed);
 +    connect(chat, &QDockWidget::topLevelChanged, this, [this]() { updateTitleBar(); Q_EMIT changed(); });
 +    updateTitleBar();
 +    qApp->installEventFilter(this);
@@ -5573,8 +2617,6 @@
 +    connect(timer, &QTimer::timeout, this, &Chrome::updatePosition);
 +    timer->start();
 +}
-+
-+bool Chrome::chatVisible() const { return chat && chat->isVisible(); }
 +
 +bool Chrome::eventFilter(QObject* watched, QEvent* event)
 +{
@@ -5605,7 +2647,6 @@
 +    }
 +    return QObject::eventFilter(watched, event);
 +}
-+void Chrome::toggleChat() { if (chat) { chat->setVisible(!chat->isVisible()); if (chat->isVisible()) chat->raise(); } }
 +
 +void Chrome::updateTitleBar()
 +{
@@ -5808,6 +2849,7 @@
 +    bar->setResizeMode(QQuickWidget::SizeRootObjectToView);
 +    bar->setFixedHeight(30);
 +    bar->rootContext()->setContextProperty(QStringLiteral("chrome"), chrome);
++    bar->rootContext()->setContextProperty(QStringLiteral("anthraciteController"), sidebarController());
 +    bar->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/StatusBar.qml")));
 +    // Keep native command hints, progress, and navigation. Only the duplicate
 +    // coordinate/measurement label is replaced by the QML coordinate display.
@@ -5828,7 +2870,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,38 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#pragma once
 +
@@ -5847,14 +2889,11 @@
 +    Q_PROPERTY(QString latestMessage READ latestMessage NOTIFY changed)
 +    Q_PROPERTY(QString coordinates READ coordinates NOTIFY changed)
 +    Q_PROPERTY(QString coordinateSource READ coordinateSource NOTIFY changed)
-+    Q_PROPERTY(bool chatVisible READ chatVisible NOTIFY changed)
 +public:
 +    explicit Chrome(QDockWidget* dock);
 +    QString latestMessage() const { return latest; }
 +    QString coordinates() const { return position; }
 +    QString coordinateSource() const { return source; }
-+    bool chatVisible() const;
-+    Q_INVOKABLE void toggleChat();
 +    Q_INVOKABLE void toggleConsole();
 +Q_SIGNALS:
 +    void changed();
@@ -5872,7 +2911,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,123 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -5965,18 +3004,34 @@
 +        }
 +        Divider { objectName: "AnthraciteAgentDivider" }
 +        ToolButton {
-+            objectName: "AnthraciteChatToggle"
++            id: bridgeIndicator
++            objectName: "AnthraciteBridgeIndicator"
 +            Layout.fillHeight: true
-+            Layout.preferredWidth: 34
-+            icon.source: "qrc:/Anthracite/icons/hexagon.svg"
-+            icon.width: 18; icon.height: 18
-+            icon.color: "transparent"
-+            Accessible.name: qsTr("Show or hide agent")
-+            checkable: true
-+            checked: chrome.chatVisible
-+            onClicked: chrome.toggleChat()
-+            Hint { hovered: parent.hovered; text: qsTr("Show or hide agent") }
-+            background: Rectangle { radius: 4; color: chrome.chatVisible ? palette.highlight : "transparent" }
++            Layout.preferredWidth: bridgeRow.implicitWidth + 20
++            Accessible.name: qsTr("Anthracite bridge status")
++            onClicked: anthraciteController.copyBridgeConfig()
++            contentItem: RowLayout {
++                id: bridgeRow
++                spacing: 6
++                Rectangle {
++                    objectName: "AnthraciteBridgeDot"
++                    Layout.preferredWidth: 8
++                    Layout.preferredHeight: 8
++                    radius: 4
++                    color: anthraciteController.bridgeRunning ? "#4caf50" : palette.mid
++                }
++                Text {
++                    objectName: "AnthraciteBridgeLabel"
++                    text: anthraciteController.bridgeRunning
++                          ? (anthraciteController.bridgeClients > 0
++                             ? qsTr("Bridge :%1 · %2").arg(anthraciteController.bridgePort).arg(anthraciteController.bridgeClients)
++                             : qsTr("Bridge :%1").arg(anthraciteController.bridgePort))
++                          : qsTr("Bridge offline")
++                    color: palette.windowText
++                    font.pixelSize: 12
++                }
++            }
++            Hint { hovered: parent.hovered; text: anthraciteController.bridgeCommand }
 +        }
 +    }
 +}
@@ -6331,7 +3386,7 @@
 +}
 --- a/src/Gui/NotificationArea.cpp
 +++ b/src/Gui/NotificationArea.cpp
-@@ -946,7 +946,7 @@ NotificationArea::NotificationArea(QWidg
+@@ -946,7 +946,7 @@
          qApp->sendEvent(pImp->menu, &re);
  
          // This corrects the position of the menu
@@ -6340,7 +3395,7 @@
              QWidget* statusbar = static_cast<QWidget*>(this->parent());
              QPoint statusbar_top_right = statusbar->mapToGlobal(statusbar->rect().topRight());
              QSize menusize = pImp->menu->size();
-@@ -1243,6 +1243,7 @@ void NotificationArea::showInNotificatio
+@@ -1243,6 +1243,7 @@
                  if (!item->isShown()) {
                      QTimer::singleShot(
                          pImp->notificationExpirationTime,
@@ -6398,7 +3453,7 @@
 +}
 --- a/src/Gui/WorkbenchSelector.cpp
 +++ b/src/Gui/WorkbenchSelector.cpp
-@@ -358,11 +358,13 @@ int WorkbenchTabWidget::addWorkbenchTab(
+@@ -358,11 +358,13 @@
      }
  
      tabBar->setTabToolTip(tabIndex, action->toolTip());
@@ -6422,7 +3477,7 @@
  #include <QMenu>
  #include <QToolButton>
  #include <QLayout>
-@@ -75,13 +76,77 @@ class GuiExport WorkbenchTabWidget: publ
+@@ -75,13 +76,77 @@
      public:
          explicit WbTabBar(QWidget* parent)
              : QTabBar(parent)
@@ -6502,7 +3557,7 @@
                  return sizeFromParent;
              }
  
-@@ -139,6 +204,7 @@ class GuiExport WorkbenchTabWidget: publ
+@@ -139,6 +204,7 @@
          }
  
      private:

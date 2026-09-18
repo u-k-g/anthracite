@@ -20,13 +20,15 @@
      value(BUILD_CLOUD)
 --- /dev/null
 +++ b/src/Mod/Anthracite/CMakeLists.txt
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,66 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +set(Anthracite_Scripts
 +    AnthraciteExecutor.py
 +    AnthraciteInspect.py
 +    AnthraciteHistory.py
++    AnthraciteBridge.py
++    anthracite-mcp
 +    Init.py
 +    TestAnthracite.py
 +)
@@ -91,11 +93,63 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 --- /dev/null
 +++ b/src/Mod/Anthracite/InitGui.py
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,56 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
-+# Importing the native module registers the sidebar and its command.
++# Importing the native module registers the dock and its commands. FreeCAD executes
++# this file with separate globals and locals, so nothing module-level is visible
++# inside the deferred callback; keep everything it needs local to the function.
 +import AnthraciteGui  # noqa: F401
++
++
++def _start_bridge():
++    import json
++
++    import FreeCAD
++
++    import AnthraciteBridge
++    import AnthraciteGui
++
++    mcp_script = AnthraciteBridge.mcp_path()
++
++    def push(method_name, payload):
++        method = getattr(AnthraciteGui, method_name, None)
++        if method is None:
++            return
++        try:
++            method(json.dumps(payload))
++        except Exception:
++            pass
++
++    def push_status():
++        status = AnthraciteBridge.status()
++        status["discoveryPath"] = AnthraciteBridge.discovery_path()
++        status["mcpCommand"] = f"python3 {mcp_script}"
++        status["mcpConfig"] = json.dumps(
++            {"mcpServers": {"anthracite": {"command": "python3", "args": [mcp_script]}}},
++            indent=2,
++        )
++        push("push_bridge_status", status)
++
++    def forward(event):
++        if event.get("kind") == "operation":
++            push("push_activity", event)
++        push_status()
++
++    try:
++        AnthraciteBridge.start()
++        AnthraciteBridge.subscribe(forward)
++        for operation in AnthraciteBridge.recent(200):
++            push("push_activity", {"kind": "operation", "operation": operation})
++        push_status()
++    except Exception as error:  # Never block FreeCAD startup on the bridge.
++        FreeCAD.Console.PrintWarning(f"Anthracite bridge did not start: {error}\n")
++
++
++# Defer to the first event-loop turn so the Qt application is fully running.
++from PySide6 import QtCore  # noqa: E402
++
++QtCore.QTimer.singleShot(0, _start_bridge)
 --- a/src/Mod/CMakeLists.txt
 +++ b/src/Mod/CMakeLists.txt
 @@ -6,6 +6,10 @@ if(BUILD_ADDONMGR)

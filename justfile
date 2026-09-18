@@ -12,10 +12,18 @@ build: _require-source
     nix develop --command nu --no-config-file '{{root}}/devutils/native.nu' build '{{build_dir}}'
 
 # Launch with persistent XDG preferences and sessions.
-run:
+run: skill-sync
     nix develop --command nu --no-config-file '{{root}}/devutils/native.nu' exec nu --no-config-file '{{root}}/devutils/launch.nu' '{{build_dir}}/bin/FreeCAD'
 
-# Rust (cargo-nextest) and isolated GUI, executor, and provider-bridge tests.
+# Mirror this repository's Anthracite skill onto ~/.agents/skills/anthracite.
+skill-sync:
+    @nu --no-config-file '{{root}}/devutils/skill.nu'
+
+# Register the Anthracite MCP server with an agent: `just connect codex`, `just connect opencode`.
+connect agent='':
+    @nu --no-config-file '{{root}}/devutils/mcp.nu' '{{agent}}'
+
+# Isolated FreeCAD GUI, executor, and bridge tests without real model calls.
 test:
     nix develop --command nu --no-config-file '{{root}}/tests/runtests.nu'
 

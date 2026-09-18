@@ -17,11 +17,6 @@ def main [] {
     let build = if (sys host | get name) == "Darwin" { $root | path join build src build debug } else { $root | path join build native }
     $env.ANTHRACITE_TEST_LAUNCHER = $root | path join devutils launch.nu
     $env.ANTHRACITE_TEST_NU = $nu.current-exe
-    let rust = ^nu --no-config-file ($root | path join devutils native.nu) exec cargo nextest run --locked --features test-fixtures --manifest-path ($root | path join build src src Mod Anthracite Runtime Cargo.toml) | complete
-    let rust_output = $rust.stdout + $rust.stderr
-    $rust_output | save ($directory | path join nextest.log)
-    print $rust_output
-    if $rust.exit_code != 0 { error make {msg: $"Rust tests failed. Logs retained at ($directory)"} }
     for test in [[script executable marker]; [executor.py FreeCADCmd ANTHRACITE_EXECUTOR_TESTS_OK] [smoke.py FreeCAD ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py FreeCAD ANTHRACITE_BRIDGE_SMOKE_OK]] {
         let result = ^nu --no-config-file ($root | path join devutils native.nu) exec $nu.current-exe --no-config-file ($root | path join devutils launch.nu) ($build | path join bin $test.executable) ($root | path join tests $test.script) | complete
         let output = $result.stdout + $result.stderr
@@ -32,5 +27,5 @@ def main [] {
         }
     }
     rm -r $directory
-    print "All Rust and FreeCAD integration tests passed."
+    print "All FreeCAD integration tests passed."
 }

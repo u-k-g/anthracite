@@ -1,6 +1,6 @@
 #!/usr/bin/env nu
 # SPDX-License-Identifier: LGPL-2.1-or-later
-def --wrapped main [executable: string, --supervisor: path, ...arguments: string] {
+def --wrapped main [executable: string, ...arguments: string] {
     let roots = {
         config: ($env.XDG_CONFIG_HOME? | default ($env.HOME | path join .config))
         data: ($env.XDG_DATA_HOME? | default ($env.HOME | path join .local share))
@@ -17,6 +17,5 @@ def --wrapped main [executable: string, --supervisor: path, ...arguments: string
     $env.FREECAD_USER_DATA = $roots.data
     $env.FREECAD_USER_TEMP = $roots.cache
     $env.QSG_RHI_BACKEND = "opengl"
-    let runtime = $supervisor | default ($executable | path expand | path dirname | path dirname | path join Mod Anthracite anthracite-runtime)
-    exec $runtime --supervise $executable --user-cfg ($roots.config | path join user.cfg) --system-cfg ($roots.config | path join system.cfg) ...$arguments
+    exec $executable --user-cfg ($roots.config | path join user.cfg) --system-cfg ($roots.config | path join system.cfg) ...$arguments
 }

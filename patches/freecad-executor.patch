@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1385 @@
+@@ -0,0 +1,1410 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -868,11 +868,25 @@
 +        return {"scheduled": True, **self.render_request}
 +
 +
++def _resolve_picked_object(doc, object_name, subelement):
++    """FreeCAD reports sub-feature picks as 'Feature.FaceN'; reference the owning feature."""
++    if not subelement:
++        return object_name, ""
++    parts = subelement.split(".")
++    if len(parts) < 2:
++        return object_name, subelement
++    owner, element = parts[-2], parts[-1]
++    if doc.getObject(owner) is not None:
++        return owner, element
++    return object_name, subelement
++
++
 +def picked_reference_json(document, object_name, subelement, x, y, z) -> str:
 +    """Native picker feedback; labels are display only, references are exact and expiring."""
 +    doc = App.ActiveDocument
 +    if doc is None or doc.Name != document:
 +        raise ValueError("Pick geometry in the active document.")
++    object_name, subelement = _resolve_picked_object(doc, object_name, subelement)
 +    reference = {"document": doc.Name, "documentToken": Inspect.document_token(doc),
 +                 "object": object_name, "subelement": subelement,
 +                 "revision": _revisions.get(doc.Name, 0)}
@@ -1030,7 +1044,18 @@
 +            except Exception as error:
 +                return {"ok": False, "notExecuted": True,
 +                        "error": {"type": type(error).__name__, "message": str(error)}}
-+        doc = App.newDocument("Anthracite")
++        # Never create a document implicitly: an external agent must open or create one
++        # explicitly so the active document is never an accidental side effect.
++        return {
++            "ok": False,
++            "notExecuted": True,
++            "revision": 0,
++            "error": {
++                "type": "DocumentMissing",
++                "message": ("No active FreeCAD document. Create one explicitly first, "
++                            "for example App.newDocument('Part')."),
++            },
++        }
 +    document_name = doc.Name
 +
 +    revision = _revisions.get(document_name, 0)

@@ -3,6 +3,5 @@
 # Prefer `just patch-edit <name>`; add a patch only for a new semantic owner.
 freecad-module.patch
 freecad-executor.patch
-agent-runtime.patch
-providers.patch
+cad-bridge.patch
 sidebar.patch

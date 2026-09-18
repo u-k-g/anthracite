@@ -7,18 +7,20 @@
 <details open>
 <summary><strong>overview</strong></summary>
 
-Anthracite puts your existing Codex or OpenCode installation in a native FreeCAD sidebar.
-Describe a change, attach images, or pick a face or edge to reference in your message.
-Inspect the agent's work through expandable activity, viewport images, and FreeCAD's
-normal feature tree, properties, and undo history.
+Anthracite exposes FreeCAD to any coding agent on your machine through one checked
+`freecad` tool. The agent runs outside FreeCAD—your existing Codex, OpenCode, Claude Code,
+or any MCP client—and reaches Anthracite over a local bridge. Ask it to inspect or change
+the active document; the Python it sends runs inside FreeCAD as one native transaction
+that recomputes, validates, and then commits or rolls back.
 
-FreeCAD remains the CAD system. The agent submits Python through one checked `freecad`
-tool; document edits recompute and validate inside transactions that commit or roll back.
-A successful recompute does not prove that the design meets your requirements.
+Watch the work in FreeCAD's right-hand dock: one expandable entry per tool call with the
+code, the observation, diagnostics, and the viewport images the executor returned. FreeCAD
+remains the CAD system. A successful recompute does not prove that the design meets your
+requirements.
 
-Your existing agent authentication, configuration, models, skills, and tools remain in use.
-One provider works with the active document at a time; no separate general-purpose agent
-harness or project/worktree manager is added.
+Your existing agent authentication, configuration, models, skills, and tools remain in
+use. One agent operates on the active FreeCAD document at a time; no separate
+general-purpose harness or project manager is added.
 
 </details>
 
@@ -37,18 +39,22 @@ just run
 `just setup` alone checks readiness without changing anything. `--fix` fetches missing
 source/submodules and applies patches; it does not overwrite dirty work.
 `just build` prepares CMake automatically and compiles incrementally.
-`just run` launches without building. Install Codex or OpenCode separately and select it
-in the sidebar.
+`just run` launches without building, and first mirrors this repository's agent skill to
+`~/.agents/skills/anthracite` (also available as `just skill-sync`). Point any MCP client at
+the installed `anthracite-mcp` script—the dock and status bar show the exact command.
+`just connect codex` or `just connect opencode` registers the server with that agent (omit
+the name for both), or prints the exact command when it is not on your PATH.
 
 - **Linux:** Nix supplies native dependencies and tooling. Packaged `nix build` and
   `nix run` are also supported. Development output is in `build/native`.
-- **macOS:** Nix supplies tooling, Rust, and Pixi. FreeCAD's pinned Pixi environment
+- **macOS:** Nix supplies tooling and Pixi. FreeCAD's pinned Pixi environment
   supplies Qt, Python, and CAD libraries—not Homebrew. Dependencies normally arrive as
   binary packages; Anthracite itself is compiled into `build/src/build/debug`.
+  If the default Xcode SDK is newer than the pinned clang/libc++ support, point the build at
+  an older SDK, e.g. `ANTHRACITE_OSX_SYSROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk just build`.
 
-Run `just test` for Rust tests through cargo-nextest and isolated FreeCAD GUI, executor,
-and provider-bridge tests. These use deterministic providers, not real model calls.
-Failure logs remain in `build/test-results/`.
+Run `just test` for isolated FreeCAD GUI, executor, and bridge tests. These use
+deterministic inputs, not real model calls. Failure logs remain in `build/test-results/`.
 
 </details>
 
@@ -59,17 +65,17 @@ The launcher uses XDG paths, with their standard defaults when unset:
 
 - `$XDG_CONFIG_HOME/anthracite`: preferences, dock layout, optional `qml/Main.qml` override
 - `$XDG_DATA_HOME/anthracite`: FreeCAD user data
-- `$XDG_STATE_HOME/anthracite`: `anthracite.sqlite3`, attachment snapshots, checkpoints,
-  and the readable `anthracite.events.jsonl` projection
+- `$XDG_STATE_HOME/anthracite`: `bridge.json` (the running bridge's connection details) and
+  the readable `operations.ndjson` history of tool calls
 - `$XDG_CACHE_HOME/anthracite`: temporary data
 
-SQLite stores sessions and the operation journal; JSONL is for inspection, not recovery.
-Session associations stay outside your `.FCStd` files.
+Session associations stay outside your `.FCStd` files. Delete `operations.ndjson` to clear
+the dock history; the running bridge rewrites `bridge.json` on every launch.
 
 To try local sidebar changes, copy the bundled `Main.qml` to the config override above,
 then run `Gui.runCommand("Anthracite_ReloadSidebar")` in FreeCAD's Python console.
-Reload preserves the provider session; invalid QML leaves the previous view intact.
-Remove the override and reload to return to the bundled UI. Native/Rust changes need a rebuild.
+Reload preserves the live bridge and its history; invalid QML leaves the previous view intact.
+Remove the override and reload to return to the bundled UI. Native changes need a rebuild.
 
 </details>
 
