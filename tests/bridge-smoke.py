@@ -77,6 +77,33 @@ def main():
     history = AnthraciteBridge.recent(20)
     assert any(entry.get("status") == "committed" and entry.get("document") == document.Name for entry in history), history
 
+    # The CLI is the agent-facing interface: same bridge, JSON with shot paths instead
+    # of base64. It runs in a child process, so pump events while it waits on the GUI thread.
+    import subprocess
+    cli = os.path.join(os.path.dirname(AnthraciteBridge.__file__), "anthracite")
+    # Inside FreeCAD, sys.executable is the FreeCAD binary, not a Python interpreter.
+    interpreter = os.environ.get("ANTHRACITE_PYTHON", "python3")
+    program = (
+        "cad.action('CLI resize')\n"
+        "doc.getObject('Box').Length = 25\n"
+        "cad.render(view='front', width=200, height=150)"
+    )
+    child = subprocess.Popen([interpreter, cli, "exec", program],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 60
+    while child.poll() is None and time.time() < deadline:
+        application.processEvents()
+        time.sleep(0.05)
+    stdout, stderr = child.communicate(timeout=10)
+    assert child.returncode == 0, f"cli failed: {stderr}"
+    payload = json.loads(stdout)
+    assert payload["ok"] is True, payload
+    assert "images" not in payload, "the CLI must not print base64 images"
+    shots = payload.get("shots") or []
+    assert shots, payload
+    assert all(os.path.isfile(shot["path"]) for shot in shots), shots
+    assert abs(document.getObject("Box").Length.Value - 25.0) < 1e-6, "the CLI edit did not apply"
+
     client.close()
     AnthraciteBridge.stop()
     App.closeDocument(document.Name)

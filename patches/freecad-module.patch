@@ -1,6 +1,6 @@
 --- a/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
 +++ b/cMake/FreeCAD_Helpers/InitializeFreeCADBuildOptions.cmake
-@@ -103,6 +103,7 @@ macro(InitializeFreeCADBuildOptions)
+@@ -103,6 +103,7 @@
      option(BUILD_SANDBOX "Build the FreeCAD Sandbox module which is only for testing purposes" OFF)
      option(BUILD_TEMPLATE "Build the FreeCAD template module which is only for testing purposes" OFF)
      option(BUILD_ADDONMGR "Build the FreeCAD addon manager module" ON)
@@ -10,7 +10,7 @@
      option(BUILD_DRAWING "Build the FreeCAD drawing module" OFF)
 --- a/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
 +++ b/cMake/FreeCAD_Helpers/PrintFinalReport.cmake
-@@ -91,6 +91,7 @@ macro(PrintFinalReport)
+@@ -91,6 +91,7 @@
      value(FREECAD_USE_PYSIDE)
      value(FREECAD_USE_SHIBOKEN)
      value(BUILD_ADDONMGR)
@@ -28,7 +28,7 @@
 +    AnthraciteInspect.py
 +    AnthraciteHistory.py
 +    AnthraciteBridge.py
-+    anthracite-mcp
++    anthracite
 +    Init.py
 +    TestAnthracite.py
 +)
@@ -93,7 +93,7 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 --- /dev/null
 +++ b/src/Mod/Anthracite/InitGui.py
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,53 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +# Importing the native module registers the dock and its commands. FreeCAD executes
@@ -110,7 +110,7 @@
 +    import AnthraciteBridge
 +    import AnthraciteGui
 +
-+    mcp_script = AnthraciteBridge.mcp_path()
++    cli_script = AnthraciteBridge.cli_path()
 +
 +    def push(method_name, payload):
 +        method = getattr(AnthraciteGui, method_name, None)
@@ -124,11 +124,8 @@
 +    def push_status():
 +        status = AnthraciteBridge.status()
 +        status["discoveryPath"] = AnthraciteBridge.discovery_path()
-+        status["mcpCommand"] = f"python3 {mcp_script}"
-+        status["mcpConfig"] = json.dumps(
-+            {"mcpServers": {"anthracite": {"command": "python3", "args": [mcp_script]}}},
-+            indent=2,
-+        )
++        status["cliCommand"] = "anthracite exec '<python>'"
++        status["cliHint"] = f"python3 {cli_script} exec '<python>'"
 +        push("push_bridge_status", status)
 +
 +    def forward(event):
@@ -152,7 +149,7 @@
 +QtCore.QTimer.singleShot(0, _start_bridge)
 --- a/src/Mod/CMakeLists.txt
 +++ b/src/Mod/CMakeLists.txt
-@@ -6,6 +6,10 @@ if(BUILD_ADDONMGR)
+@@ -6,6 +6,10 @@
    add_subdirectory(AddonManager)
  endif(BUILD_ADDONMGR)
  

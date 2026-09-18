@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1535 @@
+@@ -0,0 +1,1562 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -41,6 +41,9 @@
 +_last_changes = {}
 +_recompute_writes = {}
 +_observed_snapshots = {}
++# True while a document-creating program runs, so cad.verify() schedules instead of
++# resolving immediately (there is no document yet when execution starts).
++_creation_in_progress = False
 +
 +
 +def _bump_revision(doc: Any) -> None:
@@ -767,7 +770,7 @@
 +        return Inspect.parameters(self.doc, obj)
 +
 +    def verify(self, checks):
-+        if self.doc.Name in _executing_docs:
++        if self.doc is not None and (self.doc.Name in _executing_docs or _creation_in_progress):
 +            self.check_requests.append(checks)
 +            return {"scheduled": True, "note": "Checks run after final recompute; see verification in the result."}
 +        return Inspect.verify(self.doc, checks, _revisions.get(self.doc.Name, 0))
@@ -1060,10 +1063,13 @@
 +        # Nothing was edited through a transaction, so suppress the external-change
 +        # observer: the whole program is this one call, not a series of user edits.
 +        App.removeDocumentObserver(_revision_observer)
++        global _creation_in_progress
++        _creation_in_progress = True
 +        try:
 +            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
 +                exec(code, namespace, namespace)
 +        finally:
++            _creation_in_progress = False
 +            App.addDocumentObserver(_revision_observer)
 +    except Exception as error:
 +        return {
@@ -1121,6 +1127,26 @@
 +    changed = before != after
 +    revision += int(changed)
 +    _revisions[name] = revision
++    verification = [Inspect.verify(document, checks, revision) for checks in cad.check_requests]
++    observation = _observation(document, before, after)
++    images = []
++    specs = [cad.render_request] if cad.render_request is not None else cad.render_views_request
++    for spec in specs:
++        spec["revision"] = revision
++    if specs:
++        try:
++            progress("rendering")
++            rendered = _render_views(specs)
++        except Exception as error:
++            observation["visualFeedback"] = {"status": "failed", "reason": str(error)}
++        else:
++            observation["renders"] = [
++                {"imageIndex": index, **{key: value for key, value in image.items() if key != "dataUrl"}}
++                for index, image in enumerate(rendered)
++            ]
++            if len(rendered) == 1:
++                observation["render"] = observation["renders"][0]
++            images = [image["dataUrl"] for image in rendered]
 +    return {
 +        "ok": True,
 +        "revisionBefore": revision - int(changed),
@@ -1128,9 +1154,10 @@
 +        "stdout": _bounded(stdout.getvalue()),
 +        "stderr": _bounded(stderr.getvalue()),
 +        "result": _json_safe(namespace.get("_result")),
-+        "observation": _observation(document, before, after),
++        "observation": observation,
 +        "events": cad.events,
-+        "images": [],
++        "verification": verification,
++        "images": images,
 +        "createdDocument": name,
 +    }
 +

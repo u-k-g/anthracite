@@ -19,9 +19,9 @@ run: skill-sync
 skill-sync:
     @nu --no-config-file '{{root}}/devutils/skill.nu'
 
-# Register the Anthracite MCP server with an agent: `just connect codex`, `just connect opencode`.
-connect agent='':
-    @nu --no-config-file '{{root}}/devutils/mcp.nu' '{{agent}}'
+# Install the Anthracite CLI on PATH and mirror the agent skill.
+connect: skill-sync
+    @nu --no-config-file '{{root}}/devutils/cli.nu'
 
 # Isolated FreeCAD GUI, executor, and bridge tests without real model calls.
 test:

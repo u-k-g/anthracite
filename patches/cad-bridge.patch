@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteBridge.py
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,678 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite bridge: expose the checked FreeCAD executor to external agents.
 +
@@ -11,8 +11,8 @@
 +``AnthraciteExecutor``; this module only transports commands, serializes execution
 +across clients, and records an inspectable operation log.
 +
-+Agents reach the bridge through ``anthracite-mcp`` (a stdio MCP server). Connection
-+details are published to a discovery file; nothing here speaks MCP.
++Agents reach the bridge through the ``anthracite`` command-line client. Connection
++details are published to a discovery file; the bridge itself speaks no agent protocol.
 +"""
 +
 +from __future__ import annotations
@@ -62,7 +62,7 @@
 +
 +def _state_directory() -> str:
 +    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-+    return os.path.join(base, "anthracite")
++    return os.path.join(base, ".anthracite")
 +
 +
 +def discovery_path() -> str:
@@ -73,9 +73,9 @@
 +    return os.path.join(_state_directory(), "operations.ndjson")
 +
 +
-+def mcp_path() -> str:
-+    """Absolute path to the stdio MCP server bundled beside this module."""
-+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "anthracite-mcp")
++def cli_path() -> str:
++    """Absolute path to the command-line client bundled beside this module."""
++    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "anthracite")
 +
 +
 +def _utc_now() -> str:
@@ -152,6 +152,7 @@
 +        self._clients = 0
 +        self._busy = False
 +        self._blocked = False
++        self._blocked_reason = ""
 +        self._ring: collections.deque = collections.deque(maxlen=200)
 +        self._subscribers: list[Callable[[dict], None]] = []
 +        self._log_lock = threading.Lock()
@@ -228,6 +229,7 @@
 +            "revision": self._context["revision"],
 +            "busy": self._busy,
 +            "blocked": self._blocked,
++            "blockedReason": self._blocked_reason,
 +            "queued": len(self._queue),
 +            "clients": self._clients,
 +        }
@@ -324,23 +326,30 @@
 +
 +    # -- GUI-thread execution ---------------------------------------------
 +
-+    def _interaction_blocked(self) -> bool:
++    def _interaction_block(self) -> str:
++        """Why a queued call must wait: a modal dialog or a held mouse button."""
 +        application = QtWidgets.QApplication.instance()
 +        if application is None:
-+            return False
-+        if application.activeModalWidget() is not None:
-+            return True
-+        return application.mouseButtons() != QtCore.Qt.MouseButton.NoButton
++            return ""
++        modal = application.activeModalWidget()
++        if modal is not None:
++            return f"modal:{type(modal).__name__}"
++        if application.mouseButtons() != QtCore.Qt.MouseButton.NoButton:
++            return "mouse"
++        return ""
 +
 +    def _drain(self) -> None:
 +        while True:
 +            with self._queue_lock:
 +                if not self._queue:
 +                    self._blocked = False
++                    self._blocked_reason = ""
 +                    return
 +                pending = self._queue[0]
-+            if self._interaction_blocked():
++            reason = self._interaction_block()
++            if reason:
 +                self._blocked = True
++                self._blocked_reason = reason
 +                return
 +            with self._queue_lock:
 +                self._queue.popleft()
@@ -671,82 +680,52 @@
 +def unsubscribe(callback: Callable[[dict], None]) -> None:
 +    _bridge.unsubscribe(callback)
 --- /dev/null
-+++ b/src/Mod/Anthracite/anthracite-mcp
-@@ -0,0 +1,332 @@
++++ b/src/Mod/Anthracite/anthracite
+@@ -0,0 +1,325 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: LGPL-2.1-or-later
-+"""Stdio MCP server for the Anthracite FreeCAD bridge.
++"""Anthracite command-line client.
 +
-+Exposes one tool, ``freecad``, that runs ordinary FreeCAD Python inside a running
-+FreeCAD GUI through the Anthracite bridge. This process is spawned by an MCP client
-+and speaks the Model Context Protocol on stdin/stdout; it only forwards one command
-+per call over a loopback socket to the FreeCAD process.
++Runs FreeCAD Python through the running Anthracite bridge and prints the observation
++as JSON. Viewport images are written to disk and reported by path, so a harness reads
++them as ordinary files instead of base64 in the transcript.
 +
-+The bridge must already be running. Connection details are read from the discovery
-+file written by Anthracite ($XDG_STATE_HOME/anthracite/bridge.json by default), which
-+can be overridden with ANTHRACITE_BRIDGE, --bridge, or ANTHRACITE_HOST/PORT/TOKEN.
++    anthracite exec 'doc.addObject("Part::Box", "Box")'
++    anthracite exec build.py
++    anthracite exec -            # read the program from stdin
++    anthracite status
++    anthracite shots
 +"""
 +
 +from __future__ import annotations
 +
 +import argparse
++import base64
++import datetime
 +import json
 +import os
 +import socket
 +import sys
-+import threading
-+import time
++import uuid
 +from pathlib import Path
 +
-+SERVER_NAME = "anthracite"
-+SERVER_VERSION = "0.1.0"
-+DEFAULT_PROTOCOL_VERSION = "2024-11-05"
-+
-+TOOL = {
-+    "name": "freecad",
-+    "description": (
-+        "Run a complete FreeCAD Python program inside the running FreeCAD GUI through "
-+        "Anthracite. App, FreeCAD, Gui, doc (the active document), and cad (an inspection "
-+        "helper) are prebound. The whole program runs as one native transaction that "
-+        "recomputes and validates before committing, or rolls back on failure, and returns "
-+        "a structured observation. Discover APIs with cad.guide() and cad.api(); inspect "
-+        "before editing; never guess face or edge indices after an edit."
-+    ),
-+    "inputSchema": {
-+        "type": "object",
-+        "properties": {
-+            "code": {
-+                "type": "string",
-+                "description": "Complete ordinary FreeCAD Python source.",
-+            }
-+        },
-+        "required": ["code"],
-+        "additionalProperties": False,
-+    },
-+}
-+
-+INSTRUCTIONS = (
-+    "Anthracite drives a running FreeCAD GUI through one checked tool. Send ordinary "
-+    "FreeCAD Python; it runs as a single native transaction that recomputes, validates, "
-+    "and then commits or rolls back. Inspect before editing with cad.tree(), "
-+    "cad.inspect(), cad.diagnostics(), and cad.guide(). Read the observation: ok, revision, "
-+    "editReceipt, verification, diagnostics, images, and nextActions. A successful recompute "
-+    "is not proof of design correctness; schedule checks with cad.verify([...]) and report "
-+    "only what you checked. Topology references expire whenever the revision changes, so "
-+    "never reuse a guessed face or edge index after an edit. If a call's outcome is unknown, "
-+    "inspect before retrying."
-+)
++CLIENT = "cli"
++MAX_SHOTS = 300
++DEFAULT_PROTOCOL = 1
 +
 +
 +def state_directory() -> Path:
-+    override = os.environ.get("XDG_STATE_HOME")
-+    if override:
-+        return Path(override) / "anthracite"
-+    return Path.home() / ".local" / "state" / "anthracite"
++    base = os.environ.get("XDG_STATE_HOME")
++    root = Path(base) if base else Path.home() / ".local" / "state"
++    return root / ".anthracite"
 +
 +
-+def default_discovery_path() -> Path:
++def discovery_path() -> Path:
 +    return state_directory() / "bridge.json"
++
++
++def shots_directory() -> Path:
++    return state_directory() / "shots"
 +
 +
 +class BridgeError(RuntimeError):
@@ -763,7 +742,6 @@
 +        self._socket: socket.socket | None = None
 +        self._reader = None
 +        self._writer = None
-+        self._lock = threading.Lock()
 +        self._request_id = 0
 +
 +    def _connect(self) -> None:
@@ -771,11 +749,10 @@
 +            connection = socket.create_connection((self._host, self._port), timeout=30.0)
 +        except OSError as error:
 +            raise BridgeError(
-+                "Anthracite bridge is not running. Open FreeCAD with Anthracite, "
-+                f"then retry. ({error})"
++                "the Anthracite bridge is not running; open FreeCAD with Anthracite. "
++                f"({error})"
 +            ) from error
-+        # CAD operations can legitimately run longer than the connect timeout; the
-+        # session must block until the bridge answers rather than time out mid-call.
++        # CAD work can legitimately outlast the connect timeout.
 +        connection.settimeout(None)
 +        connection.sendall(f"{self._token}\n".encode("utf-8"))
 +        self._socket = connection
@@ -798,209 +775,234 @@
 +        self._writer = None
 +
 +    def send(self, request_type: str, params: dict | None = None) -> dict:
-+        with self._lock:
-+            if self._socket is None:
-+                self._connect()
-+            self._request_id += 1
-+            request = {"id": self._request_id, "type": request_type, "params": params or {}}
-+            try:
-+                assert self._writer is not None and self._reader is not None
-+                self._writer.write(
-+                    (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
-+                )
-+                self._writer.flush()
-+                line = self._reader.readline()
-+            except OSError as error:
-+                self.close()
-+                raise BridgeError(
-+                    f"Lost the connection to the Anthracite bridge: {error}"
-+                ) from error
-+            if not line:
-+                self.close()
-+                raise BridgeError(
-+                    "The Anthracite bridge closed the connection. Is FreeCAD still running?"
-+                )
-+            try:
-+                response = json.loads(line.decode("utf-8"))
-+            except (ValueError, UnicodeDecodeError) as error:
-+                self.close()
-+                raise BridgeError(f"The Anthracite bridge returned invalid data: {error}") from error
-+            if response.get("status") != "ok":
-+                raise BridgeError(response.get("message") or "The Anthracite bridge rejected the call.")
-+            return response
++        if self._socket is None:
++            self._connect()
++        self._request_id += 1
++        request = {"id": self._request_id, "type": request_type, "params": params or {}}
++        try:
++            assert self._writer is not None and self._reader is not None
++            self._writer.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
++            self._writer.flush()
++            line = self._reader.readline()
++        except OSError as error:
++            self.close()
++            raise BridgeError(f"lost the connection to the Anthracite bridge: {error}") from error
++        if not line:
++            self.close()
++            raise BridgeError("the Anthracite bridge closed the connection; is FreeCAD still running?")
++        try:
++            response = json.loads(line.decode("utf-8"))
++        except (ValueError, UnicodeDecodeError) as error:
++            self.close()
++            raise BridgeError(f"the Anthracite bridge returned invalid data: {error}") from error
++        if response.get("status") != "ok":
++            raise BridgeError(response.get("message") or "the Anthracite bridge rejected the call.")
++        return response
 +
 +
 +def resolve_connection(args) -> tuple[str, int, str]:
-+    path = Path(args.bridge).expanduser() if args.bridge else default_discovery_path()
-+    host = args.host
-+    port = args.port
-+    token = args.token
++    path = Path(args.bridge).expanduser() if args.bridge else discovery_path()
++    host, port, token = args.host, args.port, args.token
 +    if host is None or port is None or token is None:
 +        try:
 +            discovery = json.loads(path.read_text(encoding="utf-8"))
 +        except FileNotFoundError:
 +            raise BridgeError(
-+                f"No Anthracite bridge discovery file at {path}. Open FreeCAD with Anthracite running."
++                f"no Anthracite bridge discovery file at {path}; open FreeCAD with Anthracite running."
 +            )
 +        except (OSError, ValueError) as error:
-+            raise BridgeError(f"Could not read the Anthracite bridge discovery file {path}: {error}")
++            raise BridgeError(f"could not read the Anthracite bridge discovery file {path}: {error}")
 +        host = host or discovery.get("host")
 +        port = port if port is not None else discovery.get("port")
 +        token = token or discovery.get("token")
 +    if not host or not port or not token:
-+        raise BridgeError(f"The Anthracite bridge discovery file {path} is incomplete.")
++        raise BridgeError(f"the Anthracite bridge discovery file {path} is incomplete.")
 +    return host, int(port), token
 +
 +
-+def image_content(data_url: str) -> dict | None:
-+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
-+        return None
-+    header, _, encoded = data_url.partition(",")
-+    if not encoded:
-+        return None
-+    mime = header[len("data:") :].split(";", 1)[0] or "image/png"
-+    if ";base64" not in header:
-+        return None
-+    return {"type": "image", "data": encoded, "mimeType": mime}
-+
-+
-+def call_tool(bridge: Bridge, client: str, arguments: dict) -> dict:
-+    code = arguments.get("code")
-+    if not isinstance(code, str) or not code.strip():
-+        return {
-+            "content": [{"type": "text", "text": "The freecad tool needs a non-empty 'code' string."}],
-+            "isError": True,
-+        }
++def prune_shots(directory: Path) -> None:
 +    try:
-+        response = bridge.send("execute", {"code": code, "client": client})
++        files = sorted(directory.glob("*.png"), key=lambda item: item.stat().st_mtime, reverse=True)
++    except OSError:
++        return
++    for stale in files[MAX_SHOTS:]:
++        try:
++            stale.unlink()
++        except OSError:
++            pass
++
++
++def write_shots(images: list) -> list[Path]:
++    """Decode viewport data URLs into PNG files and return their paths in order."""
++    written: list[Path] = []
++    directory = shots_directory()
++    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
++    for index, data_url in enumerate(images):
++        if not isinstance(data_url, str) or not data_url.startswith("data:") or ";base64," not in data_url:
++            continue
++        _, encoded = data_url.split(",", 1)
++        try:
++            payload = base64.b64decode(encoded)
++        except (ValueError, TypeError):
++            continue
++        try:
++            directory.mkdir(parents=True, exist_ok=True)
++            path = directory / f"{stamp}-{index}-{uuid.uuid4().hex[:8]}.png"
++            path.write_bytes(payload)
++        except OSError as error:
++            print(f"anthracite: could not write a shot: {error}", file=sys.stderr)
++            continue
++        written.append(path)
++    if written:
++        prune_shots(directory)
++    return written
++
++
++def present(result: dict, shots: list[Path]) -> dict:
++    """Replace base64 image payloads with file paths a harness can read."""
++    renders = (result.get("observation") or {}).get("renders") or []
++    by_index = {entry.get("imageIndex"): entry for entry in renders if isinstance(entry, dict)}
++    entries = []
++    for index, path in enumerate(shots):
++        entry = {"imageIndex": index, "path": str(path)}
++        meta = by_index.get(index)
++        if meta:
++            entry.update({key: value for key, value in meta.items() if key != "dataUrl"})
++        entries.append(entry)
++    presented = dict(result)
++    presented.pop("images", None)
++    presented["shots"] = entries
++    return presented
++
++
++def summarize(result: dict, shots: list[Path]) -> str:
++    state = "ok" if result.get("ok") else "rolled_back" if result.get("rolledBack") else \
++        "rejected" if result.get("notExecuted") or result.get("conflict") else "failed"
++    parts = [state, f"revision {result.get('revision')}"]
++    if result.get("action"):
++        parts.append(str(result["action"].get("label") or "edit"))
++    if shots:
++        parts.append(f"{len(shots)} shot(s) in {shots_directory()}")
++    error = (result.get("error") or {}).get("message")
++    if error:
++        parts.append(str(error))
++    return " · ".join(parts)
++
++
++def read_source(args) -> str:
++    if args.file:
++        return Path(args.file).read_text(encoding="utf-8")
++    source = args.source
++    if source is None or source == "-":
++        return sys.stdin.read()
++    candidate = Path(source)
++    if candidate.is_file() and candidate.suffix in (".py", ".txt"):
++        return candidate.read_text(encoding="utf-8")
++    return source
++
++
++def command_exec(args) -> int:
++    source = read_source(args)
++    if not source.strip():
++        print("anthracite: no program given", file=sys.stderr)
++        return 2
++    host, port, token = resolve_connection(args)
++    bridge = Bridge(host, port, token)
++    try:
++        # A modal dialog or a held mouse button defers execution on the GUI thread; say so
++        # rather than appearing to hang.
++        try:
++            preflight = bridge.send("status")
++        except BridgeError:
++            preflight = {}
++        if preflight.get("blocked"):
++            print(f"anthracite: FreeCAD is waiting on {preflight.get('blockedReason') or 'user interaction'}; "
++                  "the call runs once that clears.", file=sys.stderr)
++        response = bridge.send("execute", {"code": source, "client": CLIENT})
 +    except BridgeError as error:
-+        return {"content": [{"type": "text", "text": str(error)}], "isError": True}
++        print(f"anthracite: {error}", file=sys.stderr)
++        return 2
++    finally:
++        bridge.close()
 +    result = response.get("result", {})
-+    content: list[dict] = [
-+        {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}
-+    ]
-+    for data_url in response.get("images", []):
-+        image = image_content(data_url)
-+        if image is not None:
-+            content.append(image)
-+    return {"content": content, "isError": False}
++    shots = write_shots(response.get("images", []))
++    print(json.dumps(present(result, shots), indent=2, ensure_ascii=False))
++    print(f"anthracite: {summarize(result, shots)}", file=sys.stderr)
++    return 0 if result.get("ok") else 1
 +
 +
-+def error_response(request_id, code: int, message: str) -> dict:
-+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
++def command_status(args) -> int:
++    host, port, token = resolve_connection(args)
++    bridge = Bridge(host, port, token)
++    try:
++        response = bridge.send("status")
++    except BridgeError as error:
++        print(f"anthracite: {error}", file=sys.stderr)
++        return 2
++    finally:
++        bridge.close()
++    print(json.dumps({key: value for key, value in response.items() if key != "id"},
++                     indent=2, ensure_ascii=False))
++    return 0
 +
 +
-+def handle_message(message: dict, bridge: Bridge, client: str) -> dict | None:
-+    method = message.get("method")
-+    request_id = message.get("id")
-+    is_notification = "id" not in message or request_id is None
-+
-+    if method == "initialize":
-+        requested = message.get("params", {}).get("protocolVersion")
-+        return {
-+            "jsonrpc": "2.0",
-+            "id": request_id,
-+            "result": {
-+                "protocolVersion": requested if isinstance(requested, str) else DEFAULT_PROTOCOL_VERSION,
-+                "capabilities": {"tools": {}},
-+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-+                "instructions": INSTRUCTIONS,
-+            },
-+        }
-+    if method in ("notifications/initialized", "initialized"):
-+        return None
-+    if method == "ping":
-+        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
-+    if method == "tools/list":
-+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": [TOOL]}}
-+    if method == "tools/call":
-+        params = message.get("params", {})
-+        if params.get("name") != TOOL["name"]:
-+            if is_notification:
-+                return None
-+            return error_response(request_id, -32602, f"Unknown tool: {params.get('name')!r}")
-+        result = call_tool(bridge, client, params.get("arguments") or {})
-+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
-+    if is_notification:
-+        return None
-+    return error_response(request_id, -32601, f"Method not found: {method}")
++def command_shots(args) -> int:
++    directory = shots_directory()
++    if args.clear:
++        removed = 0
++        for path in directory.glob("*.png"):
++            try:
++                path.unlink()
++                removed += 1
++            except OSError:
++                pass
++        print(f"removed {removed} shot(s) from {directory}")
++        return 0
++    try:
++        files = sorted(directory.glob("*.png"))
++    except OSError:
++        files = []
++    for path in files:
++        print(path)
++    print(f"{len(files)} shot(s) in {directory}", file=sys.stderr)
++    return 0
 +
 +
-+def write_message(message: dict) -> None:
-+    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
-+    sys.stdout.flush()
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(prog="anthracite", description=__doc__.splitlines()[0])
++    parser.add_argument("--bridge", help="path to the bridge discovery file")
++    parser.add_argument("--host")
++    parser.add_argument("--port", type=int)
++    parser.add_argument("--token")
++    subparsers = parser.add_subparsers(dest="command")
++
++    execute = subparsers.add_parser("exec", help="run a FreeCAD Python program through the bridge")
++    execute.add_argument("source", nargs="?", help="program text, a .py path, or - for stdin")
++    execute.add_argument("--file", help="read the program from this file")
++    execute.set_defaults(handler=command_exec)
++
++    status = subparsers.add_parser("status", help="print the bridge and document status")
++    status.set_defaults(handler=command_status)
++
++    shots = subparsers.add_parser("shots", help="list or clear saved viewport images")
++    shots.add_argument("--clear", action="store_true")
++    shots.set_defaults(handler=command_shots)
++    return parser
 +
 +
 +def main(argv: list[str] | None = None) -> int:
-+    parser = argparse.ArgumentParser(add_help=False)
-+    parser.add_argument("--bridge", default=None)
-+    parser.add_argument("--host", default=None)
-+    parser.add_argument("--port", type=int, default=None)
-+    parser.add_argument("--token", default=None)
-+    parser.add_argument("--client", default=os.environ.get("ANTHRACITE_CLIENT", "agent"))
-+    args, unknown = parser.parse_known_args(argv)
-+    if unknown:
-+        print(f"anthracite-mcp: ignoring unrecognized arguments: {unknown}", file=sys.stderr)
-+
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    if getattr(args, "handler", None) is None:
++        parser.print_help(sys.stderr)
++        return 2
 +    try:
-+        host, port, token = resolve_connection(args)
++        return args.handler(args)
 +    except BridgeError as error:
-+        print(f"anthracite-mcp: {error}", file=sys.stderr)
-+        # Serve an explicit error on the MCP stream so the client can surface it.
-+        for line in sys.stdin:
-+            try:
-+                message = json.loads(line)
-+            except ValueError:
-+                continue
-+            if message.get("method") == "initialize":
-+                write_message(
-+                    {
-+                        "jsonrpc": "2.0",
-+                        "id": message.get("id"),
-+                        "result": {
-+                            "protocolVersion": DEFAULT_PROTOCOL_VERSION,
-+                            "capabilities": {"tools": {}},
-+                            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-+                            "instructions": str(error),
-+                        },
-+                    }
-+                )
-+            elif message.get("method") == "tools/list":
-+                write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": {"tools": [TOOL]}})
-+            elif message.get("method") == "tools/call" and "id" in message:
-+                write_message(
-+                    {
-+                        "jsonrpc": "2.0",
-+                        "id": message.get("id"),
-+                        "result": {
-+                            "content": [{"type": "text", "text": str(error)}],
-+                            "isError": True,
-+                        },
-+                    }
-+                )
-+            elif message.get("method") == "ping":
-+                write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": {}})
-+        return 1
-+
-+    bridge = Bridge(host, port, token)
-+    try:
-+        for line in sys.stdin:
-+            line = line.strip()
-+            if not line:
-+                continue
-+            try:
-+                message = json.loads(line)
-+            except ValueError:
-+                write_message(error_response(None, -32700, "Parse error"))
-+                continue
-+            response = handle_message(message, bridge, args.client)
-+            if response is not None:
-+                write_message(response)
++        print(f"anthracite: {error}", file=sys.stderr)
++        return 2
 +    except KeyboardInterrupt:
-+        pass
-+    finally:
-+        bridge.close()
-+    return 0
++        return 130
 +
 +
 +if __name__ == "__main__":

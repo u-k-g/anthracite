@@ -20,11 +20,11 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
 - Documents persist; Python locals do not. Internal object names and revision-bound topology
   references matter. Reject stale references and report ambiguity/remapping; never guess a new
   face or edge after an edit, undo, or document replacement.
-- Expose FreeCAD to external agents through one checked `freecad` tool over a local bridge; the
-  agent runs outside FreeCAD (existing Codex/OpenCode/Claude Code or any MCP client), preserving
-  its own auth, configuration, models, skills, and tools. Do not build an in-app agent host,
-  provider adapters, a general-purpose harness, or simultaneous project/worktree sessions. One
-  agent operates on the active FreeCAD document at a time.
+- Expose FreeCAD to external agents through one checked `anthracite` CLI over a local bridge; the
+  agent runs outside FreeCAD (existing Codex/OpenCode/Claude Code or anything that runs a
+  command), preserving its own auth, configuration, models, skills, and tools. Do not build an
+  in-app agent host, provider adapters, MCP servers, a general-purpose harness, or simultaneous
+  project/worktree sessions. One agent operates on the active FreeCAD document at a time.
 - QML owns presentation and interaction. The dock is a read-only activity history of tool
   calls—code, observations, diagnostics, and returned images—never a chat surface; fixed to the
   right, resizable, showable/hideable, and restorable, never floating. Native FreeCAD editing and
@@ -39,7 +39,7 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
 
 ## Technology choices
 
-- Python owns the checked CAD executor, the in-app bridge, and the stdio MCP server. Keep C++/Qt
+- Python owns the checked CAD executor, the in-app bridge, and the `anthracite` CLI. Keep C++/Qt
   thin: module registration, docking, GUI-thread handoff, and narrow native integration. Prefer
   Python and standard-library code; do not keep a second language or a parallel application for
   something the executor and bridge already do.
@@ -103,8 +103,8 @@ just test
   names/files/order-list integrity. Neither replaces build or tests.
 - `just test` runs `tests/runtests.nu`: isolated FreeCAD GUI, executor, and bridge tests without
   real model calls. Logs: `build/test-results/`. Embedded FreeCAD assertions remain Python;
-  Nushell owns orchestration and workflow tests; the MCP server and bridge are exercised over
-  their real transports. Documentation-only edits need link/diff checks, not a rebuild.
+  Nushell owns orchestration and workflow tests; the CLI and bridge are exercised over their
+  real transports. Documentation-only edits need link/diff checks, not a rebuild.
 - Test follow-up parameter edits, native undo/redo, intervening user edits, stale references,
   reported topology remapping, and uncertain execution—not just final-solid validity. UI checks
   should cover focus, scroll stability, input acknowledgement, interruption, and reduced motion.

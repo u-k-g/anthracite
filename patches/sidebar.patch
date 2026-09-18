@@ -746,11 +746,11 @@
 +                    objectName: "AnthraciteBridgeCopy"
 +                    Layout.preferredHeight: root.compactControlHeight
 +                    Layout.preferredWidth: copyBridgeLabel.implicitWidth + 20
-+                    Accessible.name: qsTr("Copy MCP configuration")
++                    Accessible.name: qsTr("Copy the Anthracite CLI command")
 +                    onClicked: anthraciteController.copyBridgeConfig()
 +                    contentItem: Text {
 +                        id: copyBridgeLabel
-+                        text: qsTr("Copy MCP config")
++                        text: qsTr("Copy CLI command")
 +                        color: systemPalette.windowText
 +                        verticalAlignment: Text.AlignVCenter
 +                        horizontalAlignment: Text.AlignHCenter
@@ -758,7 +758,7 @@
 +                    Transcript.Hint {
 +                        hovered: parent.hovered
 +                        text: anthraciteController.bridgeConfig.length > 0
-+                              ? qsTr("Copy the MCP server configuration to the clipboard")
++                              ? qsTr("Copy the command an agent runs to use Anthracite")
 +                              : qsTr("Bridge is not running")
 +                    }
 +                }
@@ -1643,8 +1643,8 @@
 +    bridgeClientsValue = status.value(QStringLiteral("clients")).toInt();
 +    bridgeDocumentValue = status.value(QStringLiteral("document")).toString();
 +    bridgeRevisionValue = status.value(QStringLiteral("revision")).toInt();
-+    bridgeConfigValue = status.value(QStringLiteral("mcpConfig")).toString();
-+    bridgeCommandValue = status.value(QStringLiteral("mcpCommand")).toString();
++    bridgeConfigValue = status.value(QStringLiteral("cliHint")).toString();
++    bridgeCommandValue = status.value(QStringLiteral("cliCommand")).toString();
 +    Q_EMIT bridgeStatusChanged();
 +}
 +
@@ -2215,7 +2215,7 @@
 +    assert model.rowCount() == before_rows + 1, 'Duplicate operation was appended'
 +    AnthraciteGui.push_bridge_status(json.dumps({
 +        'running': True, 'port': 43210, 'clients': 2, 'document': 'TestDoc', 'revision': 4,
-+        'mcpConfig': '{"mcpServers": {}}', 'mcpCommand': 'python3 anthracite-mcp',
++        'cliHint': 'python3 anthracite exec <python>', 'cliCommand': 'anthracite exec <python>',
 +    }))
 +    QtTest.QTest.qWait(50)
 +    assert controller.property('bridgeRunning')
@@ -3715,7 +3715,7 @@
 +}
 --- a/src/Gui/NotificationArea.cpp
 +++ b/src/Gui/NotificationArea.cpp
-@@ -946,7 +946,7 @@ NotificationArea::NotificationArea(QWidg
+@@ -946,7 +946,7 @@
          qApp->sendEvent(pImp->menu, &re);
  
          // This corrects the position of the menu
@@ -3724,7 +3724,7 @@
              QWidget* statusbar = static_cast<QWidget*>(this->parent());
              QPoint statusbar_top_right = statusbar->mapToGlobal(statusbar->rect().topRight());
              QSize menusize = pImp->menu->size();
-@@ -1243,6 +1243,7 @@ void NotificationArea::showInNotificatio
+@@ -1243,6 +1243,7 @@
                  if (!item->isShown()) {
                      QTimer::singleShot(
                          pImp->notificationExpirationTime,
@@ -3782,7 +3782,7 @@
 +}
 --- a/src/Gui/WorkbenchSelector.cpp
 +++ b/src/Gui/WorkbenchSelector.cpp
-@@ -358,11 +358,13 @@ int WorkbenchTabWidget::addWorkbenchTab(
+@@ -358,11 +358,13 @@
      }
  
      tabBar->setTabToolTip(tabIndex, action->toolTip());
@@ -3806,7 +3806,7 @@
  #include <QMenu>
  #include <QToolButton>
  #include <QLayout>
-@@ -75,13 +76,77 @@ class GuiExport WorkbenchTabWidget: publ
+@@ -75,13 +76,77 @@
      public:
          explicit WbTabBar(QWidget* parent)
              : QTabBar(parent)
@@ -3886,7 +3886,7 @@
                  return sizeFromParent;
              }
  
-@@ -139,6 +204,7 @@ class GuiExport WorkbenchTabWidget: publ
+@@ -139,6 +204,7 @@
          }
  
      private:

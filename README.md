@@ -7,16 +7,16 @@
 <details open>
 <summary><strong>overview</strong></summary>
 
-Anthracite exposes FreeCAD to any coding agent on your machine through one checked
-`freecad` tool. The agent runs outside FreeCAD—your existing Codex, OpenCode, Claude Code,
-or any MCP client—and reaches Anthracite over a local bridge. Ask it to inspect or change
-the active document; the Python it sends runs inside FreeCAD as one native transaction
-that recomputes, validates, and then commits or rolls back.
+Anthracite exposes FreeCAD to any coding agent on your machine through one command-line
+program, `anthracite`. The agent runs outside FreeCAD—your existing Codex, OpenCode, Claude
+Code, or anything that can run a command—and reaches Anthracite over a local bridge. Ask it
+to inspect or change the active document; the Python it runs executes inside FreeCAD as one
+native transaction that recomputes, validates, and then commits or rolls back, printing a
+structured observation as JSON with viewport images written to disk.
 
-Watch the work in FreeCAD's right-hand dock: one expandable entry per tool call with the
-code, the observation, diagnostics, and the viewport images the executor returned. FreeCAD
-remains the CAD system. A successful recompute does not prove that the design meets your
-requirements.
+Watch the work in FreeCAD's right-hand dock: one expandable entry per call with the code, the
+observation, diagnostics, and the viewport images the executor returned. FreeCAD remains the
+CAD system. A successful recompute does not prove that the design meets your requirements.
 
 Your existing agent authentication, configuration, models, skills, and tools remain in
 use. One agent operates on the active FreeCAD document at a time; no separate
@@ -40,10 +40,9 @@ just run
 source/submodules and applies patches; it does not overwrite dirty work.
 `just build` prepares CMake automatically and compiles incrementally.
 `just run` launches without building, and first mirrors this repository's agent skill to
-`~/.agents/skills/anthracite` (also available as `just skill-sync`). Point any MCP client at
-the installed `anthracite-mcp` script—the dock and status bar show the exact command.
-`just connect codex` or `just connect opencode` registers the server with that agent (omit
-the name for both), or prints the exact command when it is not on your PATH.
+`~/.agents/skills/anthracite` (also available as `just skill-sync`). `just connect` installs the
+`anthracite` CLI on your PATH and syncs the skill, so an agent can run `anthracite exec '<python>'`;
+the dock and status bar show the exact command.
 
 - **Linux:** Nix supplies native dependencies and tooling. Packaged `nix build` and
   `nix run` are also supported. Development output is in `build/native`.
@@ -65,8 +64,8 @@ The launcher uses XDG paths, with their standard defaults when unset:
 
 - `$XDG_CONFIG_HOME/anthracite`: preferences, dock layout, optional `qml/Main.qml` override
 - `$XDG_DATA_HOME/anthracite`: FreeCAD user data
-- `$XDG_STATE_HOME/anthracite`: `bridge.json` (the running bridge's connection details) and
-  the readable `operations.ndjson` history of tool calls
+- `$XDG_STATE_HOME/.anthracite`: `bridge.json` (the running bridge's connection details),
+  the readable `operations.ndjson` history of calls, and `shots/` (viewport PNGs the CLI writes)
 - `$XDG_CACHE_HOME/anthracite`: temporary data
 
 Session associations stay outside your `.FCStd` files. Delete `operations.ndjson` to clear

@@ -42,7 +42,7 @@ in {
     postInstall = (old.postInstall or "") + ''
       # The branding template is relative to FreeCAD's application home.
       test -f "$out/Mod/Anthracite/AnthraciteDefaults.cfg"
-      test -f "$out/Mod/Anthracite/anthracite-mcp"
+      test -f "$out/Mod/Anthracite/anthracite"
       test -f "$out/bin/branding.xml"
     '';
     postFixup = (old.postFixup or "") + ''
