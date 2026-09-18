@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1605 @@
+@@ -0,0 +1,1622 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -470,10 +470,19 @@
 +    if spec.get("labels"):
 +        for obj in candidates[:12]:
 +            # Projection uses the same global placement as native measurements.
-+            shape = Inspect.native_shape(doc, obj, revision)
++            try:
++                shape = Inspect.native_shape(doc, obj, revision)
++            except Exception:
++                continue
 +            targets.append((obj.Name, shape.BoundBox.Center, {"document": doc.Name, "documentToken": Inspect.document_token(doc), "object": obj.Name, "revision": revision}))
++    dropped = []
 +    for ref in spec.get("references", []):
-+        shape = Inspect.native_shape(doc, ref, revision)
++        try:
++            shape = Inspect.native_shape(doc, ref, revision)
++        except Exception:
++            # A stale annotation reference must not fail the whole render.
++            dropped.append(ref)
++            continue
 +        targets.append((f"{ref['object']}.{ref['subelement']}", shape.CenterOfMass, ref))
 +    painter = QtGui.QPainter(image)
 +    annotations = []
@@ -516,8 +525,12 @@
 +        painter.end()
 +    if not image.save(path, "PNG"):
 +        raise RuntimeError("Could not save annotated viewport image.")
-+    return {"items": annotations, "omittedObjects": max(0, len(candidates) - 12) if spec.get("labels") else 0,
-+            "document": doc.Name, "revision": revision, "units": "mm"}
++    result = {"items": annotations, "omittedObjects": max(0, len(candidates) - 12) if spec.get("labels") else 0,
++              "document": doc.Name, "revision": revision, "units": "mm"}
++    if dropped:
++        result["droppedReferences"] = dropped
++        result["droppedNote"] = "Those annotation references were stale at this revision; re-inspect and retry them."
++    return result
 +
 +
 +@contextlib.contextmanager
@@ -793,6 +806,10 @@
 +            target = self._default_solid()
 +        return Inspect.compare(self.doc, reference, target, _revisions.get(self.doc.Name, 0))
 +
++    def remap(self, reference, facts=None):
++        """Find the face or edge at the current revision that best matches a stale reference."""
++        return Inspect.remap(self.doc, reference, _revisions.get(self.doc.Name, 0), facts)
++
 +    def _default_solid(self):
 +        for obj in self.doc.Objects:
 +            if obj.isDerivedFrom("PartDesign::Body") and getattr(obj, "Tip", None) is not None:
@@ -965,7 +982,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -1772,7 +1789,7 @@
 +                      "doc.addObject('Part::Box', 'Other')\ndoc.getObject('Other').Placement.Base.x = 20")
 +        faces = self.run_code("cad.topology('Pin', surface='Cylinder', limit=1)")['result']
 +        self.assertEqual(faces['total'], 1)
-+        self.assertAlmostEqual(faces['items'][0]['Radius'], 3)
++        self.assertAlmostEqual(faces['items'][0]['radius_mm'], 3)
 +        ref = faces['items'][0]['reference']
 +        self.assertTrue(self.run_code(f"cad.measure({ref!r})")['readOnly'])
 +        distance = self.run_code("cad.measure('Pin', 'Other')")['result']
@@ -2324,7 +2341,7 @@
 +            "checkpoint": identity, "originalDocumentPreserved": True}
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteInspect.py
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,889 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Readable, bounded native CAD observations; never a replacement geometry API."""
 +import FreeCAD as App
@@ -2391,13 +2408,10 @@
 +    for index, part, geometry, geometry_type in entries[offset:offset + limit]:
 +        ref = {"document": doc.Name, "documentToken": document_token(doc), "object": obj.Name,
 +               "subelement": f"{'Face' if kind == 'faces' else 'Edge'}{index}", "revision": revision}
-+        item = {"reference": ref, "geometryType": geometry_type,
++        item = {"reference": ref, **_geometry_facts(geometry),
 +                "centerOfMass_mm": _center_of_mass(part),
 +                "area_mm2" if kind == "faces" else "length_mm": part.Area if kind == "faces" else part.Length,
 +                "tolerance_mm": part.getTolerance(1)}
-+        for name in ("Radius", "MajorRadius", "MinorRadius", "Axis", "Center"):
-+            if hasattr(geometry, name):
-+                item[name] = value(getattr(geometry, name))
 +        items.append(item)
 +    return {"document": doc.Name, "revision": revision, "object": obj.Name,
 +            "items": items, "total": len(entries),
@@ -2438,21 +2452,34 @@
 +    return [average.x, average.y, average.z]
 +
 +
++def _geometry_facts(geometry):
++    """Unified geometry vocabulary for topology items and measurements."""
++    if geometry is None:
++        return {}
++    kind = type(geometry).__name__
++    facts = {"geometryType": kind}
++    if kind in ("Cylinder", "Circle", "Cone"):
++        facts["axis"] = [geometry.Axis.x, geometry.Axis.y, geometry.Axis.z]
++        facts["axisPosition"] = [geometry.Center.x, geometry.Center.y, geometry.Center.z]
++        facts["radius_mm"] = geometry.Radius
++    elif kind == "Torus":
++        facts["axis"] = [geometry.Axis.x, geometry.Axis.y, geometry.Axis.z]
++        facts["axisPosition"] = [geometry.Center.x, geometry.Center.y, geometry.Center.z]
++        facts["majorRadius_mm"] = geometry.MajorRadius
++        facts["minorRadius_mm"] = geometry.MinorRadius
++    elif kind == "Line":
++        facts["direction"] = [geometry.Direction.x, geometry.Direction.y, geometry.Direction.z]
++    elif hasattr(geometry, "Axis"):
++        facts["normal"] = [geometry.Axis.x, geometry.Axis.y, geometry.Axis.z]
++    return facts
++
++
 +def _surface_facts(shape):
 +    """Datum/face facts for an interface check: plane normal, or cylinder axis and radius."""
 +    try:
-+        surface = shape.Surface
++        return _geometry_facts(shape.Surface)
 +    except Exception:
 +        return {}
-+    kind = type(surface).__name__
-+    facts = {"faceType": kind}
-+    if kind == "Cylinder":
-+        facts["axis"] = [surface.Axis.x, surface.Axis.y, surface.Axis.z]
-+        facts["axisPosition"] = [surface.Center.x, surface.Center.y, surface.Center.z]
-+        facts["radius_mm"] = surface.Radius
-+    elif hasattr(surface, "Axis"):
-+        facts["normal"] = [surface.Axis.x, surface.Axis.y, surface.Axis.z]
-+    return facts
 +
 +
 +def measure(doc, target, revision, other=None):
@@ -2487,6 +2514,62 @@
 +        if center is not None:
 +            result["centerOfMass_mm"] = center
 +    return result
++
++
++def remap(doc, reference, revision, facts=None):
++    """Find the face or edge at the current revision that best matches a stale reference.
++
++    The old topology is gone, so pass the facts you observed for the old reference
++    (area_mm2/length_mm, centerOfMass_mm, geometryType, normal/axis). Returns a ranked
++    candidate match, not proof of identity; confirm before relying on it.
++    """
++    if not isinstance(reference, dict):
++        raise ValueError("remap needs a reference dict with object and subelement.")
++    subelement = str(reference.get("subelement") or "")
++    if not subelement.startswith(("Face", "Edge")):
++        raise ValueError("remap needs a FaceN or EdgeN reference.")
++    if not isinstance(facts, dict) or not facts:
++        raise ValueError("remap needs the old geometry facts (area_mm2/length_mm, "
++                         "centerOfMass_mm, geometryType); re-inspect instead if you do not have them.")
++    obj = resolve(doc, reference.get("object"))
++    kind = "edges" if subelement.startswith("Edge") else "faces"
++    measure_key = "length_mm" if kind == "edges" else "area_mm2"
++    shape = native_shape(doc, obj, revision)
++    parts = shape.Edges if kind == "edges" else shape.Faces
++    want_type = facts.get("geometryType")
++    want_measure = facts.get(measure_key)
++    want_center = facts.get("centerOfMass_mm")
++    want_axis = facts.get("normal") or facts.get("axis")
++    candidates = []
++    for index, part in enumerate(parts, 1):
++        geometry = part.Curve if kind == "edges" else part.Surface
++        item = _geometry_facts(geometry)
++        if want_type and item.get("geometryType") != want_type:
++            continue
++        score = 0.0
++        measured = part.Length if kind == "edges" else part.Area
++        if want_measure and measured:
++            score += abs(measured - want_measure) / max(abs(want_measure), 1e-9)
++        center = _center_of_mass(part)
++        if want_center and center:
++            score += math.dist(center, want_center) / 10.0
++        axis = item.get("normal") or item.get("axis")
++        if want_axis and axis:
++            dot = abs(sum(a * b for a, b in zip(axis, want_axis)))
++            score += 1.0 - min(1.0, dot)
++        candidates.append({
++            "reference": {"document": doc.Name, "documentToken": document_token(doc),
++                          "object": obj.Name,
++                          "subelement": f"{'Edge' if kind == 'edges' else 'Face'}{index}",
++                          "revision": revision},
++            "score": round(score, 6), measure_key: measured, "centerOfMass_mm": center, **item})
++    candidates.sort(key=lambda candidate: candidate["score"])
++    if not candidates:
++        raise ValueError("No candidate matches those facts at the current revision.")
++    return {"document": doc.Name, "revision": revision, "object": obj.Name,
++            "reference": candidates[0]["reference"], "score": candidates[0]["score"],
++            "candidates": candidates[:5],
++            "note": "Ranked by area/centroid/direction closeness; confirm before relying on it."}
 +
 +
 +def verify(doc, checks, revision):

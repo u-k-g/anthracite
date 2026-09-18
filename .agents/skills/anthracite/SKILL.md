@@ -24,13 +24,18 @@ cad.action('Pocket the top face')
 PY
 ```
 
-- `anthracite exec '<python>'` — run a program; prints the observation JSON on stdout and a
-  one-line summary on stderr.
+`exec` prints a **compact JSON** by default — `ok`, `revision`, `error`, `result`, `stdout`/`stderr`,
+`verification`, `nextActions`, `shots`, and a small `observation` (created/changed/deleted names).
+Add `--full` for the entire observation, `--select ok,result,verification` for chosen keys,
+`--print-stdout` to see your program's `print()` output as text, and `--out obs.json` to write the
+JSON to a file. **`print()` goes to the `stdout` field** — read it instead of guessing.
+
 - `anthracite status` — bridge and active-document status.
 - `anthracite shots` — list saved viewport images (`--clear` to remove them).
+- `anthracite log --limit 20` — recent operations, one line each, without parsing `operations.ndjson`.
 
 Exit code is `0` when the edit committed, `1` when it was rejected or rolled back, `2` for a
-transport problem. Always read the JSON even on `1`; it says why.
+transport problem. Always read the JSON even on `1`; the summary line on stderr says why.
 
 If `anthracite` is not on PATH, run `just connect` in the Anthracite repository, or use the
 absolute path FreeCAD shows in its status bar.
@@ -116,7 +121,9 @@ cad.verify([
 ])
 ```
 
-Numeric metrics need a finite `tolerance`; booleans and strings do not.
+Numeric metrics need a finite `tolerance`; booleans and strings do not. **`expected` must come
+from the requirement** — the drawing or the user's numbers — never from a value you computed in
+the same program. Verifying a model against itself proves nothing.
 
 Judge the result on two axes, not one:
 
@@ -168,6 +175,12 @@ changes**: `{'document': 'Part', 'documentToken': '…', 'object': 'Pad', 'subel
 
 - Never guess a new face or edge index after an edit, undo, or document change. Inspect
   `cad.topology('Pad')` again and use the returned references.
+- If a reference is stale (the revision moved on), do not hand-match faces by bounds. Call
+  `cad.remap(stale_reference, facts)` with the facts you recorded for it (`area_mm2`/`length_mm`,
+  `centerOfMass_mm`, `geometryType`, `normal`/`axis`); it returns the best current match plus
+  alternatives, which you should confirm.
+- `cad.topology` output is large and pages: pass `kind`, `limit`, and `offset` (follow
+  `nextOffset`), or use `cad.review(<reference>)` to look at one face instead of dumping all of them.
 - If the user pastes a reference (from Anthracite's geometry picker) into the conversation, pass
   it straight to `cad.review(<reference>)`; `cad.inspect`, `cad.topology`, and `cad.measure`
   accept it too.

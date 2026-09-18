@@ -681,7 +681,7 @@
 +    _bridge.unsubscribe(callback)
 --- /dev/null
 +++ b/src/Mod/Anthracite/anthracite
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,413 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite command-line client.
@@ -885,6 +885,36 @@
 +    return presented
 +
 +
++_COMPACT_OBSERVATION = ("document", "workbench", "selection", "created", "deleted", "objectCount")
++_COMPACT_CHANGE = ("name", "label", "type", "parameterChanges")
++_COMPACT_RESULT = ("ok", "revision", "revisionBefore", "rolledBack", "requiresInspection",
++                   "conflict", "notExecuted", "error", "result", "stdout", "stderr",
++                   "verification", "interveningChanges", "nextActions", "createdDocument", "shots")
++
++
++def compact(presented: dict) -> dict:
++    """The small, agent-facing projection: no tree, no per-object shape/property dumps."""
++    output = {key: presented[key] for key in _COMPACT_RESULT if key in presented}
++    observation = presented.get("observation")
++    if isinstance(observation, dict):
++        trimmed = {key: observation[key] for key in _COMPACT_OBSERVATION if key in observation}
++        trimmed["changed"] = [
++            {key: change.get(key) for key in _COMPACT_CHANGE}
++            for change in (observation.get("changed") or [])
++        ]
++        output["observation"] = trimmed
++    if isinstance(output.get("error"), dict):
++        output["error"] = {key: output["error"][key] for key in ("type", "message") if key in output["error"]}
++    return output
++
++
++def select(presented: dict, args) -> dict:
++    if args.select:
++        keys = [key.strip() for key in args.select.split(",") if key.strip()]
++        return {key: presented.get(key) for key in keys}
++    return presented if args.full else compact(presented)
++
++
 +def summarize(result: dict, shots: list[Path]) -> str:
 +    state = "ok" if result.get("ok") else "rolled_back" if result.get("rolledBack") else \
 +        "rejected" if result.get("notExecuted") or result.get("conflict") else "failed"
@@ -896,6 +926,11 @@
 +    error = (result.get("error") or {}).get("message")
 +    if error:
 +        parts.append(str(error))
++    if not result.get("ok"):
++        actions = result.get("nextActions") or []
++        if actions:
++            first = actions[0]
++            parts.append(str(first.get("message") if isinstance(first, dict) else first))
 +    return " · ".join(parts)
 +
 +
@@ -936,7 +971,17 @@
 +        bridge.close()
 +    result = response.get("result", {})
 +    shots = write_shots(response.get("images", []))
-+    print(json.dumps(present(result, shots), indent=2, ensure_ascii=False))
++    output = select(present(result, shots), args)
++    text = json.dumps(output, indent=2, ensure_ascii=False)
++    if args.print_stdout:
++        for stream in ("stdout", "stderr"):
++            if output.get(stream):
++                print(str(output[stream]), file=sys.stderr, end="")
++    if args.out:
++        Path(args.out).write_text(text + "\n", encoding="utf-8")
++        print(f"anthracite: wrote {args.out}", file=sys.stderr)
++    else:
++        print(text)
 +    print(f"anthracite: {summarize(result, shots)}", file=sys.stderr)
 +    return 0 if result.get("ok") else 1
 +
@@ -978,6 +1023,30 @@
 +    return 0
 +
 +
++def command_log(args) -> int:
++    """Compact recent operations, so history does not require parsing operations.ndjson."""
++    path = state_directory() / "operations.ndjson"
++    try:
++        lines = path.read_text(encoding="utf-8").splitlines()
++    except OSError:
++        print(f"anthracite: no operation log at {path}", file=sys.stderr)
++        return 0
++    rows = []
++    for line in lines[-args.limit:]:
++        try:
++            rows.append(json.loads(line))
++        except ValueError:
++            continue
++    for row in rows:
++        error = (row.get("error") or {}).get("message") or ""
++        print(f"{row.get('timestamp', '')} {str(row.get('status', '')):12} "
++              f"{str(row.get('document') or '-'):14} "
++              f"r{row.get('revisionBefore')}->{row.get('revisionAfter')} "
++              f"{str(row.get('label') or '')[:40]} {error[:60]}")
++    print(f"{len(rows)} operation(s) from {path}", file=sys.stderr)
++    return 0
++
++
 +def build_parser() -> argparse.ArgumentParser:
 +    parser = argparse.ArgumentParser(prog="anthracite", description=__doc__.splitlines()[0])
 +    parser.add_argument("--bridge", help="path to the bridge discovery file")
@@ -989,6 +1058,11 @@
 +    execute = subparsers.add_parser("exec", help="run a FreeCAD Python program through the bridge")
 +    execute.add_argument("source", nargs="?", help="program text, a .py path, or - for stdin")
 +    execute.add_argument("--file", help="read the program from this file")
++    execute.add_argument("--full", action="store_true", help="print the whole observation")
++    execute.add_argument("--select", help="comma-separated top-level keys to print instead")
++    execute.add_argument("--print-stdout", action="store_true",
++                         help="print the program's stdout/stderr to the terminal as well")
++    execute.add_argument("--out", help="write the JSON to this file instead of stdout")
 +    execute.set_defaults(handler=command_exec)
 +
 +    status = subparsers.add_parser("status", help="print the bridge and document status")
@@ -997,6 +1071,10 @@
 +    shots = subparsers.add_parser("shots", help="list or clear saved viewport images")
 +    shots.add_argument("--clear", action="store_true")
 +    shots.set_defaults(handler=command_shots)
++
++    log = subparsers.add_parser("log", help="recent operations, one line each")
++    log.add_argument("--limit", type=int, default=20)
++    log.set_defaults(handler=command_log)
 +    return parser
 +
 +

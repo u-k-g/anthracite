@@ -1956,7 +1956,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,771 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -2598,8 +2598,11 @@
 +    stale = AnthraciteExecutor.execute(
 +        f"cad.render(view='front', width=640, height=480, references=[{reference!r}])"
 +    )
-+    assert not stale['ok'] and stale['rolledBack'], stale
-+    assert 'nextActions' in stale
++    # A stale annotation reference is dropped and reported, not fatal to the render.
++    assert stale['ok'], stale
++    annotations = stale['observation']['renders'][0]['annotations']
++    assert annotations['items'] == [], annotations
++    assert annotations['droppedReferences'] == [reference], annotations
 +    forgotten = AnthraciteExecutor.execute("cad.render(highlight_changed=True)")
 +    assert not forgotten['ok'], forgotten
 +    render_view = AnthraciteExecutor._render_view
