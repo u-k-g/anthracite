@@ -30,7 +30,9 @@ Add `--full` for the entire observation, `--select ok,result,verification` for c
 `--print-stdout` to see your program's `print()` output as text, and `--out obs.json` to write the
 JSON to a file. **`print()` goes to the `stdout` field** — read it instead of guessing.
 
-- `anthracite status` — bridge and active-document status.
+- `anthracite status` — bridge and active-document status. `pendingTransaction.open` is a
+  native undo step still held by the GUI (spreadsheet, sketcher, task panel); it is not the
+  same as `blocked`, which is a modal dialog or held mouse.
 - `anthracite shots` — list saved viewport images (`--clear` to remove them).
 - `anthracite log --limit 20` — recent operations, one line each, without parsing `operations.ndjson`.
 
@@ -113,8 +115,11 @@ will iterate on as PartDesign Bodies, and use Part booleans only as tools betwee
   expressions, attachments. Preserve existing feature names and downstream dependencies.
 - Express intent with relationships (expressions, constraints, patterns) rather than repeated
   literal dimensions; inspect the parameters you are about to change first.
-- History actions (`cad.undo`, `cad.redo`, `cad.checkpoint`, `cad.restore_checkpoint`) must be
-  the only statement in a call, with literal arguments. They cannot be nested in a mutation.
+- History actions (`cad.undo`, `cad.redo`, `cad.checkpoint`, `cad.restore_checkpoint`,
+  `cad.yield_transaction`) must be the only statement in a call, with literal arguments. They
+  cannot be nested in a mutation. `cad.yield_transaction(mode='commit')` keeps an unfinished
+  GUI edit; `mode='abort'` discards it. Use it only when the user asked you to proceed and a
+  pending transaction is blocking; then mutate in a new call. Never auto-yield.
 - When a native feature fails (Pad, Pocket, Hole, Pattern), fix that feature — its profile,
   constraints, support, or parameters. Do not delete it and boolean around the failure.
 - Creating a document is allowed when none is open (`App.newDocument('Part')`), but that call
@@ -236,6 +241,10 @@ committed. Do **not** retry. Reconnect, then inspect the document (`anthracite s
 
 - "the Anthracite bridge is not running" — FreeCAD/Anthracite is not open, or the bridge is
   disabled.
+- `PendingTransaction` — a native undo step is still open (`pendingTransaction.name` /
+  `workbench`). Reads still work. Do not retry the mutation. If the user asked you to proceed,
+  `cad.yield_transaction(mode='commit')` or `mode='abort'`, then mutate in a new call. Closing
+  the editor tab (not only clicking the 3D view) is the GUI equivalent.
 - "RevisionConflict" — the document changed since your last observation; re-inspect and rebuild
   references before retrying.
 - "Topology changed within this action" — finish the current action and inspect topology in a new

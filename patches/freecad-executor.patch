@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1683 @@
+@@ -0,0 +1,1768 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -39,6 +39,24 @@
 +    import FreeCADGui as Gui
 +except ImportError:
 +    Gui = None
++
++
++class PendingTransaction(Exception):
++    """A native FreeCAD undo step is open; mutations cannot nest into it."""
++
++    def __init__(self, pending, message=None):
++        pending = pending or {"open": True, "name": None, "workbench": None}
++        label = pending.get("name") or "unnamed"
++        workbench = pending.get("workbench")
++        extra = f", {workbench}" if workbench else ""
++        default = (
++            f"A native transaction is open ({label}{extra}). "
++            "Mutations cannot nest into it. If the user asked you to proceed, "
++            "cad.yield_transaction(mode='commit') keeps the GUI edit, or "
++            "cad.yield_transaction(mode='abort') discards it; then mutate in a new call."
++        )
++        super().__init__(message or default)
++        self.pending = pending
 +
 +
 +_MAX_TEXT = 12_000
@@ -891,6 +909,7 @@
 +    redo = undo
 +    checkpoint = undo
 +    restore_checkpoint = undo
++    yield_transaction = undo
 +
 +    def selected(self) -> list[Any]:
 +        if Gui is None:
@@ -1032,7 +1051,20 @@
 +
 +
 +_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents"}
-+_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
++_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint", "yield_transaction"}
++
++
++def pending_transaction(doc: Any) -> dict[str, Any]:
++    """Native undo-step lock plus the active workbench, for status and rejects."""
++    info = History.pending_transaction(doc)
++    workbench = None
++    if Gui is not None:
++        try:
++            active = Gui.activeWorkbench()
++            workbench = active.name() if active is not None else None
++        except Exception:
++            workbench = None
++    return {"open": info["open"], "name": info["name"], "workbench": workbench}
 +
 +
 +def _standalone_helper(tree):
@@ -1052,10 +1084,45 @@
 +        return None
 +
 +
++def _yield_transaction(doc, args, kwargs, revision):
++    if args or set(kwargs) != {"mode"} or kwargs["mode"] not in ("commit", "abort"):
++        raise ValueError("Use cad.yield_transaction(mode='commit') or cad.yield_transaction(mode='abort').")
++    pending = pending_transaction(doc)
++    if not pending["open"]:
++        raise ValueError("No native transaction is open.")
++    mode = kwargs["mode"]
++    before = _document_snapshot(doc)
++    _executing_docs.add(doc.Name)
++    try:
++        if mode == "commit":
++            doc.commitTransaction()
++        else:
++            doc.abortTransaction()
++        doc.recompute()
++        after = _document_snapshot(doc)
++        revision += 1
++        _revisions[doc.Name] = revision
++        History.invalidate(doc, "Native transaction was yielded; undo history changed.")
++        return {
++            "ok": True,
++            "revisionBefore": revision - 1,
++            "revision": revision,
++            "result": {"operation": "yield_transaction", "mode": mode, "name": pending["name"]},
++            "pendingTransaction": pending_transaction(doc),
++            "observation": _observation(doc, before, after),
++            "history": History.describe(doc, revision),
++            "images": [],
++        }
++    finally:
++        _executing_docs.discard(doc.Name)
++
++
 +def _history_execute(doc, method, args, kwargs, revision):
++    if method == "yield_transaction":
++        return _yield_transaction(doc, args, kwargs, revision)
 +    before = _document_snapshot(doc)
 +    if doc.HasPendingTransaction:
-+        raise ValueError("Finish or cancel the open native transaction first.")
++        raise PendingTransaction(pending_transaction(doc))
 +    if method == "checkpoint":
 +        result = History.checkpoint(doc, *args, **kwargs)
 +        return {"ok": True, "revision": revision, "revisionBefore": revision,
@@ -1347,7 +1414,7 @@
 +                response["verification"] = [outcome]
 +            return response
 +        if doc.HasPendingTransaction:
-+            raise ValueError("Finish or cancel the open native transaction before agent mutations.")
++            raise PendingTransaction(pending_transaction(doc))
 +        label = "Agent edit"
 +        first = tree.body[0]
 +        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
@@ -1362,9 +1429,16 @@
 +            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute):
 +                if item.func.attr in _HISTORY_HELPERS:
 +                    raise ValueError("History operations must be standalone literal cad calls, not nested in mutations.")
-+    except Exception as error:
++    except PendingTransaction as error:
 +        return {"ok": False, "notExecuted": True, "revision": revision,
-+                "error": {"type": type(error).__name__, "message": str(error)}}
++                "error": {"type": "PendingTransaction", "message": str(error)},
++                "pendingTransaction": error.pending}
++    except Exception as error:
++        rejected = {"ok": False, "notExecuted": True, "revision": revision,
++                    "error": {"type": type(error).__name__, "message": str(error)}}
++        if doc.HasPendingTransaction:
++            rejected["pendingTransaction"] = pending_transaction(doc)
++        return rejected
 +
 +    # Transactions retain rollback state only when undo is enabled. Do not change
 +    # this setting for read-only helpers.
@@ -1662,7 +1736,18 @@
 +            result["changeTracking"] = {"status": "unavailable", "reason": str(error)}
 +    if not result.get("ok"):
 +        error_type = result.get("error", {}).get("type")
-+        if result.get("conflict") or "topology" in result.get("error", {}).get("message", "").lower():
++        if error_type == "PendingTransaction":
++            pending = result.get("pendingTransaction") or {}
++            label = pending.get("name") or "unnamed"
++            workbench = pending.get("workbench")
++            where = f"{label}, {workbench}" if workbench else label
++            actions = [
++                {"code": "cad.yield_transaction(mode='commit')",
++                 "reason": f"A native undo step is open ({where}). If the user asked you to proceed, commit keeps the GUI edit; then mutate in a new call."},
++                {"code": "cad.yield_transaction(mode='abort')",
++                 "reason": "Discard the unfinished GUI edit, then mutate in a new call. Do not retry the rejected mutation while the transaction is open."},
++            ]
++        elif result.get("conflict") or "topology" in result.get("error", {}).get("message", "").lower():
 +            actions = [{"code": "cad.tree()", "reason": "Refresh current object names and revision; then query cad.topology('Name') for new references. Never reuse guessed face/edge indices."}]
 +        elif error_type in ("SyntaxError", "IndentationError"):
 +            actions = [{"reason": "Correct the Python syntax; the rejected source was not executed."}]
@@ -1686,7 +1771,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,566 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -2018,7 +2103,44 @@
 +        failed = AnthraciteExecutor.execute("doc.addObject('Part::Box', 'Bad')")
 +        self.assertTrue(failed["notExecuted"])
 +        self.assertTrue(self.doc.HasPendingTransaction)
++        self.assertEqual(failed["error"]["type"], "PendingTransaction")
++        self.assertTrue(failed["pendingTransaction"]["open"])
++        self.assertEqual(failed["pendingTransaction"]["name"], "User is editing")
++        self.assertIsNone(self.doc.getObject("Bad"))
++        codes = [action["code"] for action in failed["nextActions"]]
++        self.assertIn("cad.yield_transaction(mode='commit')", codes)
++        self.assertIn("cad.yield_transaction(mode='abort')", codes)
++        nested = AnthraciteExecutor.execute("cad.yield_transaction(mode='abort')\ndoc.addObject('Part::Box', 'Bad')")
++        self.assertTrue(nested["notExecuted"])
++        self.assertTrue(self.doc.HasPendingTransaction)
 +        self.doc.abortTransaction()
++
++    def test_yield_transaction_commits_or_aborts_then_allows_mutation(self):
++        self.run_code("doc.addObject('Part::Box', 'Box')")
++        self.assertEqual(self.doc.getObject("Box").Length.Value, 10)
++        empty = AnthraciteExecutor.execute("cad.yield_transaction(mode='commit')")
++        self.assertTrue(empty["notExecuted"])
++        self.assertEqual(empty["error"]["type"], "ValueError")
++        self.doc.openTransaction("User is editing")
++        self.doc.getObject("Box").Length = 22
++        aborted = self.run_code("cad.yield_transaction(mode='abort')")
++        self.assertEqual(aborted["result"]["mode"], "abort")
++        self.assertEqual(aborted["result"]["name"], "User is editing")
++        self.assertFalse(aborted["pendingTransaction"]["open"])
++        self.assertFalse(self.doc.HasPendingTransaction)
++        self.assertEqual(self.doc.getObject("Box").Length.Value, 10)
++        self.doc.openTransaction("Keep this")
++        self.doc.getObject("Box").Length = 25
++        committed = self.run_code("cad.yield_transaction(mode='commit')")
++        self.assertEqual(committed["result"]["mode"], "commit")
++        self.assertFalse(self.doc.HasPendingTransaction)
++        self.assertEqual(self.doc.getObject("Box").Length.Value, 25)
++        follow = self.run_code("doc.getObject('Box').Length = 30")
++        self.assertTrue(follow["ok"])
++        self.assertEqual(self.doc.getObject("Box").Length.Value, 30)
++        history = self.run_code("cad.history()")["result"]
++        self.assertIn("pendingTransaction", history)
++        self.assertFalse(history["pendingTransaction"]["open"])
 +
 +    def test_checkpoint_restores_into_separate_document(self):
 +        with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {"XDG_STATE_HOME": state}):
@@ -2218,7 +2340,7 @@
 +    unittest.main()
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteHistory.py
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,217 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Guards around FreeCAD's native undo stack and non-destructive document checkpoints."""
 +import hashlib
@@ -2235,6 +2357,30 @@
 +
 +def stacks(doc):
 +    return (tuple(doc.UndoNames), tuple(doc.RedoNames))
++
++
++def pending_transaction(doc):
++    """Describe the unfinished native undo step, if any.
++
++    Spreadsheet, Sketcher, and similar editors leave a transaction open for the
++    whole view. Mutations must not nest into it; cad.yield_transaction commits
++    or aborts it explicitly.
++    """
++    if doc is None:
++        return {"open": False, "name": None}
++    open_ = bool(getattr(doc, "HasPendingTransaction", False))
++    name = None
++    if open_:
++        try:
++            active = App.getActiveTransaction()
++            if isinstance(active, (tuple, list)) and active:
++                name = active[0] or None
++            elif isinstance(active, str) and active:
++                name = active
++        except Exception:
++            names = list(getattr(doc, "UndoNames", []) or [])
++            name = names[0] if names else None
++    return {"open": open_, "name": name}
 +
 +
 +def invalidate(doc, reason="Document was changed outside this agent action."):
@@ -2267,9 +2413,16 @@
 +        reason = state["blocked"]
 +    elif state["revision"] != revision or state["stacks"] != stacks(doc):
 +        reason = "Revision or native undo history changed; refusing to undo intervening edits."
-+    if doc.HasPendingTransaction:
-+        reason = "A native transaction is open. Finish or cancel that edit first."
++    pending = pending_transaction(doc)
++    if pending["open"]:
++        label = pending["name"] or "unnamed"
++        reason = (
++            f"A native transaction is open ({label}). Mutations cannot nest into it. "
++            "If the user asked you to proceed, cad.yield_transaction(mode='commit') "
++            "keeps the GUI edit; mode='abort' discards it."
++        )
 +    result = {"document": doc.Name, "revision": revision, "blockedReason": reason,
++              "pendingTransaction": pending,
 +              "undo": None, "redo": None, "scope": "Last 20 tracked native actions in this open session"}
 +    if state:
 +        for direction, key in (("undo", "past"), ("redo", "future")):
@@ -2353,7 +2506,11 @@
 +    if not isinstance(label, str) or not label.strip() or len(label) > 120:
 +        raise ValueError("Checkpoint label must contain 1..120 characters.")
 +    if doc.HasPendingTransaction:
-+        raise ValueError("Finish the current native transaction before checkpointing.")
++        raise ValueError(
++            "Finish the current native transaction before checkpointing. "
++            "If the user asked you to proceed, cad.yield_transaction(mode='commit') "
++            "or cad.yield_transaction(mode='abort') first."
++        )
 +    directory = _directory()
 +    directory.mkdir(parents=True, exist_ok=True)
 +    identity = str(uuid.uuid4())

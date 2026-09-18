@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteBridge.py
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,565 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite bridge: expose the checked FreeCAD executor to external agents.
 +
@@ -143,7 +143,13 @@
 +        self._started_at: str | None = None
 +        self._queue: collections.deque[_Pending] = collections.deque()
 +        self._queue_lock = threading.Lock()
-+        self._context = {"document": None, "documentToken": None, "revision": 0, "documents": []}
++        self._context = {
++            "document": None,
++            "documentToken": None,
++            "revision": 0,
++            "documents": [],
++            "pendingTransaction": {"open": False, "name": None, "workbench": None},
++        }
 +        self._clients = 0
 +        self._busy = False
 +        self._blocked = False
@@ -225,6 +231,8 @@
 +            "blockedReason": self._blocked_reason,
 +            "queued": len(self._queue),
 +            "clients": self._clients,
++            "pendingTransaction": dict(self._context.get("pendingTransaction")
++                                       or {"open": False, "name": None, "workbench": None}),
 +        }
 +
 +    # -- discovery ---------------------------------------------------------
@@ -413,11 +421,22 @@
 +            names = AnthraciteExecutor.open_document_names()
 +        except Exception:
 +            names = []
++        pending = {"open": False, "name": None, "workbench": None}
++        if document is not None:
++            try:
++                pending = AnthraciteExecutor.pending_transaction(document)
++            except Exception:
++                pending = {
++                    "open": bool(getattr(document, "HasPendingTransaction", False)),
++                    "name": None,
++                    "workbench": None,
++                }
 +        self._context = {
 +            "document": document.Name if document is not None else None,
 +            "documentToken": token,
 +            "revision": AnthraciteExecutor.revision(document),
 +            "documents": names,
++            "pendingTransaction": pending,
 +        }
 +
 +    # -- operation log -----------------------------------------------------
@@ -549,7 +568,7 @@
 +    _bridge.unsubscribe(callback)
 --- /dev/null
 +++ b/src/Mod/Anthracite/anthracite
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,422 @@
 +#!/usr/bin/env python3
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite command-line client.
@@ -757,7 +776,8 @@
 +_COMPACT_CHANGE = ("name", "label", "type", "parameterChanges")
 +_COMPACT_RESULT = ("ok", "revision", "revisionBefore", "rolledBack", "requiresInspection",
 +                   "conflict", "notExecuted", "error", "result", "stdout", "stderr",
-+                   "verification", "interveningChanges", "nextActions", "createdDocument", "shots")
++                   "verification", "interveningChanges", "nextActions", "createdDocument",
++                   "pendingTransaction", "shots")
 +
 +
 +def compact(presented: dict) -> dict:
@@ -831,6 +851,14 @@
 +        if preflight.get("blocked"):
 +            print(f"anthracite: FreeCAD is waiting on {preflight.get('blockedReason') or 'user interaction'}; "
 +                  "the call runs once that clears.", file=sys.stderr)
++        pending = preflight.get("pendingTransaction") or {}
++        if pending.get("open"):
++            label = pending.get("name") or "unnamed"
++            workbench = pending.get("workbench")
++            where = f"{label}, {workbench}" if workbench else label
++            print(f"anthracite: a native transaction is open ({where}); "
++                  "mutations are rejected until cad.yield_transaction(mode='commit'|'abort').",
++                  file=sys.stderr)
 +        response = bridge.send("execute", {"code": source, "client": CLIENT})
 +    except BridgeError as error:
 +        print(f"anthracite: {error}", file=sys.stderr)
