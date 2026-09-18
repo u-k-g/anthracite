@@ -1,9 +1,8 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,79 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
-+#include <QJsonArray>
 +#include <QJsonDocument>
 +#include <QJsonObject>
 +#include <QJsonParseError>
@@ -16,7 +15,7 @@
 +#include <Base/PyObjectBase.h>
 +#include <Gui/Application.h>
 +
-+#include "Sidebar.h"
++#include "StatusController.h"
 +#include "Chrome.h"
 +
 +
@@ -36,48 +35,14 @@
 +        : Py::ExtensionModule<Module>("AnthraciteGui")
 +    {
 +        add_varargs_method(
-+            "push_activity",
-+            &Module::pushActivity,
-+            "push_activity(json) -- Append one bridge operation to the activity history."
-+        );
-+        add_varargs_method(
 +            "push_bridge_status",
 +            &Module::pushBridgeStatus,
-+            "push_bridge_status(json) -- Update the bridge status shown in the sidebar and status bar."
-+        );
-+        add_varargs_method(
-+            "push_parameters",
-+            &Module::pushParameters,
-+            "push_parameters(json) -- Update the parameters panel."
-+        );
-+        add_varargs_method(
-+            "take_parameter_request",
-+            &Module::takeParameterRequest,
-+            "take_parameter_request() -- Return and clear a pending parameters-panel request."
++            "push_bridge_status(json) -- Update the bridge status shown in the status bar."
 +        );
 +        initialize("Native GUI integration for Anthracite.");
 +    }
 +
 +private:
-+    Py::Object pushActivity(const Py::Tuple& args)
-+    {
-+        const char* text = nullptr;
-+        if (!PyArg_ParseTuple(args.ptr(), "s", &text)) {
-+            throw Py::Exception();
-+        }
-+        QJsonParseError error;
-+        const auto document = QJsonDocument::fromJson(QByteArray(text), &error);
-+        if (error.error != QJsonParseError::NoError || !document.isObject()) {
-+            throw Py::ValueError("push_activity expects a JSON object.");
-+        }
-+        const auto event = document.object();
-+        sidebarController()->pushOperation(
-+            event.value(QStringLiteral("operation")).toObject().toVariantMap(),
-+            event.value(QStringLiteral("images")).toArray().toVariantList()
-+        );
-+        return Py::None();
-+    }
-+
 +    Py::Object pushBridgeStatus(const Py::Tuple& args)
 +    {
 +        const char* text = nullptr;
@@ -89,28 +54,8 @@
 +        if (error.error != QJsonParseError::NoError || !document.isObject()) {
 +            throw Py::ValueError("push_bridge_status expects a JSON object.");
 +        }
-+        sidebarController()->applyBridgeStatus(document.object().toVariantMap());
++        statusController()->applyBridgeStatus(document.object().toVariantMap());
 +        return Py::None();
-+    }
-+
-+    Py::Object pushParameters(const Py::Tuple& args)
-+    {
-+        const char* text = nullptr;
-+        if (!PyArg_ParseTuple(args.ptr(), "s", &text)) {
-+            throw Py::Exception();
-+        }
-+        QJsonParseError error;
-+        const auto document = QJsonDocument::fromJson(QByteArray(text), &error);
-+        if (error.error != QJsonParseError::NoError || !document.isObject()) {
-+            throw Py::ValueError("push_parameters expects a JSON object.");
-+        }
-+        sidebarController()->applyParameters(document.object().toVariantMap());
-+        return Py::None();
-+    }
-+
-+    Py::Object takeParameterRequest(const Py::Tuple&)
-+    {
-+        return Py::String(sidebarController()->takeParameterRequest().toStdString());
 +    }
 +};
 +
@@ -130,23 +75,14 @@
 +    initAnthraciteResources();
 +    PyObject* module = AnthraciteGui::initModule();
 +    CreateAnthraciteCommands();
-+    AnthraciteGui::ensureSidebar();
 +    QTimer::singleShot(0, []() { AnthraciteGui::installChrome(); });
-+
-+    auto preferences = App::GetApplication().GetParameterGroupByPath(
-+        "User parameter:BaseApp/Preferences/Mod/Anthracite"
-+    );
-+    if (!preferences->GetBool("SidebarInitialized", false)) {
-+        preferences->SetBool("SidebarInitialized", true);
-+        QTimer::singleShot(0, []() { AnthraciteGui::showSidebar(); });
-+    }
 +
 +    Base::Console().log("Loading GUI of Anthracite module... done\n");
 +    PyMOD_Return(module);
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/CMakeLists.txt
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,65 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +find_package(
@@ -158,7 +94,7 @@
 +# Content-address the resource path, not a URL query (Qt's disk-cache key strips
 +# queries). Fixed RCC timestamps must never reuse a previous component definition.
 +set(AnthraciteQml_FINGERPRINT "")
-+foreach(component Main TranscriptView TranscriptText ActivityEntry StatusBar Hint UserNotifications ConsoleNavigation)
++foreach(component StatusBar Hint UserNotifications ConsoleNavigation)
 +    set(qml_file ${CMAKE_CURRENT_SOURCE_DIR}/Resources/qml/${component}.qml)
 +    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${qml_file})
 +    file(SHA256 ${qml_file} qml_hash)
@@ -178,20 +114,11 @@
 +    Command.cpp
 +    Chrome.cpp
 +    Chrome.h
-+    ConversationModel.cpp
-+    ConversationModel.h
-+    Sidebar.cpp
-+    Sidebar.h
++    StatusController.cpp
++    StatusController.h
 +)
 +
 +add_library(AnthraciteGui SHARED ${AnthraciteGui_SRCS})
-+if(APPLE)
-+    # Keep Objective-C++ local; enabling another project-wide language from a
-+    # module changes how upstream's unrelated .mm sources are generated.
-+    set_source_files_properties(MotionMac.mm PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x objective-c++")
-+    target_sources(AnthraciteGui PRIVATE MotionMac.mm)
-+    target_link_libraries(AnthraciteGui PRIVATE "-framework AppKit")
-+endif()
 +target_compile_definitions(AnthraciteGui PRIVATE ANTHRACITE_QML_VERSION="${AnthraciteQml_VERSION}")
 +
 +target_include_directories(
@@ -221,58 +148,39 @@
 +SET_PYTHON_PREFIX_SUFFIX(AnthraciteGui)
 +
 +install(TARGETS AnthraciteGui DESTINATION ${CMAKE_INSTALL_LIBDIR})
-+install(FILES Resources/qml/Main.qml DESTINATION Mod/Anthracite/qml)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Command.cpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,45 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
++#include <Gui/Action.h>
 +#include <Gui/Application.h>
 +#include <Gui/Command.h>
++#include <Gui/MainWindow.h>
 +
-+#include "Sidebar.h"
++#include "StatusController.h"
 +
 +
-+DEF_STD_CMD_A(AnthraciteCmdToggleSidebar)
++DEF_STD_CMD_A(AnthraciteCmdPickReference)
 +
-+AnthraciteCmdToggleSidebar::AnthraciteCmdToggleSidebar()
-+    : Command("Anthracite_ToggleSidebar")
++AnthraciteCmdPickReference::AnthraciteCmdPickReference()
++    : Command("Anthracite_PickReference")
 +{
 +    sGroup = "Anthracite";
-+    sMenuText = QT_TR_NOOP("&Anthracite");
-+    sToolTipText = QT_TR_NOOP("Show the Anthracite activity history");
-+    sStatusTip = QT_TR_NOOP("Show the Anthracite activity history");
-+    sWhatsThis = "Anthracite_ToggleSidebar";
++    sMenuText = QT_TR_NOOP("Pick CAD &geometry");
++    sToolTipText = QT_TR_NOOP("Copy a model reference to the clipboard");
++    sStatusTip = QT_TR_NOOP("Copy a model reference to the clipboard");
++    sAccel = "Ctrl+Shift+E";
++    sWhatsThis = "Anthracite_PickReference";
 +}
 +
-+void AnthraciteCmdToggleSidebar::activated(int message)
++void AnthraciteCmdPickReference::activated(int message)
 +{
 +    Q_UNUSED(message);
-+    AnthraciteGui::showSidebar();
++    AnthraciteGui::statusController()->togglePicker();
 +}
 +
-+bool AnthraciteCmdToggleSidebar::isActive()
-+{
-+    return true;
-+}
-+
-+DEF_STD_CMD_A(AnthraciteCmdReloadSidebar)
-+
-+AnthraciteCmdReloadSidebar::AnthraciteCmdReloadSidebar()
-+    : Command("Anthracite_ReloadSidebar")
-+{
-+    sGroup = "Anthracite";
-+    sMenuText = QT_TR_NOOP("Reload Anthracite UI");
-+    sToolTipText = QT_TR_NOOP("Reload the local QML override while preserving the live bridge");
-+}
-+
-+void AnthraciteCmdReloadSidebar::activated(int message)
-+{
-+    Q_UNUSED(message);
-+    AnthraciteGui::ensureSidebar()->reloadUi();
-+}
-+
-+bool AnthraciteCmdReloadSidebar::isActive()
++bool AnthraciteCmdPickReference::isActive()
 +{
 +    return true;
 +}
@@ -280,280 +188,17 @@
 +void CreateAnthraciteCommands()
 +{
 +    auto& commands = Gui::Application::Instance->commandManager();
-+    auto* command = new AnthraciteCmdToggleSidebar();
++    auto* command = new AnthraciteCmdPickReference();
 +    command->initAction();
 +    commands.addCommand(command);
-+    auto* reload = new AnthraciteCmdReloadSidebar();
-+    reload->initAction();
-+    commands.addCommand(reload);
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/ConversationModel.cpp
-@@ -0,0 +1,187 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#include "ConversationModel.h"
-+#include <QUuid>
-+#include <utility>
-+
-+using namespace AnthraciteGui;
-+
-+ConversationModel::ConversationModel(QObject* parent)
-+    : QAbstractListModel(parent)
-+{
-+    updateTimer.setSingleShot(true);
-+    updateTimer.setInterval(16);
-+    connect(&updateTimer, &QTimer::timeout, this, &ConversationModel::flushChanges);
-+}
-+
-+void ConversationModel::flushChanges()
-+{
-+    updateTimer.stop();
-+    const auto changes = std::exchange(pendingRoles, {});
-+    for (auto it = changes.cbegin(); it != changes.cend(); ++it)
-+        Q_EMIT dataChanged(index(it.key()), index(it.key()), it.value());
-+}
-+
-+int ConversationModel::rowCount(const QModelIndex& parent) const
-+{
-+    return parent.isValid() ? 0 : static_cast<int>(messages.size());
-+}
-+
-+QVariant ConversationModel::data(const QModelIndex& index, int role) const
-+{
-+    if (!index.isValid() || index.row() < 0 || index.row() >= rowCount()) {
-+        return {};
-+    }
-+    return messages[index.row()].value(role == IdRole ? QStringLiteral("id")
-+        : QString::fromLatin1(roleNames().value(role)));
-+}
-+
-+QHash<int, QByteArray> ConversationModel::roleNames() const
-+{
-+    return {{AuthorRole, "author"}, {BodyRole, "body"}, {KindRole, "kind"},
-+            {EntriesRole, "entries"}, {IdRole, "entryId"}, {TitleRole, "title"},
-+            {EntryCountRole, "entryCount"}, {ContentRole, "content"}};
-+}
-+
-+int ConversationModel::indexOfId(const QString& id) const
-+{
-+    for (int row = 0; row < rowCount(); ++row)
-+        if (messages[row].value("id").toString() == id) return row;
-+    return -1;
-+}
-+
-+QString ConversationModel::idAt(int row) const
-+{
-+    return row >= 0 && row < rowCount() ? messages[row].value("id").toString() : QString();
-+}
-+
-+QString ConversationModel::kindAt(int row) const
-+{
-+    return row >= 0 && row < rowCount() ? messages[row].value("kind").toString() : QString();
-+}
-+
-+void ConversationModel::loadEarlier()
-+{
-+    if (!earlier || earlierLoading || messages.empty()) return;
-+    earlierLoading = true;
-+    Q_EMIT historyChanged();
-+    const auto token = ++requestSequence;
-+    requestTokens[QString()] = token;
-+    QTimer::singleShot(10000, this, [this, token]() {
-+        if (requestTokens.value(QString()) != token || !earlierLoading) return;
-+        earlierLoading = false;
-+        Q_EMIT historyChanged();
-+    });
-+    Q_EMIT earlierRequested(idAt(0));
-+}
-+
-+void ConversationModel::loadDetails(const QString& id)
-+{
-+    const int row = indexOfId(id);
-+    if (row < 0 || detailStates.value(id) == QStringLiteral("loading")) return;
-+    detailStates[id] = QStringLiteral("loading");
-+    Q_EMIT historyChanged();
-+    const auto token = ++requestSequence;
-+    requestTokens[id] = token;
-+    QTimer::singleShot(10000, this, [this, id, token]() {
-+        if (requestTokens.value(id) != token || detailStates.value(id) != QStringLiteral("loading")) return;
-+        detailStates[id] = QStringLiteral("retry");
-+        Q_EMIT historyChanged();
-+    });
-+    Q_EMIT detailsRequested(id, messages[row].value("entries").toList().size());
-+}
-+
-+void ConversationModel::append(QString author, QString body, QString kind)
-+{
-+    apply({{"op", "append"}, {"row", QVariantMap {{"id", QUuid::createUuid().toString()},
-+        {"author", author}, {"body", body}, {"kind", kind}, {"title", author},
-+        {"entries", QVariantList()}, {"entryCount", 0}}}});
-+}
-+
-+void ConversationModel::clear()
-+{
-+    apply({{"op", "reset"}});
-+}
-+
-+void ConversationModel::apply(const QVariantMap& edit)
-+{
-+    // Generic row transport only. Message/run semantics belong to the Rust runtime.
-+    const QString operation = edit.value("op").toString();
-+    // Structural edits must not leave delayed signals addressing old row indices.
-+    if (operation != QLatin1String("update")) flushChanges();
-+    if (edit.contains("hasEarlier") || operation == QLatin1String("reset")) {
-+        earlierLoading = false;
-+        earlier = edit.value("hasEarlier").toBool();
-+        Q_EMIT historyChanged();
-+    }
-+    if (operation == QLatin1String("reset")) {
-+        detailStates.clear();
-+        requestTokens.clear();
-+        Q_EMIT historyChanged();
-+        beginResetModel();
-+        messages.clear();
-+        for (const auto& row : edit.value("rows").toList()) {
-+            messages.push_back(row.toMap());
-+        }
-+        endResetModel();
-+    }
-+    else if (operation == QLatin1String("prepend")) {
-+        const auto rows = edit.value("rows").toList();
-+        if (rows.isEmpty()) return;
-+        beginInsertRows({}, 0, rows.size() - 1);
-+        std::vector<QVariantMap> prefix;
-+        for (const auto& row : rows) prefix.push_back(row.toMap());
-+        messages.insert(messages.begin(), prefix.begin(), prefix.end());
-+        endInsertRows();
-+    }
-+    else if (operation == QLatin1String("details")) {
-+        const int row = indexOfId(edit.value("id").toString());
-+        if (row < 0) return;
-+        auto entries = messages[row].value("entries").toList();
-+        // Duplicate or stale page responses must not duplicate activity.
-+        if (entries.size() != edit.value("offset").toInt()) return;
-+        detailStates.remove(edit.value("id").toString());
-+        requestTokens.remove(edit.value("id").toString());
-+        Q_EMIT historyChanged();
-+        entries.append(edit.value("entries").toList());
-+        messages[row]["entries"] = entries;
-+        Q_EMIT dataChanged(index(row), index(row), {EntriesRole});
-+    }
-+    else if (operation == QLatin1String("append")) {
-+        const int row = rowCount();
-+        beginInsertRows({}, row, row);
-+        messages.push_back(edit.value("row").toMap());
-+        endInsertRows();
-+    }
-+    else if (operation == QLatin1String("update")) {
-+        const QVariantMap value = edit.value("row").toMap();
-+        for (int row = 0; row < rowCount(); ++row) {
-+            if (messages[row].value("id") == value.value("id")) {
-+                auto roles = roleNames();
-+                QList<int> changed;
-+                for (auto it = roles.cbegin(); it != roles.cend(); ++it) {
-+                    const QString key = it.key() == IdRole ? QStringLiteral("id") : QString::fromLatin1(it.value());
-+                    if (messages[row].value(key) != value.value(key)) changed.append(it.key());
-+                }
-+                messages[row] = value;
-+                if (!changed.isEmpty()) {
-+                    auto& pending = pendingRoles[row];
-+                    for (int role : changed) if (!pending.contains(role)) pending.append(role);
-+                    // Throttle, don't debounce: continuous output must still paint.
-+                    if (!updateTimer.isActive()) updateTimer.start();
-+                }
-+                break;
-+            }
-+        }
-+    }
-+    else if (operation == QLatin1String("remove")) {
-+        const QVariantList ids = edit.value("ids").toList();
-+        for (int row = rowCount() - 1; row >= 0; --row) {
-+            if (ids.contains(messages[row].value("id"))) {
-+                beginRemoveRows({}, row, row);
-+                messages.erase(messages.begin() + row);
-+                endRemoveRows();
-+            }
-+        }
++    // The accelerator only fires once the action belongs to the main window.
++    if (auto* action = command->getAction()) {
++        Gui::getMainWindow()->addAction(action->action());
 +    }
 +}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/ConversationModel.h
-@@ -0,0 +1,71 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#ifndef ANTHRACITEGUI_CONVERSATIONMODEL_H
-+#define ANTHRACITEGUI_CONVERSATIONMODEL_H
-+
-+#include <QAbstractListModel>
-+#include <QString>
-+#include <QTimer>
-+#include <QMap>
-+#include <vector>
-+
-+
-+namespace AnthraciteGui
-+{
-+class ConversationModel: public QAbstractListModel
-+{
-+    Q_OBJECT
-+    Q_PROPERTY(bool hasEarlier READ hasEarlier NOTIFY historyChanged)
-+    Q_PROPERTY(QVariantMap detailRequests READ detailRequests NOTIFY historyChanged)
-+    Q_PROPERTY(bool loadingEarlier READ loadingEarlier NOTIFY historyChanged)
-+
-+public:
-+    enum Role
-+    {
-+        AuthorRole = Qt::UserRole + 1,
-+        BodyRole,
-+        KindRole,
-+        EntriesRole,
-+        IdRole,
-+        TitleRole,
-+        EntryCountRole,
-+        ContentRole
-+    };
-+
-+    explicit ConversationModel(QObject* parent = nullptr);
-+
-+    int rowCount(const QModelIndex& parent = QModelIndex()) const override;
-+    QVariant data(const QModelIndex& index, int role) const override;
-+    QHash<int, QByteArray> roleNames() const override;
-+
-+    void append(QString author, QString body, QString kind);
-+    void clear();
-+    Q_INVOKABLE void apply(const QVariantMap& edit);
-+    bool hasEarlier() const { return earlier; }
-+    QVariantMap detailRequests() const { return detailStates; }
-+    bool loadingEarlier() const { return earlierLoading; }
-+    Q_INVOKABLE int indexOfId(const QString& id) const;
-+    Q_INVOKABLE QString idAt(int row) const;
-+    Q_INVOKABLE QString kindAt(int row) const;
-+    Q_INVOKABLE void loadEarlier();
-+    Q_INVOKABLE void loadDetails(const QString& id);
-+
-+Q_SIGNALS:
-+    void historyChanged();
-+    void earlierRequested(const QString& before);
-+    void detailsRequested(const QString& id, int offset);
-+
-+private:
-+    void flushChanges();
-+    QTimer updateTimer;
-+    QMap<int, QList<int>> pendingRoles;
-+    std::vector<QVariantMap> messages;
-+    bool earlier = false;
-+    bool earlierLoading = false;
-+    QVariantMap detailStates;
-+    QMap<QString, quint64> requestTokens;
-+    quint64 requestSequence = 0;
-+};
-+}  // namespace AnthraciteGui
-+
-+#endif  // ANTHRACITEGUI_CONVERSATIONMODEL_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/Anthracite.qrc
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,22 @@
 +<!DOCTYPE RCC>
 +<RCC version="1.0">
 +    <qresource prefix="/Anthracite/icons">
@@ -566,1414 +211,34 @@
 +        <file alias="qml/UserNotifications.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/UserNotifications.qml</file>
 +        <file alias="theme.yaml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/theme.yaml</file>
 +        <file alias="qml/Hint.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Hint.qml</file>
-+        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="overlay.qss">@CMAKE_CURRENT_SOURCE_DIR@/Resources/overlay.qss</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
-+        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
-+        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
-+        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +    <qresource prefix="/Anthracite/@AnthraciteQml_VERSION@">
 +        <file alias="qml/ConsoleNavigation.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ConsoleNavigation.qml</file>
 +        <file alias="qml/UserNotifications.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/UserNotifications.qml</file>
 +        <file alias="qml/Hint.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Hint.qml</file>
-+        <file alias="qml/TranscriptView.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptView.qml</file>
 +        <file alias="qml/StatusBar.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/StatusBar.qml</file>
-+        <file alias="qml/Main.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/Main.qml</file>
-+        <file alias="qml/TranscriptText.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/TranscriptText.qml</file>
-+        <file alias="qml/ActivityEntry.qml">@CMAKE_CURRENT_SOURCE_DIR@/Resources/qml/ActivityEntry.qml</file>
 +    </qresource>
 +</RCC>
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,774 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+import QtQuick 2.15
-+import QtQuick.Controls 2.15
-+import QtQuick.Controls.Basic
-+import QtQuick.Layouts 1.15
-+import "qrc:/Anthracite/qml" as Transcript
-+
-+Pane {
-+    id: root
-+    FontMetrics { id: controlFont; font: root.font }
-+    readonly property real compactControlHeight: Math.max(28, Math.ceil(controlFont.height) + 8)
-+    property bool reducedMotion: true
-+    property string activeTab: "activity"
-+    onActiveTabChanged: if (activeTab === "parameters") anthraciteController.refreshParameters()
-+    onReducedMotionChanged: {
-+        if (reducedMotion && latestMotion && latestMotion.running) {
-+            latestMotion.stop()
-+            timeline.latest()
-+        }
-+    }
-+    function observeWheel(position) {
-+        if (imagePreview.visible) return
-+        const point = timeline.mapFromItem(root, position.x, position.y)
-+        if (point.x >= 0 && point.y >= 0 && point.x < timeline.width && point.y < timeline.height)
-+            timeline.navigate()
-+    }
-+    function refreshMotion() {
-+        reducedMotion = anthraciteController.reducedMotion()
-+    }
-+    Component.onCompleted: refreshMotion()
-+    Connections {
-+        target: Qt.application
-+        function onStateChanged() { root.refreshMotion() }
-+    }
-+
-+    padding: 0
-+
-+    Popup {
-+        id: imagePreview
-+        property url imageSource
-+        parent: Overlay.overlay
-+        anchors.centerIn: parent
-+        width: parent.width * 0.95
-+        height: parent.height * 0.9
-+        modal: true
-+        focus: true
-+        opacity: 0
-+        onAboutToShow: root.refreshMotion()
-+        enter: Transition { NumberAnimation { property: "opacity"; to: 1; duration: root.reducedMotion ? 0 : 120; easing.type: Easing.OutCubic } }
-+        exit: Transition { NumberAnimation { property: "opacity"; to: 0; duration: root.reducedMotion ? 0 : 90; easing.type: Easing.OutCubic } }
-+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
-+        ScrollView {
-+            anchors.fill: parent
-+            clip: true
-+            contentWidth: previewImage.width
-+            contentHeight: previewImage.height
-+            Image {
-+                id: previewImage
-+                source: imagePreview.visible ? imagePreview.imageSource : ""
-+                asynchronous: true
-+                width: sourceSize.width
-+                height: sourceSize.height
-+            }
-+        }
-+        Label {
-+            anchors.centerIn: parent
-+            visible: previewImage.status === Image.Loading || previewImage.status === Image.Error
-+            text: previewImage.status === Image.Error ? qsTr("Image could not be loaded. Close and reopen the preview to retry.") : qsTr("Loading image…")
-+            width: parent.width - 32
-+            wrapMode: Text.WordWrap
-+        }
-+        Button {
-+            anchors.right: parent.right
-+            text: "Close"
-+            onClicked: imagePreview.close()
-+        }
-+    }
-+
-+    SystemPalette {
-+        id: systemPalette
-+        colorGroup: SystemPalette.Active
-+    }
-+
-+    background: Rectangle {
-+        color: systemPalette.window
-+    }
-+
-+    ColumnLayout {
-+        anchors.fill: parent
-+        spacing: 0
-+
-+        Rectangle {
-+            Layout.fillWidth: true
-+            Layout.preferredHeight: bridgeHeader.implicitHeight + 8
-+            color: systemPalette.window
-+
-+            RowLayout {
-+                id: bridgeHeader
-+                anchors.fill: parent
-+                anchors.leftMargin: 14
-+                anchors.rightMargin: 14
-+                anchors.topMargin: 4
-+                anchors.bottomMargin: 4
-+                spacing: 8
-+
-+                Rectangle {
-+                    objectName: "AnthraciteBridgeStatusDot"
-+                    Layout.preferredWidth: 8
-+                    Layout.preferredHeight: 8
-+                    radius: 4
-+                    color: anthraciteController.bridgeRunning ? "#4caf50" : systemPalette.mid
-+                }
-+                Label {
-+                    objectName: "AnthraciteBridgeStatusLabel"
-+                    Layout.fillWidth: true
-+                    Layout.minimumWidth: 0
-+                    text: anthraciteController.bridgeRunning
-+                          ? qsTr("Anthracite bridge · port %1").arg(anthraciteController.bridgePort)
-+                          : qsTr("Anthracite bridge offline")
-+                    color: systemPalette.windowText
-+                    elide: Text.ElideRight
-+                }
-+                Label {
-+                    objectName: "AnthraciteBridgeDocument"
-+                    visible: text.length > 0
-+                    Layout.maximumWidth: 200
-+                    text: anthraciteController.bridgeDocument.length > 0
-+                          ? anthraciteController.bridgeDocument
-+                            + (anthraciteController.bridgeRevision > 0
-+                               ? qsTr(" · r%1").arg(anthraciteController.bridgeRevision) : "")
-+                          : ""
-+                    color: systemPalette.windowText
-+                    opacity: 0.65
-+                    elide: Text.ElideRight
-+                }
-+                ToolButton {
-+                    id: geometryPickerButton
-+                    objectName: "AnthraciteGeometryPicker"
-+                    Layout.preferredHeight: root.compactControlHeight
-+                    Layout.preferredWidth: root.compactControlHeight
-+                    checked: anthraciteController.picking
-+                    Accessible.name: qsTr("Pick CAD geometry")
-+                    icon.source: "qrc:/Anthracite/icons/color-picker.svg"
-+                    icon.width: 20; icon.height: 20
-+                    icon.color: "transparent"
-+                    onClicked: anthraciteController.togglePicker()
-+                    Transcript.Hint {
-+                        hovered: parent.hovered
-+                        text: anthraciteController.picking
-+                              ? qsTr("Click a face, edge, vertex or object · Esc cancels")
-+                              : qsTr("Copy a model reference to the clipboard")
-+                    }
-+                }
-+                ToolButton {
-+                    id: copyBridgeButton
-+                    objectName: "AnthraciteBridgeCopy"
-+                    Layout.preferredHeight: root.compactControlHeight
-+                    Layout.preferredWidth: copyBridgeLabel.implicitWidth + 20
-+                    Accessible.name: qsTr("Copy the Anthracite CLI command")
-+                    onClicked: anthraciteController.copyBridgeConfig()
-+                    contentItem: Text {
-+                        id: copyBridgeLabel
-+                        text: qsTr("Copy CLI command")
-+                        color: systemPalette.windowText
-+                        verticalAlignment: Text.AlignVCenter
-+                        horizontalAlignment: Text.AlignHCenter
-+                    }
-+                    Transcript.Hint {
-+                        hovered: parent.hovered
-+                        text: anthraciteController.bridgeConfig.length > 0
-+                              ? qsTr("Copy the command an agent runs to use Anthracite")
-+                              : qsTr("Bridge is not running")
-+                    }
-+                }
-+            }
-+
-+            Rectangle {
-+                anchors.bottom: parent.bottom
-+                width: parent.width
-+                height: 1
-+                color: systemPalette.mid
-+                opacity: 0.45
-+            }
-+        }
-+
-+        RowLayout {
-+            id: tabBar
-+            Layout.fillWidth: true
-+            Layout.leftMargin: 14
-+            Layout.rightMargin: 14
-+            Layout.topMargin: 6
-+            spacing: 6
-+
-+            Button {
-+                text: qsTr("Activity")
-+                checkable: true
-+                checked: root.activeTab === "activity"
-+                onClicked: root.activeTab = "activity"
-+            }
-+
-+            Button {
-+                text: qsTr("Parameters")
-+                checkable: true
-+                checked: root.activeTab === "parameters"
-+                onClicked: root.activeTab = "parameters"
-+            }
-+
-+            Item { Layout.fillWidth: true }
-+        }
-+
-+        StackLayout {
-+            id: contentStack
-+            Layout.fillWidth: true
-+            Layout.fillHeight: true
-+            currentIndex: root.activeTab === "activity" ? 0 : 1
-+
-+            Transcript.TranscriptView {
-+                id: timeline
-+            objectName: "AnthraciteTimeline"
-+            Layout.fillWidth: true
-+            Layout.fillHeight: true
-+            Layout.margins: 10
-+            spacing: 9
-+            clip: true
-+            model: anthraciteController.messages
-+
-+            // Only user navigation changes intent. Geometry changes preserve an anchor.
-+            property string scrollMode: "following"
-+            property bool followOutput: scrollMode !== "reading"
-+            property string anchorId: ""
-+            property real anchorOffset: 0
-+            property string newTurnId: ""
-+            property bool pendingTurn: false
-+            property bool settling: false
-+            property var expandedRows: ({})
-+            property var expandedEntries: ({})
-+            boundsBehavior: Flickable.StopAtBounds
-+            property bool userScrolling: false
-+
-+            function remember() {
-+                if (settling || moving) return
-+                // The top can fall in message spacing. Do not keep a stale
-+                // anchor from another screen merely because indexAt misses it.
-+                let item = itemAtIndex(indexAt(1, contentY + 2))
-+                if (!item) {
-+                    const children = rowItems
-+                    for (let i = 0; i < children.length; ++i) {
-+                        const candidate = children[i]
-+                        if (candidate.rowId && candidate.y + candidate.height > contentY
-+                            && candidate.y < contentY + height
-+                            && (!item || candidate.y < item.y)) item = candidate
-+                    }
-+                }
-+                if (item) { anchorId = item.rowId; anchorOffset = item.y - contentY }
-+                else anchorId = ""
-+            }
-+            function pauseAt(item) {
-+                latestMotion.stop()
-+                scrollMode = "reading"
-+                pendingTurn = false
-+                anchorId = item.rowId
-+                anchorOffset = item.y - contentY
-+            }
-+            function toggleEntry(id) {
-+                const state = Object.assign({}, expandedEntries)
-+                state[id] = !state[id]
-+                expandedEntries = state
-+            }
-+            function navigate() {
-+                latestMotion.stop()
-+                userScrolling = true
-+                gestureEnd.restart()
-+                scrollMode = "reading"
-+                pendingTurn = false
-+                // Keep the reserved space during a gesture; removing it clamps the viewport.
-+                settle.stop()
-+            }
-+            function latest() { jumpLatest(false) }
-+            function jumpLatest(animate) {
-+                latestMotion.stop()
-+                userScrolling = false
-+                gestureEnd.stop()
-+                scrollMode = "following"
-+                newTurnId = ""
-+                root.refreshMotion()
-+                forceLayout()
-+                if (animate && !root.reducedMotion) {
-+                    latestMotion.to = Math.max(originY, originY + contentHeight - height)
-+                    latestMotion.start()
-+                } else positionViewAtEnd()
-+            }
-+            function schedule() {
-+                if (!moving && !userScrolling && !settling && !latestMotion.running && !settle.running) settle.start()
-+            }
-+            function reconcile() {
-+                if (moving || userScrolling || latestMotion.running) return
-+                settling = true
-+                if (scrollMode === "following") {
-+                    positionViewAtEnd()
-+                } else if (scrollMode === "new-turn") {
-+                    const row = model.indexOfId(newTurnId)
-+                    if (row >= 0) {
-+                        positionViewAtIndex(row, ListView.Beginning)
-+                        // Keep the prompt at the top until the answer outgrows the viewport.
-+                        const last = itemAtIndex(count - 1)
-+                        if (!last) positionViewAtIndex(count - 1, ListView.End)
-+                        else if (last.y + last.height > contentY + height)
-+                            contentY = last.y + last.height - height
-+                    }
-+                } else if (anchorId.length) {
-+                    const row = model.indexOfId(anchorId)
-+                    if (row >= 0) {
-+                        const item = itemAtIndex(row)
-+                        if (item) contentY = item.y - anchorOffset
-+                    }
-+                }
-+                settling = false
-+                remember()
-+            }
-+            onMovementStarted: navigate()
-+            onMovementEnded: {
-+                // A trackpad gesture can contain several native movement bursts.
-+                // Only the quiet-period timer may release manual-scroll ownership.
-+                gestureEnd.restart()
-+                remember()
-+            }
-+            // Only real layout changes affect the exact content height.
-+            onContentHeightChanged: { if (scrollMode !== "reading") schedule() }
-+            onHeightChanged: schedule()
-+            onWidthChanged: schedule()
-+            onCountChanged: schedule()
-+            Timer { id: settle; interval: 16; onTriggered: timeline.reconcile() }
-+            NumberAnimation {
-+                id: latestMotion
-+                objectName: "AnthraciteLatestMotion"
-+                target: timeline
-+                property: "contentY"
-+                duration: 180
-+                easing.type: Easing.OutCubic
-+                onFinished: timeline.schedule()
-+            }
-+            Timer {
-+                id: gestureEnd
-+                interval: 150
-+                onTriggered: {
-+                    if (timeline.moving || timelineScrollBar.pressed) { restart(); return }
-+                    timeline.userScrolling = false
-+                    timeline.remember()
-+                    if (timeline.atYEnd && !timeline.newTurnId.length)
-+                        timeline.scrollMode = "following"
-+                }
-+            }
-+            Timer {
-+                id: latestDelay
-+                interval: 150
-+                running: timeline.scrollMode === "reading" && !timeline.atYEnd
-+            }
-+            // Flickable owns wheel/trackpad input. A competing WheelHandler
-+            // can grab the gesture without actually scrolling the view.
-+            Keys.onPressed: function(event) {
-+                if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown,
-+                     Qt.Key_Home, Qt.Key_End].indexOf(event.key) >= 0) {
-+                    timeline.navigate()
-+                    const step = event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown ? height * 0.9 : 40
-+                    const target = event.key === Qt.Key_Home ? 0 : event.key === Qt.Key_End ? contentHeight
-+                        : contentY + ([Qt.Key_Up, Qt.Key_PageUp].indexOf(event.key) >= 0 ? -step : step)
-+                    contentY = Math.max(0, Math.min(Math.max(0, contentHeight - height), target))
-+                    event.accepted = true
-+                }
-+            }
-+            Connections {
-+                target: anthraciteController.messages
-+                function onRowsInserted(parent, first, last) {
-+                    if (timeline.pendingTurn && anthraciteController.messages.kindAt(last) === "user") {
-+                        timeline.newTurnId = anthraciteController.messages.idAt(last)
-+                        timeline.pendingTurn = false
-+                        timeline.scrollMode = "new-turn"
-+                    }
-+                }
-+                function onDataChanged() { timeline.schedule() }
-+                function onModelReset() {
-+                    timeline.anchorId = ""
-+                    timeline.expandedRows = ({})
-+                    timeline.expandedEntries = ({})
-+                    timeline.latest()
-+                }
-+            }
-+            header: Button {
-+                objectName: "loadEarlier"
-+                visible: anthraciteController.messages.hasEarlier
-+                height: visible ? implicitHeight : 0
-+                text: anthraciteController.messages.loadingEarlier ? qsTr("Loading earlier messages…") : qsTr("Load earlier messages")
-+                enabled: !anthraciteController.messages.loadingEarlier
-+                onClicked: { timeline.navigate(); timeline.remember(); anthraciteController.messages.loadEarlier() }
-+            }
-+            footer: Item {
-+                // Retain end space while reading: removing it would clamp the scroll position.
-+                // Reserve a full viewport: a short prompt must still reach the
-+                // top when transcript controls are hidden or text wraps differently.
-+                height: timeline.newTurnId.length ? timeline.height : 0
-+            }
-+            ToolButton {
-+                parent: timeline
-+                anchors.right: parent.right
-+                anchors.bottom: parent.bottom
-+                z: 2
-+                visible: timeline.scrollMode === "reading" && !timeline.atYEnd && !latestDelay.running
-+                text: qsTr("Latest")
-+                icon.source: "qrc:/Anthracite/icons/nav-arrow-down.svg"
-+                icon.width: 16; icon.height: 16
-+                icon.color: "transparent"
-+                onClicked: timeline.jumpLatest(true)
-+            }
-+
-+            delegate: Item {
-+                id: timelineRow
-+                // Actual message layout changes (wrapping, streamed text, or
-+                // expansion) can need repair; estimated total height does not.
-+                onHeightChanged: timeline.schedule()
-+                property string rowId: entryId || ""
-+                objectName: isWork ? "workSummary" : "timelineEntry"
-+                property bool activityExpanded: timeline.expandedRows[rowId] || false
-+                function toggleWork() {
-+                    timeline.pauseAt(timelineRow)
-+                    if (!activityExpanded && entries.length === 0 && entryCount > 0)
-+                        anthraciteController.messages.loadDetails(rowId)
-+                    const state = Object.assign({}, timeline.expandedRows)
-+                    state[rowId] = !activityExpanded
-+                    timeline.expandedRows = state
-+                }
-+                property bool isActivity: kind === "activity"
-+                property bool isWork: kind === "work"
-+                property bool isUser: kind === "user"
-+
-+                width: Math.max(0, timeline.width - timelineScrollBar.width - 4)
-+                height: bubble.implicitHeight
-+
-+                Rectangle {
-+                    id: bubble
-+                    objectName: "AnthraciteTranscriptSurface"
-+                    anchors.right: parent.right
-+                    width: isUser ? Math.min(parent.width * 0.85, Math.ceil(userTextMetrics.advanceWidth) + 26) : parent.width
-+                    implicitHeight: messageColumn.implicitHeight + (isUser ? 24 : 12)
-+                    radius: 12
-+                    color: isUser
-+                           ? Qt.rgba(systemPalette.highlight.r, systemPalette.highlight.g, systemPalette.highlight.b, 0.25)
-+                             : kind === "error"
-+                             ? Qt.rgba(0.90, 0.25, 0.25, 0.15)
-+                             : "transparent"
-+
-+                    TextMetrics {
-+                        id: userTextMetrics
-+                        font: messageBody.font
-+                        text: isUser ? body : ""
-+                    }
-+
-+                    Column {
-+                        id: messageColumn
-+                        anchors.left: parent.left
-+                        anchors.right: parent.right
-+                        anchors.top: parent.top
-+                        anchors.margins: isUser ? 12 : 6
-+                        spacing: isWork ? 12 : 5
-+
-+                        ToolButton {
-+                            visible: isWork
-+                            text: isWork ? author : ""
-+                            icon.source: "qrc:/Anthracite/icons/" + (activityExpanded ? "nav-arrow-down" : "nav-arrow-right") + ".svg"
-+                            icon.width: 16; icon.height: 16
-+                            icon.color: "transparent"
-+                            width: parent.width
-+                            padding: 4
-+                            contentItem: Row {
-+                                spacing: 6
-+                                Text { text: isWork ? author : ""; color: systemPalette.windowText }
-+                                Image {
-+                                    source: "qrc:/Anthracite/icons/" + (activityExpanded ? "nav-arrow-down" : "nav-arrow-right") + ".svg"
-+                                    sourceSize.width: 16; sourceSize.height: 16
-+                                    anchors.verticalCenter: parent.verticalCenter
-+                                }
-+                            }
-+                            onClicked: timelineRow.toggleWork()
-+                        }
-+
-+                        Item {
-+                            id: workDetails
-+                            property real reveal: activityExpanded ? 1 : 0
-+                            width: parent.width
-+                            height: reveal * detailColumn.implicitHeight
-+                            clip: true
-+                            // Animate the user's toggle, not every arriving token
-+                            // or detail page changing the expanded content height.
-+                            Behavior on reveal { NumberAnimation { duration: root.reducedMotion ? 0 : 140; easing.type: Easing.OutCubic } }
-+                            Column {
-+                                id: detailColumn
-+                                width: parent.width
-+                                spacing: 5
-+                                Repeater {
-+                                    model: isWork && (activityExpanded || workDetails.reveal > 0) ? entries : []
-+                                    delegate: Transcript.ActivityEntry {
-+                                        width: messageColumn.width
-+                                        entry: modelData
-+                                        expanded: timeline.expandedEntries[modelData.id] || false
-+                                        onToggle: timeline.toggleEntry(modelData.id)
-+                                        onResizing: timeline.pauseAt(timelineRow)
-+                                        onPreview: function(source) { imagePreview.imageSource = source; imagePreview.open() }
-+                                    }
-+                                }
-+                                Button {
-+                                    visible: isWork && activityExpanded && entryCount > entries.length
-+                                    text: anthraciteController.messages.detailRequests[rowId] === "loading" ? qsTr("Loading activity…")
-+                                        : anthraciteController.messages.detailRequests[rowId] === "retry" ? qsTr("Activity hasn’t arrived · Retry") : qsTr("Show more activity")
-+                                    enabled: anthraciteController.messages.detailRequests[rowId] !== "loading"
-+                                    onClicked: { timeline.pauseAt(timelineRow); anthraciteController.messages.loadDetails(rowId) }
-+                                }
-+                            }
-+                        }
-+
-+                        Rectangle {
-+                            visible: isWork
-+                            width: parent.width
-+                            height: 1
-+                            color: systemPalette.windowText
-+                            opacity: 0.18
-+                        }
-+
-+                        Image {
-+                            objectName: "chatImage"
-+                            visible: kind === "image"
-+                            width: parent.width
-+                            height: visible ? Math.min(180, width * 0.75) : 0
-+                            sourceSize.width: 480
-+                            sourceSize.height: 360
-+                            asynchronous: true
-+                            source: visible ? body : ""
-+                            fillMode: Image.PreserveAspectFit
-+                            MouseArea {
-+                                anchors.fill: parent
-+                                onClicked: { imagePreview.imageSource = parent.source; imagePreview.open() }
-+                            }
-+                        }
-+
-+                        Transcript.ActivityEntry {
-+                            visible: isActivity
-+                            width: parent.width
-+                            entry: ({kind: kind, title: title, author: author, body: body, content: model.content})
-+                            expanded: timeline.expandedEntries[rowId] || false
-+                            onToggle: timeline.toggleEntry(rowId)
-+                            onResizing: timeline.pauseAt(timelineRow)
-+                        }
-+                        Transcript.TranscriptText {
-+                            id: messageBody
-+                            visible: !isActivity && kind !== "image" && body.length > 0
-+                            width: parent.width
-+                            body: visible ? model.body : ""
-+                            markdown: kind === "assistant" || isWork
-+                            foldLong: kind === "user"
-+                            onResizing: timeline.pauseAt(timelineRow)
-+                        }
-+                    }
-+
-+                }
-+            }
-+
-+            ScrollBar.vertical: ScrollBar {
-+                id: timelineScrollBar
-+                onPressedChanged: {
-+                    if (pressed) timeline.navigate()
-+                    else { timeline.userScrolling = false; timeline.remember() }
-+                }
-+            }
-+        }
-+
-+            Rectangle {
-+                id: parametersPanel
-+                objectName: "AnthraciteParameters"
-+                Layout.fillWidth: true
-+                Layout.fillHeight: true
-+                color: "transparent"
-+
-+                ColumnLayout {
-+                    anchors.fill: parent
-+                    anchors.margins: 12
-+                    spacing: 8
-+
-+                    RowLayout {
-+                        Layout.fillWidth: true
-+                        spacing: 6
-+
-+                        ComboBox {
-+                            id: parameterObjectBox
-+                            Layout.fillWidth: true
-+                            model: anthraciteController.parameterTargets
-+                            textRole: "label"
-+                            valueRole: "name"
-+                            function syncIndex() {
-+                                for (let index = 0; index < model.length; ++index) {
-+                                    if (model[index].name === anthraciteController.parameterObject) {
-+                                        currentIndex = index
-+                                        return
-+                                    }
-+                                }
-+                                currentIndex = -1
-+                            }
-+                            Component.onCompleted: syncIndex()
-+                            onActivated: anthraciteController.chooseParameterObject(currentValue)
-+                            Connections {
-+                                target: anthraciteController
-+                                function onParametersChanged() { parameterObjectBox.syncIndex() }
-+                            }
-+                        }
-+
-+                        Button {
-+                            text: qsTr("Refresh")
-+                            onClicked: anthraciteController.refreshParameters()
-+                        }
-+                    }
-+
-+                    Label {
-+                        Layout.fillWidth: true
-+                        visible: anthraciteController.parameterNote.length > 0
-+                        text: anthraciteController.parameterNote
-+                        wrapMode: Text.WordWrap
-+                        color: systemPalette.text
-+                        opacity: 0.8
-+                    }
-+
-+                    ScrollView {
-+                        id: parameterScroll
-+                        Layout.fillWidth: true
-+                        Layout.fillHeight: true
-+                        clip: true
-+                        ScrollBar.vertical.policy: ScrollBar.AsNeeded
-+
-+                        ColumnLayout {
-+                            width: parameterScroll.availableWidth
-+                            spacing: 6
-+
-+                            Repeater {
-+                                model: anthraciteController.parameters
-+
-+                                delegate: RowLayout {
-+                                    Layout.fillWidth: true
-+                                    spacing: 8
-+
-+                                    Label {
-+                                        Layout.preferredWidth: 120
-+                                        text: modelData.label
-+                                        elide: Text.ElideRight
-+                                        color: systemPalette.text
-+                                    }
-+
-+                                    Loader {
-+                                        Layout.fillWidth: true
-+                                        sourceComponent: {
-+                                            if (modelData.kind === "bool") return boolEditor
-+                                            if (modelData.kind === "enum") return enumEditor
-+                                            if (modelData.kind === "text") return textEditor
-+                                            return numberEditor
-+                                        }
-+                                        onLoaded: item.entry = modelData
-+                                    }
-+
-+                                    Label {
-+                                        text: modelData.unit ? String(modelData.unit) : ""
-+                                        visible: text.length > 0
-+                                        opacity: 0.7
-+                                        color: systemPalette.text
-+                                    }
-+
-+                                    Label {
-+                                        visible: !!modelData.expression
-+                                        text: "fx"
-+                                        opacity: 0.7
-+                                        color: systemPalette.text
-+                                        HoverHandler { id: expressionHover }
-+                                        ToolTip.visible: expressionHover.hovered
-+                                        ToolTip.text: modelData.expression ? String(modelData.expression) : ""
-+                                    }
-+                                }
-+                            }
-+
-+                            Label {
-+                                Layout.fillWidth: true
-+                                visible: anthraciteController.parameters.length === 0
-+                                    && anthraciteController.parameterNote.length === 0
-+                                text: qsTr("Select an object to edit its parameters.")
-+                                wrapMode: Text.WordWrap
-+                                opacity: 0.7
-+                                color: systemPalette.text
-+                            }
-+                        }
-+                    }
-+                }
-+
-+                Component {
-+                    id: numberEditor
-+                    TextField {
-+                        property var entry
-+                        text: entry ? String(entry.value) : ""
-+                        enabled: !(entry && entry.expression)
-+                        onEditingFinished: if (entry) anthraciteController.editParameter(entry.id, text)
-+                    }
-+                }
-+
-+                Component {
-+                    id: textEditor
-+                    TextField {
-+                        property var entry
-+                        text: entry ? String(entry.value) : ""
-+                        enabled: !(entry && entry.expression)
-+                        onEditingFinished: if (entry) anthraciteController.editParameter(entry.id, text)
-+                    }
-+                }
-+
-+                Component {
-+                    id: boolEditor
-+                    CheckBox {
-+                        property var entry
-+                        checked: entry ? entry.value === true : false
-+                        enabled: !(entry && entry.expression)
-+                        onClicked: if (entry) anthraciteController.editParameter(entry.id, checked ? "true" : "false")
-+                    }
-+                }
-+
-+                Component {
-+                    id: enumEditor
-+                    ComboBox {
-+                        property var entry
-+                        model: entry ? entry.options : []
-+                        onEntryChanged: syncIndex()
-+                        function syncIndex() {
-+                            if (!entry) { currentIndex = -1; return }
-+                            currentIndex = model.indexOf(entry.value)
-+                        }
-+                        onActivated: if (entry) anthraciteController.editParameter(entry.id, currentText)
-+                    }
-+                }
-+            }
-+        }
-+
-+    }
-+
-+    Rectangle {
-+        id: toast
-+        objectName: "AnthraciteToast"
-+        visible: anthraciteController.toastMessage.length > 0
-+        anchors.horizontalCenter: parent.horizontalCenter
-+        anchors.bottom: parent.bottom
-+        anchors.bottomMargin: 16
-+        width: Math.min(parent.width - 24, toastLabel.implicitWidth + 28)
-+        height: toastLabel.implicitHeight + 16
-+        radius: 8
-+        color: Qt.rgba(0.06, 0.06, 0.06, 0.94)
-+        border.color: systemPalette.mid
-+        z: 5
-+        Label {
-+            id: toastLabel
-+            anchors.centerIn: parent
-+            width: parent.width - 24
-+            text: anthraciteController.toastMessage
-+            color: systemPalette.windowText
-+            wrapMode: Text.WordWrap
-+            horizontalAlignment: Text.AlignHCenter
-+        }
-+        Timer {
-+            id: toastDismiss
-+            interval: 4000
-+            running: toast.visible
-+            onTriggered: anthraciteController.dismissToast()
-+        }
-+    }
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,458 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#include "Sidebar.h"
-+
-+#include <Python.h>
-+
-+#include <QDockWidget>
-+#include <QApplication>
-+#include <QStyle>
-+#include <App/Application.h>
-+#include <QClipboard>
-+#include <QQmlAbstractUrlInterceptor>
-+#include <QJsonDocument>
-+#include <QJsonObject>
-+#include <QKeyEvent>
-+#include <QMouseEvent>
-+#include <QWheelEvent>
-+#include <QDir>
-+#include <QFileInfo>
-+#include <QFile>
-+#include <QQmlComponent>
-+#include <QQmlEngine>
-+#include <QQmlError>
-+#include <QQmlContext>
-+#include <QQuickWidget>
-+#include <QQuickItem>
-+#include <QUrl>
-+#include <QVBoxLayout>
-+
-+#include <QStringList>
-+
-+#include <Gui/DockWindowManager.h>
-+#include <Base/Console.h>
-+#include <Gui/Selection/Selection.h>
-+
-+
-+using namespace AnthraciteGui;
-+#ifdef Q_OS_MACOS
-+extern bool anthraciteSystemReducedMotion();
-+#endif
-+
-+namespace {
-+// Reproducible RCC timestamps cannot invalidate Qt's disk cache. Give only our
-+// embedded components content-addressed URLs; leave FreeCAD's other QML alone.
-+class SidebarQmlUrls final : public QObject, public QQmlAbstractUrlInterceptor
-+{
-+public:
-+    explicit SidebarQmlUrls(QObject* parent) : QObject(parent) {}
-+    QUrl intercept(const QUrl& url, DataType type) override
-+    {
-+        if (type != QmlFile || url.scheme() != QLatin1String("qrc")
-+            || !url.path().startsWith(QLatin1String("/Anthracite/qml/"))) return url;
-+        QUrl versioned(url);
-+        versioned.setPath(QStringLiteral("/Anthracite/" ANTHRACITE_QML_VERSION)
-+            + url.path().mid(QStringLiteral("/Anthracite").size()));
-+        return versioned;
-+    }
-+};
-+}
-+
-+namespace
-+{
-+QString pythonError()
-+{
-+    if (!PyErr_Occurred()) {
-+        return QStringLiteral("Unknown embedded Python error.");
-+    }
-+
-+    PyObject* type = nullptr;
-+    PyObject* value = nullptr;
-+    PyObject* traceback = nullptr;
-+    PyErr_Fetch(&type, &value, &traceback);
-+    PyErr_NormalizeException(&type, &value, &traceback);
-+
-+    QString result = QStringLiteral("Embedded Python error.");
-+    if (value) {
-+        PyObject* text = PyObject_Str(value);
-+        if (text) {
-+            result = QString::fromUtf8(PyUnicode_AsUTF8(text));
-+            Py_DECREF(text);
-+        }
-+    }
-+
-+    Py_XDECREF(type);
-+    Py_XDECREF(value);
-+    Py_XDECREF(traceback);
-+    return result;
-+}
-+}  // namespace
-+
-+SidebarController::SidebarController(QObject* parent)
-+    : QObject(parent)
-+    , conversation(this)
-+{
-+    toastTimer.setSingleShot(true);
-+    toastTimer.setInterval(4000);
-+    connect(&toastTimer, &QTimer::timeout, this, [this]() {
-+        if (currentToast.isEmpty()) return;
-+        currentToast.clear();
-+        Q_EMIT toastChanged();
-+    });
-+    selectionConnection = Gui::Selection().signalSelectionChanged2.connect(
-+        [this](const Gui::SelectionChanges& selection) {
-+            if (!pickActive || selection.Type != Gui::SelectionChanges::AddSelection) return;
-+            const auto gil = PyGILState_Ensure();
-+            PyObject* module = PyImport_ImportModule("AnthraciteExecutor");
-+            PyObject* result = module ? PyObject_CallMethod(module, "picked_reference_json", "sssddd",
-+                selection.pDocName, selection.pObjectName, selection.pSubName,
-+                double(selection.x), double(selection.y), double(selection.z)) : nullptr;
-+            const char* encoded = result ? PyUnicode_AsUTF8(result) : nullptr;
-+            const auto attachment = encoded ? QJsonDocument::fromJson(encoded).object() : QJsonObject();
-+            const QString error = encoded ? QString() : pythonError();
-+            Py_XDECREF(result);
-+            Py_XDECREF(module);
-+            PyGILState_Release(gil);
-+            setPicking(false);
-+            if (!error.isEmpty()) {
-+                showToast(error);
-+                return;
-+            }
-+            QString literal = attachment.value("inspect").toString();
-+            if (literal.isEmpty()) {
-+                literal = QString::fromUtf8(
-+                    QJsonDocument(attachment.value("reference").toObject()).toJson(QJsonDocument::Compact)
-+                );
-+            }
-+            QApplication::clipboard()->setText(literal);
-+            showToast(tr("Copied %1").arg(attachment.value("name").toString()));
-+        });
-+}
-+
-+QAbstractItemModel* SidebarController::messages()
-+{
-+    return &conversation;
-+}
-+
-+bool SidebarController::reducedMotion() const
-+{
-+    const auto preferences = App::GetApplication().GetParameterGroupByPath(
-+        "User parameter:BaseApp/Preferences/Mod/Anthracite");
-+    if (preferences->GetBool("ReduceMotion", false)) return true;
-+#ifdef Q_OS_MACOS
-+    if (anthraciteSystemReducedMotion()) return true;
-+#endif
-+    return qApp->style()->styleHint(QStyle::SH_Widget_Animation_Duration) == 0;
-+}
-+
-+void SidebarController::togglePicker() { setPicking(!pickActive); }
-+
-+void SidebarController::setPicking(bool active)
-+{
-+    if (pickActive == active) return;
-+    pickActive = active;
-+    if (active) {
-+        QApplication::setOverrideCursor(Qt::CrossCursor);
-+        qApp->installEventFilter(this);
-+    } else {
-+        qApp->removeEventFilter(this);
-+        QApplication::restoreOverrideCursor();
-+    }
-+    Q_EMIT pickingChanged();
-+}
-+
-+bool SidebarController::eventFilter(QObject* watched, QEvent* event)
-+{
-+    if (pickActive && ((event->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape)
-+        || (event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent*>(event)->button() == Qt::RightButton))) {
-+        setPicking(false);
-+        return true;
-+    }
-+    return QObject::eventFilter(watched, event);
-+}
-+
-+void SidebarController::showToast(const QString& message)
-+{
-+    currentToast = message;
-+    toastTimer.start();
-+    Q_EMIT toastChanged();
-+}
-+
-+void SidebarController::dismissToast()
-+{
-+    toastTimer.stop();
-+    if (currentToast.isEmpty()) return;
-+    currentToast.clear();
-+    Q_EMIT toastChanged();
-+}
-+
-+QString SidebarController::operationObservation(const QVariantMap& operation) const
-+{
-+    QStringList parts;
-+    const QString stdoutText = operation.value("stdout").toString().trimmed();
-+    if (!stdoutText.isEmpty()) parts.append(stdoutText);
-+    const QString stderrText = operation.value("stderr").toString().trimmed();
-+    if (!stderrText.isEmpty()) parts.append(stderrText);
-+    const QVariant error = operation.value("error");
-+    if (error.isValid() && !error.isNull()) {
-+        const QString message = error.toMap().value("message").toString();
-+        parts.append(message.isEmpty() ? error.toString() : message);
-+    }
-+    if (operation.value("conflict").toBool()) {
-+        parts.append(tr("Document changed; inspect before editing."));
-+    }
-+    if (operation.value("requiresInspection").toBool()) {
-+        parts.append(tr("Result requires inspection before trusting it."));
-+    }
-+    return parts.join(QStringLiteral("\n\n"));
-+}
-+
-+void SidebarController::pushOperation(const QVariantMap& operation, const QVariantList& images)
-+{
-+    const QString id = operation.value("id").toString();
-+    if (id.isEmpty()) return;
-+
-+    const QString status = operation.value("status").toString();
-+    const QString label = operation.value("label").toString();
-+    const QString document = operation.value("document").toString();
-+    QString summary = status.isEmpty() ? tr("Operation") : status;
-+    if (!label.isEmpty()) summary += QStringLiteral(" · ") + label;
-+    if (!document.isEmpty()) summary += QStringLiteral(" · ") + document;
-+    const QVariant revisionBefore = operation.value("revisionBefore");
-+    const QVariant revisionAfter = operation.value("revisionAfter");
-+    if (!revisionBefore.isNull() || !revisionAfter.isNull()) {
-+        summary += QStringLiteral(" · r%1→r%2").arg(revisionBefore.toInt()).arg(revisionAfter.toInt());
-+    }
-+    const int duration = operation.value("durationMs").toInt();
-+    if (duration > 0) summary += QStringLiteral(" · %1 ms").arg(duration);
-+
-+    QVariantList entries;
-+    const QString code = operation.value("code").toString();
-+    if (!code.trimmed().isEmpty()) {
-+        entries.append(QVariantMap {
-+            {QStringLiteral("kind"), QStringLiteral("text")},
-+            {QStringLiteral("title"), tr("Code")},
-+            {QStringLiteral("content"), code},
-+        });
-+    }
-+    const QString observation = operationObservation(operation);
-+    if (!observation.isEmpty()) {
-+        entries.append(QVariantMap {
-+            {QStringLiteral("kind"), QStringLiteral("text")},
-+            {QStringLiteral("title"), tr("Observation")},
-+            {QStringLiteral("content"), observation},
-+        });
-+    }
-+    for (const auto& image : images) {
-+        const QString dataUrl = image.toString();
-+        if (dataUrl.isEmpty()) continue;
-+        entries.append(QVariantMap {
-+            {QStringLiteral("kind"), QStringLiteral("image")},
-+            {QStringLiteral("title"), tr("After")},
-+            {QStringLiteral("body"), dataUrl},
-+        });
-+    }
-+
-+    const QVariantMap row {
-+        {QStringLiteral("id"), id},
-+        {QStringLiteral("author"), summary},
-+        {QStringLiteral("body"), QString()},
-+        {QStringLiteral("kind"), QStringLiteral("work")},
-+        {QStringLiteral("title"), summary},
-+        {QStringLiteral("entries"), entries},
-+        {QStringLiteral("entryCount"), entries.size()},
-+    };
-+    if (conversation.indexOfId(id) >= 0) {
-+        conversation.apply({{QStringLiteral("op"), QStringLiteral("update")}, {QStringLiteral("row"), row}});
-+    }
-+    else {
-+        conversation.apply({{QStringLiteral("op"), QStringLiteral("append")}, {QStringLiteral("row"), row}});
-+    }
-+}
-+
-+void SidebarController::applyBridgeStatus(const QVariantMap& status)
-+{
-+    bridgeRunningValue = status.value(QStringLiteral("running")).toBool();
-+    bridgePortValue = QString::number(status.value(QStringLiteral("port")).toInt());
-+    bridgeClientsValue = status.value(QStringLiteral("clients")).toInt();
-+    bridgeDocumentValue = status.value(QStringLiteral("document")).toString();
-+    bridgeRevisionValue = status.value(QStringLiteral("revision")).toInt();
-+    bridgeConfigValue = status.value(QStringLiteral("cliHint")).toString();
-+    bridgeCommandValue = status.value(QStringLiteral("cliCommand")).toString();
-+    Q_EMIT bridgeStatusChanged();
-+}
-+
-+void SidebarController::copyBridgeConfig()
-+{
-+    if (bridgeConfigValue.isEmpty()) return;
-+    QApplication::clipboard()->setText(bridgeConfigValue);
-+    showToast(tr("CLI command copied"));
-+}
-+
-+void SidebarController::applyParameters(const QVariantMap& payload)
-+{
-+    parameterTargetsValue = payload.value(QStringLiteral("targets")).toList();
-+    parameterObjectValue = payload.value(QStringLiteral("object")).toString();
-+    parametersValue = payload.value(QStringLiteral("entries")).toList();
-+    parameterNoteValue = payload.value(QStringLiteral("note")).toString();
-+    Q_EMIT parametersChanged();
-+}
-+
-+void SidebarController::chooseParameterObject(const QString& name)
-+{
-+    QJsonObject request{
-+        {QStringLiteral("kind"), QStringLiteral("select")},
-+        {QStringLiteral("object"), name},
-+    };
-+    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
-+}
-+
-+void SidebarController::editParameter(const QString& id, const QString& text)
-+{
-+    QJsonObject request{
-+        {QStringLiteral("kind"), QStringLiteral("set")},
-+        {QStringLiteral("object"), parameterObjectValue},
-+        {QStringLiteral("id"), id},
-+        {QStringLiteral("text"), text},
-+    };
-+    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
-+}
-+
-+void SidebarController::refreshParameters()
-+{
-+    QJsonObject request{{QStringLiteral("kind"), QStringLiteral("refresh")}};
-+    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
-+}
-+
-+QString SidebarController::takeParameterRequest()
-+{
-+    const QString request = pendingParameterRequest;
-+    pendingParameterRequest.clear();
-+    return request;
-+}
-+
-+void SidebarController::applyTimelineEdit(const QVariantMap& edit)
-+{
-+    conversation.apply(edit);
-+}
-+
-+Sidebar::Sidebar(QWidget* parent)
-+    : QWidget(parent)
-+    , sidebarController(this)
-+    , quickView(nullptr)
-+{
-+    setWindowTitle(tr("Anthracite"));
-+    setMinimumWidth(320);
-+
-+    auto* layout = new QVBoxLayout(this);
-+    layout->setContentsMargins(0, 0, 0, 0);
-+    reloadUi();
-+}
-+
-+bool Sidebar::eventFilter(QObject* watched, QEvent* event)
-+{
-+    // Observe, never consume: mouse wheels can change Flickable.contentY
-+    // without movementStarted. Qt Quick still owns the actual scrolling.
-+    if (watched == quickView && event->type() == QEvent::Wheel) {
-+        auto* root = quickView->rootObject();
-+        if (root && root->metaObject()->indexOfMethod("observeWheel(QVariant)") >= 0) {
-+            QMetaObject::invokeMethod(root, "observeWheel", Qt::DirectConnection,
-+                Q_ARG(QVariant, QVariant(static_cast<QWheelEvent*>(event)->position())));
-+        }
-+    }
-+    return QWidget::eventFilter(watched, event);
-+}
-+
-+void Sidebar::reloadUi()
-+{
-+    QString configRoot = qEnvironmentVariable("XDG_CONFIG_HOME");
-+    if (configRoot.isEmpty() || !QDir::isAbsolutePath(configRoot)) {
-+        configRoot = QDir::home().filePath(QStringLiteral(".config"));
-+    }
-+    const QString overridePath = QDir(configRoot)
-+        .filePath(QStringLiteral("anthracite/qml/Main.qml"));
-+    QUrl source = QFileInfo::exists(overridePath)
-+        ? QUrl::fromLocalFile(overridePath)
-+        : QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
-+    auto* replacement = new QQuickWidget(this);
-+    replacement->installEventFilter(this);
-+    replacement->setResizeMode(QQuickWidget::SizeRootObjectToView);
-+    replacement->engine()->addUrlInterceptor(new SidebarQmlUrls(replacement));
-+    replacement->rootContext()->setContextProperty(
-+        QStringLiteral("anthraciteController"),
-+        &sidebarController
-+    );
-+    // RCC timestamps are fixed in reproducible builds. Compile this small
-+    // surface from its actual bytes so Qt cannot reuse stale disk-cached QML.
-+    const auto load = [replacement](const QUrl& url) {
-+        QFile file(url.isLocalFile() ? url.toLocalFile() : QStringLiteral(":") + url.path());
-+        if (!file.open(QIODevice::ReadOnly)) {
-+            replacement->setSource(url);
-+            return;
-+        }
-+        auto* component = new QQmlComponent(replacement->engine(), replacement);
-+        component->setData(file.readAll(), url);
-+        replacement->setContent(url, component, component->isReady() ? component->create() : nullptr);
-+    };
-+    load(source);
-+    if (replacement->status() != QQuickWidget::Ready) {
-+        for (const auto& error : replacement->errors()) {
-+            Base::Console().error("Anthracite QML: %s\n", error.toString().toUtf8().constData());
-+        }
-+        if (!quickView && source.isLocalFile()) {
-+            source = QUrl(QStringLiteral("qrc:/Anthracite/qml/Main.qml"));
-+            load(source);
-+        }
-+        if (quickView || replacement->status() != QQuickWidget::Ready) {
-+            delete replacement;
-+            return;
-+        }
-+    }
-+    if (quickView) {
-+        layout()->removeWidget(quickView);
-+        delete quickView;
-+    }
-+    quickView = replacement;
-+    layout()->addWidget(quickView);
-+    setProperty("anthraciteQmlSource", source.toString());
-+    Base::Console().message("Anthracite QML source: %s\n", source.toString().toUtf8().constData());
-+}
-+
-+Sidebar::~Sidebar()
-+{
-+    delete quickView;
-+    quickView = nullptr;
-+}
-+
-+SidebarController* Sidebar::controller()
-+{
-+    return &sidebarController;
-+}
-+
-+Sidebar* AnthraciteGui::ensureSidebar()
-+{
-+    auto* manager = Gui::DockWindowManager::instance();
-+    if (auto* existing = qobject_cast<Sidebar*>(manager->getDockWindow("AnthraciteSidebar"))) {
-+        return existing;
-+    }
-+
-+    auto* sidebar = new Sidebar();
-+    manager->addDockWindow("AnthraciteSidebar", sidebar, Qt::RightDockWidgetArea);
-+    return sidebar;
-+}
-+
-+void AnthraciteGui::showSidebar()
-+{
-+    auto* sidebar = ensureSidebar();
-+    auto* dock = qobject_cast<QDockWidget*>(sidebar->parentWidget());
-+    if (dock) {
-+        dock->show();
-+        dock->raise();
-+    }
-+    sidebar->setFocus();
-+}
-+
-+SidebarController* AnthraciteGui::sidebarController()
-+{
-+    return ensureSidebar()->controller();
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,129 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+
-+#ifndef ANTHRACITEGUI_SIDEBAR_H
-+#define ANTHRACITEGUI_SIDEBAR_H
-+
-+#include <QObject>
-+#include <QString>
-+#include <QTimer>
-+#include <QVariantList>
-+#include <QVariantMap>
-+#include <QWidget>
-+
-+#include <boost/signals2/connection.hpp>
-+
-+#include "ConversationModel.h"
-+
-+class QQuickWidget;
-+
-+namespace AnthraciteGui
-+{
-+class SidebarController: public QObject
-+{
-+    Q_OBJECT
-+    Q_PROPERTY(QAbstractItemModel* messages READ messages CONSTANT)
-+    Q_PROPERTY(bool picking READ picking NOTIFY pickingChanged)
-+    Q_PROPERTY(bool bridgeRunning READ bridgeRunning NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(QString bridgePort READ bridgePort NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(int bridgeClients READ bridgeClients NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(QString bridgeDocument READ bridgeDocument NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(int bridgeRevision READ bridgeRevision NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(QString bridgeConfig READ bridgeConfig NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(QString bridgeCommand READ bridgeCommand NOTIFY bridgeStatusChanged)
-+    Q_PROPERTY(QString toastMessage READ toastMessage NOTIFY toastChanged)
-+    Q_PROPERTY(QVariantList parameterTargets READ parameterTargets NOTIFY parametersChanged)
-+    Q_PROPERTY(QString parameterObject READ parameterObject NOTIFY parametersChanged)
-+    Q_PROPERTY(QVariantList parameters READ parameters NOTIFY parametersChanged)
-+    Q_PROPERTY(QString parameterNote READ parameterNote NOTIFY parametersChanged)
-+
-+public:
-+    explicit SidebarController(QObject* parent = nullptr);
-+
-+    QAbstractItemModel* messages();
-+    bool picking() const { return pickActive; }
-+    bool bridgeRunning() const { return bridgeRunningValue; }
-+    QString bridgePort() const { return bridgePortValue; }
-+    int bridgeClients() const { return bridgeClientsValue; }
-+    QString bridgeDocument() const { return bridgeDocumentValue; }
-+    int bridgeRevision() const { return bridgeRevisionValue; }
-+    QString bridgeConfig() const { return bridgeConfigValue; }
-+    QString bridgeCommand() const { return bridgeCommandValue; }
-+    QString toastMessage() const { return currentToast; }
-+    QVariantList parameterTargets() const { return parameterTargetsValue; }
-+    QString parameterObject() const { return parameterObjectValue; }
-+    QVariantList parameters() const { return parametersValue; }
-+    QString parameterNote() const { return parameterNoteValue; }
-+
-+    Q_INVOKABLE bool reducedMotion() const;
-+    Q_INVOKABLE void togglePicker();
-+    Q_INVOKABLE void chooseParameterObject(const QString& name);
-+    Q_INVOKABLE void editParameter(const QString& id, const QString& text);
-+    Q_INVOKABLE void refreshParameters();
-+    void setPicking(bool active);
-+
-+    void pushOperation(const QVariantMap& operation, const QVariantList& images = {});
-+    void applyBridgeStatus(const QVariantMap& status);
-+    void applyParameters(const QVariantMap& payload);
-+    QString takeParameterRequest();
-+    Q_INVOKABLE void copyBridgeConfig();
-+    Q_INVOKABLE void dismissToast();
-+    void applyTimelineEdit(const QVariantMap& edit);
-+
-+Q_SIGNALS:
-+    void pickingChanged();
-+    void bridgeStatusChanged();
-+    void toastChanged();
-+    void parametersChanged();
-+
-+private:
-+    bool eventFilter(QObject* watched, QEvent* event) override;
-+    void showToast(const QString& message);
-+    QString operationObservation(const QVariantMap& operation) const;
-+
-+    ConversationModel conversation;
-+    bool pickActive = false;
-+
-+    bool bridgeRunningValue = false;
-+    QString bridgePortValue;
-+    int bridgeClientsValue = 0;
-+    QString bridgeDocumentValue;
-+    int bridgeRevisionValue = 0;
-+    QString bridgeConfigValue;
-+    QString bridgeCommandValue;
-+
-+    QString currentToast;
-+    QTimer toastTimer;
-+
-+    QVariantList parameterTargetsValue;
-+    QString parameterObjectValue;
-+    QVariantList parametersValue;
-+    QString parameterNoteValue;
-+    QString pendingParameterRequest;
-+
-+    boost::signals2::scoped_connection selectionConnection;
-+};
-+
-+class Sidebar: public QWidget
-+{
-+    Q_OBJECT
-+
-+public:
-+    explicit Sidebar(QWidget* parent = nullptr);
-+    ~Sidebar() override;
-+    SidebarController* controller();
-+    void reloadUi();
-+
-+protected:
-+    bool eventFilter(QObject* watched, QEvent* event) override;
-+
-+private:
-+    SidebarController sidebarController;
-+    QQuickWidget* quickView;
-+};
-+
-+Sidebar* ensureSidebar();
-+void showSidebar();
-+SidebarController* sidebarController();
-+}  // namespace AnthraciteGui
-+
-+#endif  // ANTHRACITEGUI_SIDEBAR_H
---- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,383 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
 +import base64
 +import json
-+import time
 +from unittest.mock import patch
 +from pathlib import Path
-+import tempfile
 +
 +import FreeCAD as App
 +import FreeCADGui as Gui
 +from PySide import QtCore, QtWidgets
-+from PySide6 import QtQuickWidgets, QtGui, QtTest, QtQml
++from PySide6 import QtQuickWidgets, QtGui, QtTest
 +
 +import AnthraciteExecutor
-+import AnthraciteGui  # noqa: F401 - importing registers the dock window
++import AnthraciteGui  # noqa: F401 - importing registers the status bar and commands
 +
 +
 +def run_smoke_test():
@@ -1983,11 +248,14 @@
 +    assert chrome is not None
 +    status = main_window.findChild(QtQuickWidgets.QQuickWidget, 'AnthraciteStatusBar')
 +    assert status is not None and status.status() == QtQuickWidgets.QQuickWidget.Ready
++    root = status.rootObject()
++    controller = status.rootContext().contextProperty("anthraciteController")
++    assert controller is not None
 +    def visual_items(item):
 +        yield item
 +        for child in item.childItems():
 +            yield from visual_items(child)
-+    status_items = {item.objectName(): item for item in visual_items(status.rootObject())}
++    status_items = {item.objectName(): item for item in visual_items(root)}
 +    for index, axis in enumerate(('x', 'y', 'z')):
 +        label = status_items['AnthraciteAxis' + str(index)]
 +        value = status_items['AnthraciteCoordinateValue' + str(index)]
@@ -2041,19 +309,6 @@
 +    assert cube.GetUnsigned('HiliteColor') == 0xA06666FF
 +    overlay = App.ParamGet('User parameter:BaseApp/MainWindow/DockWindows/OverlayLeft')
 +    assert overlay.GetBool('Transparent') and 'Tree view' in overlay.GetString('Widgets')
-+    dock = main_window.findChild(QtWidgets.QDockWidget, "AnthraciteSidebar")
-+    if dock is None:
-+        raise AssertionError("AnthraciteSidebar was not registered as a dock window.")
-+    if dock.widget() is None:
-+        raise AssertionError("AnthraciteSidebar does not contain its native widget.")
-+    dock.show()
-+    assert dock.titleBarWidget() is not None and dock.titleBarWidget().height() == 0
-+    assert dock.isVisible()
-+    assert not dock.features() & QtWidgets.QDockWidget.DockWidgetFloatable
-+    assert not dock.features() & QtWidgets.QDockWidget.DockWidgetMovable
-+    assert dock.allowedAreas() == QtCore.Qt.RightDockWidgetArea
-+    dock.setFloating(True)  # Simulate restoration of an old floating profile.
-+    assert not dock.isFloating() and dock.titleBarWidget().height() == 0
 +    assert QtWidgets.QApplication.palette().color(QtGui.QPalette.Button).name() == '#111111'
 +    assert QtCore.QFile.exists(':/Anthracite/icons/hexagon.svg')
 +    icon_map = QtCore.QFile(':/Anthracite/icons/map.json')
@@ -2064,7 +319,7 @@
 +        assert QtSvg.QSvgRenderer(':/Anthracite/icons/' + alias + '.svg').isValid(), alias
 +    assert not QtCore.QDir.searchPaths('iconOverrides'), 'Native icons must not be overridden'
 +    assert not Gui.getIcon('PartDesign_Pad').isNull()
-+    bridge_indicator = status.rootObject().findChild(QtCore.QObject, 'AnthraciteBridgeIndicator')
++    bridge_indicator = root.findChild(QtCore.QObject, 'AnthraciteBridgeIndicator')
 +    assert bridge_indicator is not None, 'Status bar must expose the bridge indicator'
 +    hint = bridge_indicator.findChild(QtCore.QObject, 'AnthraciteHint')
 +    assert hint is not None
@@ -2092,8 +347,8 @@
 +    chrome.changed.disconnect(console_changed)
 +    assert any('Anthracite console status probe' in message for message in console_updates), (chrome.property('latestMessage'), console_updates)
 +    console_dock = main_window.findChild(QtWidgets.QDockWidget, 'Report view')
-+    console_button = status.rootObject().findChild(QtCore.QObject, 'AnthraciteConsoleToggle')
-+    console_preview = status.rootObject().findChild(QtCore.QObject, 'AnthraciteConsolePreview')
++    console_button = root.findChild(QtCore.QObject, 'AnthraciteConsoleToggle')
++    console_preview = root.findChild(QtCore.QObject, 'AnthraciteConsolePreview')
 +    console_width = console_button.property('width')
 +    for message in ('Short', 'Long console message ' * 80):
 +        App.Console.PrintMessage(message + '\n')
@@ -2102,7 +357,7 @@
 +    assert console_width > 260, 'Console preview should fill available status-bar space'
 +    assert console_preview.property('truncated'), 'Long console preview must end in an ellipsis'
 +    for name in ('AnthraciteConsoleDivider', 'AnthraciteAgentDivider'):
-+        divider = status.rootObject().findChild(QtCore.QObject, name)
++        divider = root.findChild(QtCore.QObject, name)
 +        assert divider is not None and divider.property('visible')
 +        assert divider.property('width') == 1 and divider.property('height') == 18
 +    assert console_dock is not None
@@ -2138,81 +393,8 @@
 +    assert console_dock.isVisible() and main_window.dockWidgetArea(console_dock) == QtCore.Qt.BottomDockWidgetArea
 +    chrome.toggleConsole()
 +    assert not console_dock.isVisible()
-+    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
-+    if quick_widget is None:
-+        raise AssertionError("AnthraciteSidebar does not contain its QML surface.")
-+    if quick_widget.status() != QtQuickWidgets.QQuickWidget.Ready:
-+        errors = "; ".join(error.toString() for error in quick_widget.errors())
-+        raise AssertionError(f"Anthracite QML did not load: {errors}")
-+    root = quick_widget.rootObject()
-+    compact_height = root.property('compactControlHeight')
-+    copy_button = root.findChild(QtCore.QObject, 'AnthraciteBridgeCopy')
-+    assert copy_button is not None, 'Anthracite QML must expose the bridge copy control.'
-+    assert abs(copy_button.property('height') - compact_height) <= 1
 +    if root.findChild(QtCore.QObject, 'AnthraciteGeometryPicker') is None:
-+        raise AssertionError("Anthracite QML does not expose the geometry picker.")
-+    if root.findChild(QtCore.QObject, "AnthraciteTimeline") is None:
-+        raise AssertionError("Anthracite QML does not expose the activity timeline.")
-+    if root.findChild(QtCore.QObject, "AnthraciteParameters") is None:
-+        raise AssertionError("Anthracite QML does not expose the parameters panel.")
-+    if root.findChild(QtCore.QObject, "AnthraciteBridgeStatusLabel") is None:
-+        raise AssertionError("Anthracite QML does not expose the bridge status header.")
-+    for removed in ('AnthraciteInteractionCard', 'AnthraciteRequestedInput', 'AnthraciteThreadPicker',
-+                    'AnthraciteNewThread', 'AnthraciteComposer', 'AnthraciteAgentSettingsButton',
-+                    'AnthraciteSubmitButton', 'AnthraciteAttachmentTray', 'AnthraciteContextUsage'):
-+        if root.findChild(QtCore.QObject, removed) is not None:
-+            raise AssertionError(f"Removed chat control is still exposed: {removed}")
-+
-+    component = QtQml.QQmlComponent(quick_widget.engine())
-+    component.setData(b'import QtQuick 2.15; import "qrc:/Anthracite/qml" as Chat; Chat.TranscriptText { body: "Selectable response"; width: 250 }', QtCore.QUrl())
-+    transcript = component.create(quick_widget.rootContext())
-+    assert transcript is not None, [e.toString() for e in component.errors()]
-+    assert transcript.findChild(QtCore.QObject, 'copyMessage') is None
-+    response_text = transcript.findChild(QtCore.QObject, 'transcriptText')
-+    assert response_text.property('readOnly') and response_text.property('selectByMouse')
-+    response_text.select(0, len('Selectable response'))
-+    response_text.copy()
-+    assert QtWidgets.QApplication.clipboard().text() == 'Selectable response'
-+    transcript.deleteLater()
-+
-+    controller = quick_widget.rootContext().contextProperty("anthraciteController")
-+    QtTest.QTest.qWait(500)  # Drain document-switch notifications from executor tests.
-+    # Exercise the native QML list with deterministic rows; no provider or CAD actions.
-+    model = controller.property('messages')
-+    def apply_edit(edit):
-+        # Convert nested maps through QML, matching the native JSON transport rather
-+        # than PySide's opaque Python-object QVariant conversion for nested dicts.
-+        expression = QtQml.QQmlExpression(quick_widget.rootContext(), root,
-+            'anthraciteController.messages.apply(' + json.dumps(edit) + ')')
-+        expression.evaluate()
-+        assert not expression.hasError(), expression.error().toString()
-+    roles = {bytes(name).decode(): role for role, name in model.roleNames().items()}
-+    original = [{name: model.data(model.index(row, 0), role) for name, role in roles.items()}
-+                for row in range(model.rowCount())]
-+    for row in original:
-+        row['id'] = row.pop('entryId')
-+    # The Python bridge feeds one work row per freecad tool call. Exercise the
-+    # exact extension method the bridge calls, not the model directly.
-+    bridge_event = {
-+        'operation': {
-+            'id': 'bridge-operation-1', 'status': 'committed', 'document': 'TestDoc',
-+            'revisionBefore': 3, 'revisionAfter': 4, 'label': 'Create box', 'durationMs': 42,
-+            'code': 'box = doc.addObject("Part::Box", "Box")', 'stdout': 'committed',
-+            'error': None, 'conflict': False, 'requiresInspection': False,
-+        },
-+        'images': [],
-+    }
-+    before_rows = model.rowCount()
-+    AnthraciteGui.push_activity(json.dumps(bridge_event))
-+    QtTest.QTest.qWait(50)
-+    pushed = model.indexOfId('bridge-operation-1')
-+    assert pushed >= 0 and model.kindAt(pushed) == 'work', (pushed, model.kindAt(pushed) if pushed >= 0 else None)
-+    pushed_entries = model.data(model.index(pushed, 0), roles['entries'])
-+    pushed_entries = pushed_entries.toVariant() if hasattr(pushed_entries, 'toVariant') else pushed_entries
-+    assert any(entry.get('title') == 'Code' for entry in pushed_entries), pushed_entries
-+    AnthraciteGui.push_activity(json.dumps(bridge_event))
-+    QtTest.QTest.qWait(50)
-+    assert model.rowCount() == before_rows + 1, 'Duplicate operation was appended'
++        raise AssertionError('Status bar does not expose the geometry picker.')
 +    AnthraciteGui.push_bridge_status(json.dumps({
 +        'running': True, 'port': 43210, 'clients': 2, 'document': 'TestDoc', 'revision': 4,
 +        'cliHint': 'python3 anthracite exec <python>', 'cliCommand': 'anthracite exec <python>',
@@ -2221,268 +403,6 @@
 +    assert controller.property('bridgeRunning')
 +    assert controller.property('bridgePort') == '43210'
 +    assert controller.property('bridgeClients') == 2
-+    rows = [{'id': str(i), 'author': 'You', 'kind': 'user', 'body': 'Message ' + str(i),
-+             'title': '', 'entries': [], 'entryCount': 0} for i in range(80)]
-+    apply_edit({'op': 'reset', 'rows': rows, 'hasEarlier': True})
-+    timeline = root.findChild(QtCore.QObject, 'AnthraciteTimeline')
-+    assert timeline is not None
-+    QtTest.QTest.qWait(100)
-+    assert model.indexOfId('40') == 40 and model.idAt(40) == '40', (model.rowCount(), model.indexOfId('40'), model.idAt(40))
-+    requests = []
-+    def requested(entry, offset):
-+        requests.append((entry, offset))
-+    model.detailsRequested.connect(requested)
-+    model.loadDetails('40')
-+    assert model.property('detailRequests')['40'] == 'loading', 'Activity request has no immediate acknowledgement'
-+    model.loadDetails('40')
-+    assert len(requests) == 1, 'Repeated click duplicated a pending page request'
-+    apply_edit({'op': 'details', 'id': '40', 'offset': 0, 'entries': []})
-+    assert '40' not in model.property('detailRequests')
-+    model.detailsRequested.disconnect(requested)
-+    timeline.setProperty('scrollMode', 'reading')
-+    timeline.setProperty('anchorId', '40')
-+    timeline.setProperty('anchorOffset', 0)
-+    timeline.positionViewAtIndex(40, 0)  # Explicit navigation, not anchor repair.
-+    timeline.reconcile()
-+    QtTest.QTest.qWait(100)
-+    anchor = timeline.property('anchorId')
-+    offset = timeline.property('anchorOffset')
-+    apply_edit({'op': 'prepend', 'rows': [dict(rows[0], id='earlier')], 'hasEarlier': False})
-+    QtTest.QTest.qWait(100)
-+    assert timeline.property('scrollMode') == 'reading'
-+    assert timeline.property('anchorId') == anchor, 'Loading history lost the visible message'
-+    assert abs(timeline.property('anchorOffset') - offset) < 3, 'Loading history moved the visible message'
-+    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20)})
-+    QtTest.QTest.qWait(100)
-+    assert timeline.property('anchorId') == anchor, 'Streaming pulled the reader to the bottom'
-+    # A burst must update the data immediately but notify/re-layout only once
-+    # per frame, and only invalidate the fields that actually changed.
-+    notifications = []
-+    def changed(first, last, changed_roles):
-+        notifications.append(list(changed_roles))
-+    model.dataChanged.connect(changed)
-+    started = time.monotonic()
-+    for i in range(250):
-+        apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='Streaming output\n' * 20 + str(i))})
-+    assert model.data(model.index(model.indexOfId('79'), 0), roles['body']).endswith('249')
-+    QtTest.QTest.qWait(70)
-+    assert 1 <= len(notifications) <= 3, f'Streaming caused {len(notifications)} model invalidations'
-+    assert all(items == [roles['body']] for items in notifications), notifications
-+    model.dataChanged.disconnect(changed)
-+    print(f'ANTHRACITE_STREAM_BURST: 250 updates, {len(notifications)} notifications, {time.monotonic() - started:.3f}s', flush=True)
-+    assert timeline.property('anchorId') == anchor
-+    timeline.setProperty('scrollMode', 'reading')
-+    timeline.setProperty('anchorId', anchor)
-+    timeline.setProperty('anchorOffset', offset)
-+    timeline.positionViewAtIndex(model.indexOfId(anchor), 0)
-+    timeline.reconcile()
-+    QtTest.QTest.qWait(100)
-+    # Simulate the native wheel path, not a direct scroll-mode assignment.
-+    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
-+    wheel = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(0, 120),
-+                             QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
-+                             QtCore.Qt.NoScrollPhase, False)
-+    def anchor_position():
-+        expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline,
-+            'itemAtIndex(model.indexOfId(' + json.dumps(anchor) + ')).y - contentY')
-+        value = expression.evaluate()
-+        assert not expression.hasError(), expression.error().toString()
-+        return value[0] if isinstance(value, tuple) else value
-+    before_wheel = anchor_position()
-+    QtWidgets.QApplication.sendEvent(quick_widget, wheel)
-+    assert timeline.property('userScrolling'), 'Wheel input did not pause anchor correction'
-+    QtTest.QTest.qWait(200)
-+    after_wheel = anchor_position()
-+    assert after_wheel > before_wheel, ('Wheel did not scroll the transcript', before_wheel, after_wheel,
-+                                       timeline.property('scrollMode'), timeline.property('userScrolling'))
-+    apply_edit({'op': 'update', 'row': dict(rows[-1], kind='assistant', body='More streaming\n' * 25)})
-+    QtTest.QTest.qWait(100)
-+    assert abs(anchor_position() - after_wheel) < 3, ('Streaming snapped back after a wheel gesture', after_wheel, anchor_position(),
-+        anchor, timeline.property('anchorId'), timeline.property('anchorOffset'), timeline.property('scrollMode'))
-+    anchor = timeline.property('anchorId')
-+    offset = timeline.property('anchorOffset')
-+    original_width = root.property('width')
-+    root.setProperty('width', 320)
-+    QtTest.QTest.qWait(100)
-+    assert root.findChild(QtCore.QObject, 'AnthraciteBridgeCopy').property('width') > 0
-+    assert timeline.property('anchorId') == anchor, 'Dock resize lost the reading anchor'
-+    assert abs(timeline.property('anchorOffset') - offset) < 3
-+    root.setProperty('width', original_width)
-+    preferences = App.ParamGet('User parameter:BaseApp/Preferences/Mod/Anthracite')
-+    previous_motion = preferences.GetBool('ReduceMotion', False)
-+    motion = timeline.findChild(QtCore.QObject, 'AnthraciteLatestMotion')
-+    assert motion is not None
-+    preferences.SetBool('ReduceMotion', False)
-+    root.refreshMotion()
-+    if not root.property('reducedMotion'):
-+        timeline.jumpLatest(True)
-+        QtTest.QTest.qWait(30)
-+        assert motion.property('running'), 'Explicit Latest navigation did not animate'
-+        timeline.navigate()
-+        stopped = timeline.property('contentY')
-+        assert not motion.property('running'), 'User navigation did not interrupt motion immediately'
-+        QtTest.QTest.qWait(200)
-+        assert abs(timeline.property('contentY') - stopped) < 3, 'Cancelled animation continued moving'
-+    preferences.SetBool('ReduceMotion', True)
-+    timeline.jumpLatest(True)
-+    assert not motion.property('running'), 'Reduced motion still animates navigation'
-+    preferences.SetBool('ReduceMotion', previous_motion)
-+    timeline.latest()
-+    QtTest.QTest.qWait(100)
-+    assert timeline.property('atYEnd'), 'Latest failed to resume end following'
-+    timeline.setProperty('pendingTurn', True)
-+    apply_edit({'op': 'append', 'row': dict(rows[0], id='new-prompt')})
-+    QtTest.QTest.qWait(100)
-+    assert timeline.property('scrollMode') == 'new-turn'
-+    assert timeline.property('newTurnId') == 'new-prompt'
-+    top = timeline.property('contentY')
-+    apply_edit({'op': 'append', 'row': dict(rows[0], id='answer', kind='assistant', body='Short answer')})
-+    QtTest.QTest.qWait(100)
-+    assert abs(timeline.property('contentY') - top) < 3, 'Short answer moved the new prompt'
-+    # User prompts have a right-aligned bubble; agent replies have no author
-+    # label, background card, or duplicate idle/branding header.
-+    expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline, '''
-+        const reply = itemAtIndex(count - 1);
-+        const prompt = itemAtIndex(count - 2);
-+        const surface = reply.children[0];
-+        const promptSurface = prompt.children[0];
-+        if (surface.color.a !== 0) throw new Error("Assistant reply is still boxed");
-+        if (promptSurface.width >= width || promptSurface.x <= 0)
-+            throw new Error("User prompt is not a right-aligned bubble");
-+    ''')
-+    expression.evaluate()
-+    assert not expression.hasError(), expression.error().toString()
-+    del expression
-+    # Traverse visual items in QML, without manufacturing PySide wrappers for
-+    # private QML objects that will be destroyed by the reload test below.
-+    expression = QtQml.QQmlExpression(quick_widget.rootContext(), root, '''
-+        function check(item) {
-+            if (item.text === "Anthracite" || item.text === "Ready" || item.text === "You")
-+                throw new Error("Redundant thread label");
-+            const children = item.children || [];
-+            for (let i = 0; i < children.length; ++i) check(children[i]);
-+        }
-+        check(this);
-+    ''')
-+    expression.evaluate()
-+    assert not expression.hasError(), expression.error().toString()
-+    del expression
-+    capture = Path(os.environ['ANTHRACITE_TEST_LAUNCHER']).parent.parent / 'build/test-results/thread-layout.png'
-+    assert quick_widget.grab().save(str(capture))
-+    # Detail responses are append-only pages and duplicate responses are ignored.
-+    apply_edit({'op': 'append', 'row': dict(rows[0], id='work', kind='work', entryCount=2)})
-+    details = {'op': 'details', 'id': 'work', 'offset': 0,
-+               'entries': [{'kind': 'activity', 'author': 'Activity', 'body': 'freecad\npass'}]}
-+    apply_edit(details)
-+    apply_edit(details)
-+    assert len(model.data(model.index(model.rowCount()-1, 0), roles['entries'])) == 1
-+    model.loadDetails('work')
-+    apply_edit(details)
-+    assert model.property('detailRequests')['work'] == 'loading', 'Stale page cleared a newer request'
-+    apply_edit(dict(details, offset=1))
-+    assert 'work' not in model.property('detailRequests')
-+    # Mixed-height history reproduces the estimate/anchor feedback path hidden
-+    # by a list of equally short messages. No provider or private chat data.
-+    mixed = [dict(rows[0], id='mixed-' + str(i), kind='assistant' if i % 3 else 'user',
-+                  body=('| Tool | Description |\n| --- | --- |\n' + '| inspect | Native geometry and topology |\n' * 35)
-+                  if i % 7 == 0 else ('Long reply\n\n' * 20 if i % 4 == 0 else 'Short message'))
-+             for i in range(100)]
-+    apply_edit({'op': 'reset', 'rows': mixed})
-+    QtTest.QTest.qWait(100)
-+    timeline.setProperty('scrollMode', 'reading')
-+    timeline.positionViewAtIndex(50, 0)
-+    QtTest.QTest.qWait(200)
-+    timeline.remember()
-+    # Every loaded message has measured geometry, including offscreen messages.
-+    def timeline_value(source):
-+        expression = QtQml.QQmlExpression(quick_widget.rootContext(), timeline, source)
-+        value = expression.evaluate()
-+        assert not expression.hasError(), expression.error().toString()
-+        return value[0] if isinstance(value, tuple) else value
-+    assert timeline_value('itemAtIndex(0) !== null')
-+    visible_before = timeline_value('itemAtIndex(50).y - contentY')
-+    timeline.reconcile()
-+    assert abs(timeline_value('itemAtIndex(50).y - contentY') - visible_before) < 3, 'Reading anchor teleported the viewport'
-+    measured_height = timeline.property('contentHeight')
-+    center = timeline.mapToScene(QtCore.QPointF(timeline.width() / 2, timeline.height() / 2))
-+    for direction in (-1, 1, -1, 1):
-+        for _ in range(12):
-+            wheel = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(0, direction * 480),
-+                                     QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
-+            QtWidgets.QApplication.sendEvent(quick_widget, wheel)
-+            QtTest.QTest.qWait(10)
-+        QtTest.QTest.qWait(350)
-+        timeline.remember()
-+        stable_id = timeline.property('anchorId')
-+        assert stable_id, 'Fast scrolling lost the visible anchor'
-+        position = 'itemAtIndex(model.indexOfId(' + json.dumps(stable_id) + ')).y - contentY'
-+        settled = timeline_value(position)
-+        for _ in range(15):
-+            QtTest.QTest.qWait(25)
-+            assert abs(timeline_value(position) - settled) < 3, 'Transcript oscillated after fast scrolling'
-+            assert abs(timeline.property('contentHeight') - measured_height) < 1, 'Scrolling changed transcript geometry'
-+    # Trackpads carry pixel deltas, momentum phases, and the platform-synthesized
-+    # source flag. Qt treats NotSynthesized as angle-only wheel input even with
-+    # pixel deltas: a no-motion test could otherwise pass the monotonic assertion.
-+    # Down-only input must traverse the history without reversing it.
-+    timeline.setProperty('scrollMode', 'reading')
-+    timeline.positionViewAtIndex(1, 0)
-+    QtTest.QTest.qWait(200)
-+    def visible_progress():
-+        return timeline_value('''
-+            let first = null;
-+            for (const item of rowItems) {
-+                if (item.rowId && item.y + item.height > contentY && item.y < contentY + height
-+                    && (!first || item.y < first.y)) first = item;
-+            }
-+            [model.indexOfId(first.rowId), contentY - first.y];
-+        ''')
-+    previous_progress = None
-+    # Native wheel scaling depends on display/style; drive to the actual end,
-+    # with a bounded budget rather than assuming one input pixel = one scene unit.
-+    steps = 4 * int(max(0, timeline.property('contentHeight') - timeline.height() - timeline.property('contentY')) / 160) + 32
-+    for i in range(steps):
-+        phase = QtCore.Qt.ScrollBegin if i == 0 else QtCore.Qt.ScrollMomentum if i > 30 else QtCore.Qt.ScrollUpdate
-+        trackpad = QtGui.QWheelEvent(center, center, QtCore.QPoint(0, -160), QtCore.QPoint(),
-+                                    QtCore.Qt.NoButton, QtCore.Qt.NoModifier, phase, False,
-+                                    QtCore.Qt.MouseEventSynthesizedBySystem)
-+        QtWidgets.QApplication.sendEvent(quick_widget, trackpad)
-+        QtTest.QTest.qWait(16)
-+        assert abs(timeline.property('contentHeight') - measured_height) < 1, 'Trackpad input changed message layout'
-+        progress = visible_progress()
-+        if hasattr(progress, 'toVariant'): progress = progress.toVariant()
-+        if previous_progress is not None:
-+            assert progress[0] > previous_progress[0] or (progress[0] == previous_progress[0] and progress[1] >= previous_progress[1] - 3), ('Downward trackpad input reversed', previous_progress, progress)
-+        previous_progress = progress
-+        if timeline.property('atYEnd'):
-+            break
-+    assert timeline.property('atYEnd'), ('Downward trackpad gesture did not traverse the loaded history',
-+                                       timeline.property('contentY'), timeline.property('contentHeight'), steps)
-+    end = QtGui.QWheelEvent(center, center, QtCore.QPoint(), QtCore.QPoint(), QtCore.Qt.NoButton,
-+                           QtCore.Qt.NoModifier, QtCore.Qt.ScrollEnd, False,
-+                           QtCore.Qt.MouseEventSynthesizedBySystem)
-+    QtWidgets.QApplication.sendEvent(quick_widget, end)
-+    QtTest.QTest.qWait(350)
-+    apply_edit({'op': 'reset', 'rows': original})
-+    Gui.runCommand("Anthracite_ReloadSidebar")
-+    quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
-+    if quick_widget.rootContext().contextProperty("anthraciteController") != controller:
-+        raise AssertionError("Reload replaced the live controller.")
-+    previous_config = os.environ.get("XDG_CONFIG_HOME")
-+    try:
-+        with tempfile.TemporaryDirectory() as directory:
-+            os.environ["XDG_CONFIG_HOME"] = directory
-+            qml = Path(directory) / "anthracite/qml/Main.qml"
-+            qml.parent.mkdir(parents=True)
-+            qml.write_text("this is invalid QML", encoding="utf-8")
-+            Gui.runCommand("Anthracite_ReloadSidebar")
-+            if dock.findChild(QtQuickWidgets.QQuickWidget) != quick_widget:
-+                raise AssertionError("Invalid QML replaced the working sidebar.")
-+    finally:
-+        if previous_config is None:
-+            os.environ.pop("XDG_CONFIG_HOME", None)
-+        else:
-+            os.environ["XDG_CONFIG_HOME"] = previous_config
 +
 +    render_document = App.newDocument("AnthraciteRender")
 +    render_result = AnthraciteExecutor.execute(
@@ -2528,7 +448,6 @@
 +    assert workbenches['ok'] and workbenches['readOnly'], workbenches
 +    assert workbenches['result']['workbenches']
 +    for subelement in ('Face1', 'Edge1', 'Vertex1', ''):
-+        dock.show()
 +        main_window.activateWindow()
 +        QtWidgets.QApplication.setActiveWindow(main_window)
 +        Gui.Selection.clearSelection()
@@ -2545,14 +464,6 @@
 +        expected = json.loads(AnthraciteExecutor.picked_reference_json(
 +            render_document.Name, 'RenderBox', subelement, 1.0, 2.0, 3.0))
 +        assert QtWidgets.QApplication.clipboard().text() == expected['inspect'], 'Picker did not copy the reference'
-+        assert controller.property('toastMessage').startswith('Copied '), controller.property('toastMessage')
-+        if subelement == 'Face1':
-+            Gui.runCommand('Anthracite_ReloadSidebar')
-+            quick_widget = dock.findChild(QtQuickWidgets.QQuickWidget)
-+            root = quick_widget.rootObject()
-+            assert controller.property('toastMessage').startswith('Copied ')
-+    controller.dismissToast()
-+    assert controller.property('toastMessage') == ''
 +    controller.togglePicker()
 +    QtWidgets.QApplication.sendEvent(main_window, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape, QtCore.Qt.NoModifier))
 +    assert not controller.property('picking')
@@ -2648,41 +559,7 @@
 +    assert picked_pad['reference']['object'] == 'BasePad', picked_pad
 +    assert picked_pad['reference']['subelement'] == 'Face1', picked_pad
 +    assert QtWidgets.QApplication.clipboard().text() == picked_pad['inspect']
-+    assert controller.property('toastMessage').startswith('Copied ')
-+    controller.dismissToast()
 +    Gui.Selection.clearSelection()
-+
-+    # Parameters panel: the bridge lists editable values, the panel chooses an object, and
-+    # an edit is applied through the same checked executor path as an agent edit.
-+    import AnthraciteBridge
-+    import AnthraciteInspect
-+    AnthraciteBridge.start()
-+    QtTest.QTest.qWait(400)
-+    listed = AnthraciteInspect.parameters(render_document, 'BasePad')
-+    if 'Length' not in {entry['label'] for entry in listed['entries']}:
-+        raise AssertionError(f"parameters() did not list Pad.Length: {listed['entries']}")
-+    sketch_params = AnthraciteInspect.parameters(render_document, 'BaseSketch')
-+    dimensions = [entry for entry in sketch_params['entries'] if entry['id'].startswith('con:')]
-+    if not dimensions or not all(entry['kind'] == 'number' and entry['unit'] for entry in dimensions):
-+        raise AssertionError(f"parameters() did not list sketch dimensions: {sketch_params['entries']}")
-+
-+    controller.chooseParameterObject('BasePad')
-+    QtTest.QTest.qWait(700)
-+    if controller.property('parameterObject') != 'BasePad':
-+        raise AssertionError("The parameters panel did not follow the chosen object.")
-+    if not any(row['id'] == 'prop:Length' for row in controller.property('parameters')):
-+        raise AssertionError("The parameters panel did not receive Pad.Length.")
-+
-+    controller.editParameter('prop:Length', '17.5')
-+    request = json.loads(AnthraciteGui.take_parameter_request())
-+    if request.get('kind') != 'set' or request.get('id') != 'prop:Length' or request.get('text') != '17.5':
-+        raise AssertionError(f"Unexpected parameter edit request: {request}")
-+    # Leave the request in place for the bridge timer, which applies it for real.
-+    controller.editParameter('prop:Length', '17.5')
-+    QtTest.QTest.qWait(2500)
-+    pad_length = render_document.getObject('BasePad').Length.Value
-+    if abs(pad_length - 17.5) > 1e-6:
-+        raise AssertionError(f"The parameters panel did not apply the edit: Length={pad_length}")
 +
 +    diagram = AnthraciteExecutor.execute("cad.render_sketch('BaseSketch')")
 +    assert diagram["ok"], diagram
@@ -2727,126 +604,15 @@
 +    # Drain deferred native-widget destruction before Cocoa tears down Qt thread storage.
 +    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 +    QtWidgets.QApplication.instance().quit()
++
++
 +QtCore.QTimer.singleShot(0, finish)
 --- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/qml/ActivityEntry.qml
-@@ -0,0 +1,61 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+import QtQuick 2.15
-+import QtQuick.Controls 2.15
-+import QtQuick.Controls.Basic
-+
-+Column {
-+    id: root
-+    property var entry: ({})
-+    property bool expanded: false
-+    signal resizing()
-+    signal toggle()
-+    signal preview(url source)
-+    SystemPalette { id: colors }
-+    spacing: 4
-+    ToolButton {
-+        width: parent.width
-+        visible: root.entry.kind !== "image"
-+        text: root.entry.title || qsTr("Activity")
-+        icon.source: "qrc:/Anthracite/icons/" + (root.expanded ? "nav-arrow-down" : "nav-arrow-right") + ".svg"
-+        icon.width: 16; icon.height: 16
-+        icon.color: "transparent"
-+        contentItem: Row {
-+            spacing: 6
-+            Image {
-+                source: "qrc:/Anthracite/icons/" + (root.expanded ? "nav-arrow-down" : "nav-arrow-right") + ".svg"
-+                sourceSize.width: 16; sourceSize.height: 16
-+                anchors.verticalCenter: parent.verticalCenter
-+            }
-+            Text {
-+                width: Math.max(0, parent.width - 22)
-+                text: root.entry.title || qsTr("Activity")
-+                color: colors.text
-+                elide: Text.ElideRight
-+            }
-+        }
-+        onClicked: { root.resizing(); root.toggle() }
-+    }
-+    Loader {
-+        width: parent.width
-+        active: root.expanded && root.entry.kind !== "image"
-+        sourceComponent: TranscriptText {
-+            body: root.entry.content !== undefined ? root.entry.content : (root.entry.body || "")
-+            onResizing: root.resizing()
-+        }
-+    }
-+    Image {
-+        objectName: "workImage"
-+        visible: root.entry.kind === "image"
-+        width: parent.width
-+        height: visible ? Math.min(180, width * 0.75) : 0
-+        source: visible ? root.entry.body : ""
-+        sourceSize.width: 480
-+        sourceSize.height: 360
-+        asynchronous: true
-+        fillMode: Image.PreserveAspectFit
-+        MouseArea {
-+            anchors.fill: parent
-+            onClicked: root.preview(parent.source)
-+        }
-+    }
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptText.qml
-@@ -0,0 +1,36 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+import QtQuick 2.15
-+import QtQuick.Controls 2.15
-+import QtQuick.Controls.Basic
-+
-+Column {
-+    id: root
-+    property string body: ""
-+    property alias font: messageText.font
-+    property bool markdown: false
-+    property bool foldLong: false
-+    property bool expanded: false
-+    signal resizing()
-+    SystemPalette { id: colors }
-+    spacing: 4
-+    TextEdit {
-+        id: messageText
-+        objectName: "transcriptText"
-+        width: parent.width
-+        height: root.foldLong && !root.expanded ? Math.min(contentHeight, 120) : contentHeight
-+        clip: true
-+        text: root.body
-+        textFormat: root.markdown ? TextEdit.MarkdownText : TextEdit.PlainText
-+        readOnly: true
-+        selectByMouse: true
-+        onSelectedTextChanged: if (selectedText.length) root.resizing()
-+        wrapMode: TextEdit.Wrap
-+        color: colors.text
-+        Accessible.name: root.body
-+    }
-+    ToolButton {
-+        visible: root.foldLong && messageText.contentHeight > 120
-+        text: root.expanded ? qsTr("Show less") : qsTr("Show full message")
-+        onClicked: { root.resizing(); root.expanded = !root.expanded }
-+    }
-+}
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/MotionMac.mm
-@@ -0,0 +1,7 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+#import <AppKit/AppKit.h>
-+
-+bool anthraciteSystemReducedMotion()
-+{
-+    return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion;
-+}
---- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.cpp
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,343 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#include "Chrome.h"
-+#include "Sidebar.h"
++#include "StatusController.h"
 +
 +#include <QApplication>
 +#include <QCursor>
@@ -2924,13 +690,10 @@
 +};
 +}
 +
-+Chrome::Chrome(QDockWidget* dock) : QObject(Gui::getMainWindow()), chat(dock)
++Chrome::Chrome(QObject* parent) : QObject(parent)
 +{
-+    setObjectName(QStringLiteral("AnthraciteChrome"));
-+    latest = tr("Console · No messages yet");
++    setObjectName(QStringLiteral("AnthraciteChrome"));    latest = tr("Console · No messages yet");
 +    position = QStringLiteral("X —   Y —   Z —");
-+    connect(chat, &QDockWidget::topLevelChanged, this, [this]() { updateTitleBar(); Q_EMIT changed(); });
-+    updateTitleBar();
 +    qApp->installEventFilter(this);
 +    if (auto* output = Gui::getMainWindow()->findChild<Gui::DockWnd::ReportOutput*>()) {
 +        const auto update = [this, output]() {
@@ -2978,22 +741,6 @@
 +        }
 +    }
 +    return QObject::eventFilter(watched, event);
-+}
-+
-+void Chrome::updateTitleBar()
-+{
-+    if (!chat) return;
-+    chat->setFeatures(QDockWidget::DockWidgetClosable);
-+    chat->setAllowedAreas(Qt::RightDockWidgetArea);
-+    if (chat->isFloating()) chat->setFloating(false);
-+    auto* previous = chat->titleBarWidget();
-+    if (!previous || previous->objectName() != QStringLiteral("AnthraciteHiddenTitleBar")) {
-+        auto* empty = new HiddenTitleBar(chat);
-+        empty->setObjectName(QStringLiteral("AnthraciteHiddenTitleBar"));
-+        empty->setFixedHeight(0);
-+        chat->setTitleBarWidget(empty);
-+        if (previous) previous->deleteLater();
-+    }
 +}
 +
 +void Chrome::toggleConsole()
@@ -3045,6 +792,11 @@
 +    }
 +    if (next != position || origin != source) { position = next; source = origin; Q_EMIT changed(); }
 +}
++
++QString Chrome::accentColor() const { return qApp->palette().color(QPalette::Highlight).name(); }
++QString Chrome::textColor() const { return qApp->palette().color(QPalette::WindowText).name(); }
++QString Chrome::backgroundColor() const { return qApp->palette().color(QPalette::Window).name(); }
++QString Chrome::midColor() const { return qApp->palette().color(QPalette::Mid).name(); }
 +
 +void AnthraciteGui::installChrome()
 +{
@@ -3136,7 +888,6 @@
 +        preferences->SetBool("ChromeDefaultsInitialized", true);
 +        Gui::OverlayManager::instance()->reload();
 +    }
-+    auto* dock = qobject_cast<QDockWidget*>(ensureSidebar()->parentWidget());
 +    // Keep the original Report view and its observer alive under a native tab host.
 +    if (auto* report = window->findChild<QDockWidget*>(QStringLiteral("Report view"))) {
 +        if (!report->findChild<QTabWidget*>(QStringLiteral("AnthraciteConsoleTabs"))) {
@@ -3175,14 +926,16 @@
 +            }
 +        }
 +    }
-+    auto* chrome = new Chrome(dock);
++    auto* chrome = new Chrome(window);
 +    auto* bar = new QQuickWidget(window->statusBar());
 +    bar->setObjectName(QStringLiteral("AnthraciteStatusBar"));
 +    bar->setResizeMode(QQuickWidget::SizeRootObjectToView);
 +    bar->setFixedHeight(30);
 +    bar->rootContext()->setContextProperty(QStringLiteral("chrome"), chrome);
-+    bar->rootContext()->setContextProperty(QStringLiteral("anthraciteController"), sidebarController());
++    bar->rootContext()->setContextProperty(QStringLiteral("anthraciteController"), statusController());
 +    bar->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/StatusBar.qml")));
++    QObject::connect(statusController(), &StatusController::notified, window->statusBar(),
++        [window](const QString& text) { window->statusBar()->showMessage(text, 4000); });
 +    // Keep native command hints, progress, and navigation. Only the duplicate
 +    // coordinate/measurement label is replaced by the QML coordinate display.
 +    for (auto* label : window->statusBar()->findChildren<QLabel*>(QString(), Qt::FindDirectChildrenOnly)) {
@@ -3202,16 +955,12 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#pragma once
 +
 +#include <QObject>
-+#include <QPointer>
 +#include <QString>
-+
-+class QDockWidget;
-+class QQuickWidget;
 +
 +namespace AnthraciteGui {
 +// Native application integration only; StatusBar.qml owns presentation.
@@ -3221,11 +970,21 @@
 +    Q_PROPERTY(QString latestMessage READ latestMessage NOTIFY changed)
 +    Q_PROPERTY(QString coordinates READ coordinates NOTIFY changed)
 +    Q_PROPERTY(QString coordinateSource READ coordinateSource NOTIFY changed)
++    Q_PROPERTY(QString accentColor READ accentColor NOTIFY changed)
++    Q_PROPERTY(QString textColor READ textColor NOTIFY changed)
++    Q_PROPERTY(QString backgroundColor READ backgroundColor NOTIFY changed)
++    Q_PROPERTY(QString midColor READ midColor NOTIFY changed)
 +public:
-+    explicit Chrome(QDockWidget* dock);
++    explicit Chrome(QObject* parent = nullptr);
 +    QString latestMessage() const { return latest; }
 +    QString coordinates() const { return position; }
 +    QString coordinateSource() const { return source; }
++    // QML's SystemPalette does not follow the applied application palette reliably
++    // once the module owns no other QQuickWidget, so expose the theme roles directly.
++    QString accentColor() const;
++    QString textColor() const;
++    QString backgroundColor() const;
++    QString midColor() const;
 +    Q_INVOKABLE void toggleConsole();
 +Q_SIGNALS:
 +    void changed();
@@ -3233,8 +992,6 @@
 +    bool eventFilter(QObject* watched, QEvent* event) override;
 +private:
 +    void updatePosition();
-+    void updateTitleBar();
-+    QPointer<QDockWidget> chat;
 +    QString latest;
 +    QString position;
 +    QString source;
@@ -3243,7 +1000,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,140 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -3251,17 +1008,34 @@
 +import QtQuick.Layouts 1.15
 +
 +Rectangle {
-+    color: palette.window
-+    SystemPalette { id: palette }
++    color: chrome.backgroundColor
 +    component Divider: Rectangle {
 +        Layout.preferredWidth: 1
 +        Layout.preferredHeight: 18
 +        Layout.alignment: Qt.AlignVCenter
-+        color: palette.mid
++        color: chrome.midColor
 +    }
 +    RowLayout {
 +        anchors.fill: parent
 +        spacing: 8
++        ToolButton {
++            id: geometryPicker
++            objectName: "AnthraciteGeometryPicker"
++            Layout.preferredHeight: 24
++            Layout.preferredWidth: 24
++            checked: anthraciteController.picking
++            icon.source: "qrc:/Anthracite/icons/color-picker.svg"
++            icon.width: 18; icon.height: 18
++            icon.color: "transparent"
++            Accessible.name: qsTr("Pick CAD geometry")
++            onClicked: anthraciteController.togglePicker()
++            Hint {
++                hovered: parent.hovered
++                text: anthraciteController.picking
++                      ? qsTr("Click a face, edge, vertex or object · Esc cancels")
++                      : qsTr("Copy a model reference to the clipboard (Ctrl+Shift+E)")
++            }
++        }
 +        ToolButton {
 +            id: consoleButton
 +            objectName: "AnthraciteConsoleToggle"
@@ -3289,7 +1063,7 @@
 +                    Layout.minimumWidth: 0
 +                    text: consoleButton.text
 +                    font: consoleButton.font
-+                    color: palette.windowText
++                    color: chrome.textColor
 +                    opacity: 0.62
 +                    elide: Text.ElideRight
 +                    wrapMode: Text.NoWrap
@@ -3317,7 +1091,7 @@
 +                    Label {
 +                        objectName: "AnthraciteAxis" + parent.index
 +                        text: parent.modelData
-+                        color: palette.highlight
++                        color: chrome.accentColor
 +                        font.pixelSize: 12
 +                    }
 +                    Label {
@@ -3325,12 +1099,12 @@
 +                        text: coordinateLabel.parts[parent.index * 2 + 1] || "—"
 +                        Layout.minimumWidth: Math.ceil(coordinateFont.advanceWidth("-9999.99"))
 +                        horizontalAlignment: Text.AlignRight
-+                        color: palette.windowText
++                        color: chrome.textColor
 +                        font.pixelSize: 12
 +                    }
 +                }
 +            }
-+            Label { text: "mm"; color: palette.windowText; opacity: 0.62; font.pixelSize: 12 }
++            Label { text: "mm"; color: chrome.textColor; opacity: 0.62; font.pixelSize: 12 }
 +            Hint { hovered: coordinateHover.hovered; text: chrome.coordinateSource }
 +            HoverHandler { id: coordinateHover }
 +        }
@@ -3350,7 +1124,7 @@
 +                    Layout.preferredWidth: 8
 +                    Layout.preferredHeight: 8
 +                    radius: 4
-+                    color: anthraciteController.bridgeRunning ? "#4caf50" : palette.mid
++                    color: anthraciteController.bridgeRunning ? "#4caf50" : chrome.midColor
 +                }
 +                Text {
 +                    objectName: "AnthraciteBridgeLabel"
@@ -3359,7 +1133,7 @@
 +                             ? qsTr("Bridge :%1 · %2").arg(anthraciteController.bridgePort).arg(anthraciteController.bridgeClients)
 +                             : qsTr("Bridge :%1").arg(anthraciteController.bridgePort))
 +                          : qsTr("Bridge offline")
-+                    color: palette.windowText
++                    color: chrome.textColor
 +                    font.pixelSize: 12
 +                }
 +            }
@@ -3406,63 +1180,6 @@
 +QTabBar::tab { background-color: palette(window); color: palette(window-text); padding: 5px; }
 +QTabBar::tab:selected { border-bottom: 2px solid palette(highlight); }
 +QScrollBar { background-color: transparent; }
---- /dev/null
-+++ b/src/Mod/Anthracite/Gui/Resources/qml/TranscriptView.qml
-@@ -0,0 +1,54 @@
-+// SPDX-License-Identifier: LGPL-2.1-or-later
-+import QtQuick 2.15
-+
-+// Exact geometry for the loaded history page. Moving the viewport must not
-+// instantiate delegates, remeasure text, or change the scroll range. History
-+// and activity pagination belong to the conversation model, not the viewport.
-+Flickable {
-+    id: view
-+    property alias model: rows.model
-+    property alias delegate: rows.delegate
-+    property alias count: rows.count
-+    property alias spacing: layout.spacing
-+    property alias header: headerLoader.sourceComponent
-+    property alias footer: footerLoader.sourceComponent
-+    readonly property alias rowItems: layout.children
-+    contentWidth: width
-+    contentHeight: layout.height
-+    flickableDirection: Flickable.VerticalFlick
-+
-+    function itemAtIndex(index) { return rows.itemAt(index) }
-+    function indexAt(x, y) {
-+        for (let i = 0; i < count; ++i) {
-+            const item = rows.itemAt(i)
-+            if (item && y >= item.y && y < item.y + item.height) return i
-+        }
-+        return -1
-+    }
-+    function forceLayout() { layout.forceLayout() }
-+    function positionViewAtEnd() {
-+        forceLayout()
-+        contentY = Math.max(0, contentHeight - height)
-+    }
-+    function positionViewAtIndex(index, mode) {
-+        forceLayout()
-+        const item = itemAtIndex(index)
-+        if (item) contentY = Math.max(0, Math.min(contentHeight - height,
-+            mode === ListView.End ? item.y + item.height - height : item.y))
-+    }
-+    Column {
-+        id: layout
-+        width: view.width
-+        Loader {
-+            id: headerLoader
-+            width: parent.width
-+            visible: height > 0
-+        }
-+        Repeater { id: rows }
-+        Loader {
-+            id: footerLoader
-+            width: parent.width
-+            visible: height > 0
-+        }
-+    }
-+}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/icons/LICENSE-Iconoir
 @@ -0,0 +1,21 @@

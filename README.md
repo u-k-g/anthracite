@@ -14,9 +14,10 @@ to inspect or change the active document; the Python it runs executes inside Fre
 native transaction that recomputes, validates, and then commits or rolls back, printing a
 structured observation as JSON with viewport images written to disk.
 
-Watch the work in FreeCAD's right-hand dock: one expandable entry per call with the code, the
-observation, diagnostics, and the viewport images the executor returned. FreeCAD remains the
-CAD system. A successful recompute does not prove that the design meets your requirements.
+Follow the work in FreeCAD's console and the `anthracite log` history: each call records the
+code, the observation, diagnostics, and the viewport images the executor returned. FreeCAD
+remains the CAD system. A successful recompute does not prove that the design meets your
+requirements.
 
 Your existing agent authentication, configuration, models, skills, and tools remain in
 use. One agent operates on the active FreeCAD document at a time; no separate
@@ -42,7 +43,8 @@ source/submodules and applies patches; it does not overwrite dirty work.
 `just run` launches without building, and first mirrors this repository's agent skill to
 `~/.agents/skills/anthracite` (also available as `just skill-sync`). `just connect` installs the
 `anthracite` CLI on your PATH and syncs the skill, so an agent can run `anthracite exec '<python>'`;
-the dock and status bar show the exact command.
+the status bar shows the exact command. The eyedropper button in the status bar, or
+`Ctrl+Shift+E`, copies a model reference to the clipboard.
 
 - **Linux:** Nix supplies native dependencies and tooling. Packaged `nix build` and
   `nix run` are also supported. Development output is in `build/native`.
@@ -62,19 +64,14 @@ deterministic inputs, not real model calls. Failure logs remain in `build/test-r
 
 The launcher uses XDG paths, with their standard defaults when unset:
 
-- `$XDG_CONFIG_HOME/anthracite`: preferences, dock layout, optional `qml/Main.qml` override
+- `$XDG_CONFIG_HOME/anthracite`: preferences
 - `$XDG_DATA_HOME/anthracite`: FreeCAD user data
 - `$XDG_STATE_HOME/.anthracite`: `bridge.json` (the running bridge's connection details),
   the readable `operations.ndjson` history of calls, and `shots/` (viewport PNGs the CLI writes)
 - `$XDG_CACHE_HOME/anthracite`: temporary data
 
-Session associations stay outside your `.FCStd` files. Delete `operations.ndjson` to clear
-the dock history; the running bridge rewrites `bridge.json` on every launch.
-
-To try local sidebar changes, copy the bundled `Main.qml` to the config override above,
-then run `Gui.runCommand("Anthracite_ReloadSidebar")` in FreeCAD's Python console.
-Reload preserves the live bridge and its history; invalid QML leaves the previous view intact.
-Remove the override and reload to return to the bundled UI. Native changes need a rebuild.
+Session associations stay outside your `.FCStd` files. The running bridge rewrites `bridge.json`
+on every launch; `anthracite log` reads the `operations.ndjson` history.
 
 </details>
 

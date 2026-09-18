@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteBridge.py
-@@ -0,0 +1,678 @@
+@@ -0,0 +1,517 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite bridge: expose the checked FreeCAD executor to external agents.
 +
@@ -39,11 +39,6 @@
 +    Gui = None
 +
 +try:
-+    import AnthraciteGui  # The native panel is only present with the GUI module.
-+except Exception:
-+    AnthraciteGui = None
-+
-+try:
 +    from PySide6 import QtCore, QtWidgets
 +except Exception:  # pragma: no cover - FreeCAD's GUI always ships Qt.
 +    QtCore = None
@@ -51,7 +46,6 @@
 +
 +BRIDGE_VERSION = 1
 +TIMER_INTERVAL_MS = 40
-+PARAMETER_INTERVAL_MS = 200
 +IDLE_TIMEOUT_SECONDS = 1800
 +MAX_REQUEST_BYTES = 8 * 1024 * 1024
 +MAX_LOG_BYTES = 8 * 1024 * 1024
@@ -156,11 +150,6 @@
 +        self._ring: collections.deque = collections.deque(maxlen=200)
 +        self._subscribers: list[Callable[[dict], None]] = []
 +        self._log_lock = threading.Lock()
-+        self._parameter_timer = None
-+        self._parameter_object: str | None = None
-+        self._parameter_selection: str | None = None
-+        self._parameter_entries: dict[str, dict] = {}
-+        self._parameter_note = ""
 +
 +    # -- lifecycle ---------------------------------------------------------
 +
@@ -186,20 +175,12 @@
 +        self._timer.setInterval(TIMER_INTERVAL_MS)
 +        self._timer.timeout.connect(self._drain)
 +        self._timer.start()
-+        self._parameter_timer = QtCore.QTimer(application)
-+        self._parameter_timer.setInterval(PARAMETER_INTERVAL_MS)
-+        self._parameter_timer.timeout.connect(self._parameter_tick)
-+        self._parameter_timer.start()
-+        self._push_parameters()
 +        return self.status()
 +
 +    def stop(self) -> None:
 +        if self._timer is not None:
 +            self._timer.stop()
 +            self._timer = None
-+        if self._parameter_timer is not None:
-+            self._parameter_timer.stop()
-+            self._parameter_timer = None
 +        if self._server is not None:
 +            self._server.shutdown()
 +            self._server.server_close()
@@ -410,146 +391,6 @@
 +            pending.finish(result, images, document_name, document_token)
 +            self._record(operation_id, client, code, result, images, started, pending.stages)
 +
-+    # -- parameters panel --------------------------------------------------
-+
-+    @staticmethod
-+    def _selected_object() -> str | None:
-+        if Gui is None:
-+            return None
-+        try:
-+            selection = Gui.Selection.getSelectionEx()
-+        except Exception:
-+            return None
-+        if len(selection) != 1:
-+            return None
-+        return getattr(selection[0], "ObjectName", None)
-+
-+    @staticmethod
-+    def _default_parameter_object(document) -> str | None:
-+        for obj in document.Objects:
-+            if obj.isDerivedFrom("PartDesign::Body") and getattr(obj, "Tip", None) is not None:
-+                return obj.Tip.Name
-+        return document.Objects[-1].Name if document.Objects else None
-+
-+    def _parameter_tick(self) -> None:
-+        request = self._take_parameter_request()
-+        if request:
-+            self._handle_parameter_request(request)
-+            return
-+        document = App.ActiveDocument
-+        if document is None:
-+            if self._parameter_object is not None:
-+                self._parameter_object = None
-+                self._parameter_selection = None
-+                self._push_parameters()
-+            return
-+        selection = self._selected_object()
-+        if selection != self._parameter_selection:
-+            self._parameter_selection = selection
-+            if selection is not None:
-+                self._parameter_object = selection
-+            self._push_parameters()
-+
-+    @staticmethod
-+    def _take_parameter_request() -> str:
-+        method = getattr(AnthraciteGui, "take_parameter_request", None) if AnthraciteGui else None
-+        if method is None:
-+            return ""
-+        try:
-+            return str(method() or "")
-+        except Exception:
-+            return ""
-+
-+    def _handle_parameter_request(self, request: str) -> None:
-+        try:
-+            payload = json.loads(request)
-+        except ValueError:
-+            return
-+        kind = payload.get("kind")
-+        if kind == "select":
-+            self._parameter_object = payload.get("object") or None
-+            self._parameter_selection = self._selected_object()
-+            self._push_parameters()
-+        elif kind == "refresh":
-+            self._push_parameters()
-+        elif kind == "set":
-+            self._apply_parameter(payload)
-+
-+    def _push_parameters(self) -> None:
-+        method = getattr(AnthraciteGui, "push_parameters", None) if AnthraciteGui else None
-+        if method is None:
-+            return
-+        document = App.ActiveDocument
-+        payload = {
-+            "document": document.Name if document is not None else None,
-+            "revision": self._context.get("revision", 0),
-+            "targets": [], "object": None, "label": None, "type": None,
-+            "entries": [], "note": "",
-+        }
-+        if document is None:
-+            payload["note"] = "No active document."
-+        else:
-+            payload["targets"] = AnthraciteInspect.parameter_targets(document)
-+            if self._parameter_object is None:
-+                self._parameter_object = self._default_parameter_object(document)
-+            if self._parameter_object is None:
-+                payload["note"] = "This document has no objects."
-+            else:
-+                try:
-+                    data = AnthraciteInspect.parameters(document, self._parameter_object)
-+                    payload.update({"object": data["object"], "label": data["label"],
-+                                    "type": data["type"], "entries": data["entries"]})
-+                    self._parameter_entries = {entry["id"]: entry for entry in data["entries"]}
-+                except Exception as error:
-+                    self._parameter_object = None
-+                    payload["note"] = str(error)
-+        payload["note"] = payload["note"] or self._parameter_note
-+        try:
-+            method(json.dumps(payload, ensure_ascii=False))
-+        except Exception:
-+            pass
-+
-+    def _apply_parameter(self, payload: dict) -> None:
-+        entry_id = str(payload.get("id") or "")
-+        entry = self._parameter_entries.get(entry_id)
-+        if entry is None or self._parameter_object is None:
-+            self._parameter_note = "That parameter is no longer available; refresh the panel."
-+            self._push_parameters()
-+            return
-+        try:
-+            program = self._parameter_program(entry, str(payload.get("text", "")))
-+        except Exception as error:
-+            self._parameter_note = f"Invalid value: {error}"
-+            self._push_parameters()
-+            return
-+        self._parameter_note = ""
-+        self._run(_Pending("execute", {"code": program, "client": "panel"}))
-+
-+    def _parameter_program(self, entry: dict, text: str) -> str:
-+        kind = entry.get("kind")
-+        if kind == "bool":
-+            literal = "True" if text.strip().casefold() in {"1", "true", "yes", "on"} else "False"
-+        elif kind == "number":
-+            number = float(text.strip())
-+            unit = entry.get("unit") or ""
-+            if entry.get("integer"):
-+                literal = str(int(round(number)))
-+            elif unit:
-+                literal = f"App.Units.Quantity({f'{number} {unit}'.strip()!r})"
-+            else:
-+                literal = repr(number)
-+        else:
-+            literal = repr(text)
-+        entry_id = entry["id"]
-+        if entry_id.startswith("con:"):
-+            call = f"obj.setDatum({int(entry_id[4:])}, {literal})"
-+        else:
-+            call = f"setattr(obj, {entry_id[len('prop:'):]!r}, {literal})"
-+        label = f"Set {entry.get('label') or entry_id}"
-+        return (f"cad.action({label!r})\n"
-+                f"obj = doc.getObject({self._parameter_object!r})\n"
-+                f"{call}\n")
-+
 +    # -- operation log -----------------------------------------------------
 +
 +    def _record(self, operation_id, client, code, result, images, started, stages) -> None:
@@ -578,8 +419,6 @@
 +        # Images travel only with the live event: the persisted record keeps just a
 +        # count so the operation log never carries base64 payloads.
 +        self._notify({"kind": "operation", "operation": record, "images": images})
-+        # Agent edits change the model, so the parameters panel follows along.
-+        self._push_parameters()
 +
 +    @staticmethod
 +    def _status_of(result: dict) -> str:

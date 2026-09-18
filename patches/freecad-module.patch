@@ -93,12 +93,12 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 --- /dev/null
 +++ b/src/Mod/Anthracite/InitGui.py
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,39 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
-+# Importing the native module registers the dock and its commands. FreeCAD executes
-+# this file with separate globals and locals, so nothing module-level is visible
-+# inside the deferred callback; keep everything it needs local to the function.
++# Importing the native module registers the status bar and its commands. FreeCAD
++# executes this file with separate globals and locals, so nothing module-level is
++# visible inside the deferred callback; keep everything it needs local to the function.
 +import AnthraciteGui  # noqa: F401
 +
 +
@@ -112,32 +112,18 @@
 +
 +    cli_script = AnthraciteBridge.cli_path()
 +
-+    def push(method_name, payload):
-+        method = getattr(AnthraciteGui, method_name, None)
-+        if method is None:
-+            return
-+        try:
-+            method(json.dumps(payload))
-+        except Exception:
-+            pass
-+
 +    def push_status():
 +        status = AnthraciteBridge.status()
 +        status["discoveryPath"] = AnthraciteBridge.discovery_path()
 +        status["cliCommand"] = "anthracite exec '<python>'"
 +        status["cliHint"] = f"python3 {cli_script} exec '<python>'"
-+        push("push_bridge_status", status)
-+
-+    def forward(event):
-+        if event.get("kind") == "operation":
-+            push("push_activity", event)
-+        push_status()
++        try:
++            AnthraciteGui.push_bridge_status(json.dumps(status))
++        except Exception:
++            pass
 +
 +    try:
 +        AnthraciteBridge.start()
-+        AnthraciteBridge.subscribe(forward)
-+        for operation in AnthraciteBridge.recent(200):
-+            push("push_activity", {"kind": "operation", "operation": operation})
 +        push_status()
 +    except Exception as error:  # Never block FreeCAD startup on the bridge.
 +        FreeCAD.Console.PrintWarning(f"Anthracite bridge did not start: {error}\n")

@@ -25,11 +25,10 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
   command), preserving its own auth, configuration, models, skills, and tools. Do not build an
   in-app agent host, provider adapters, MCP servers, a general-purpose harness, or simultaneous
   project/worktree sessions. One agent operates on the active FreeCAD document at a time.
-- QML owns presentation and interaction. The dock is a read-only activity history of tool
-  calls—code, observations, diagnostics, and returned images—never a chat surface; fixed to the
-  right, resizable, showable/hideable, and restorable, never floating. Native FreeCAD editing and
-  the viewport remain first class. Keep entries lean: expandable timed work, images visible,
-  selectable text, no redundant branding or Copy buttons.
+- QML owns presentation and interaction. The agent's work is visible through the console and the
+  `anthracite log` operation history—code, observations, diagnostics, and returned images—not an
+  in-app chat or activity dock. Native FreeCAD editing and the viewport remain first class. The
+  status-bar eyedropper, or `Ctrl+Shift+E`, copies a model reference to the clipboard.
 - Acknowledge inputs immediately (target ~100 ms); preserve focus, reading position, and spatial
   continuity. Motion must be interruptible and respect reduced motion. Never imply CAD success
   before validation. Show honest progress and actionable errors; tests alone do not prove the UI
@@ -40,7 +39,7 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
 ## Technology choices
 
 - Python owns the checked CAD executor, the in-app bridge, and the `anthracite` CLI. Keep C++/Qt
-  thin: module registration, docking, GUI-thread handoff, and narrow native integration. Prefer
+  thin: module registration, GUI-thread handoff, and narrow native integration. Prefer
   Python and standard-library code; do not keep a second language or a parallel application for
   something the executor and bridge already do.
 - The bridge serializes execution on the GUI thread inside FreeCAD transactions and appends each
@@ -49,9 +48,8 @@ rules; code and tests define API details. `freecad_commit.txt` pins upstream and
   not mean an edit failed or rolled back; do not retry while native execution may still be running.
 - Keep session identity outside `.FCStd` for upstream compatibility. Any future in-document
   metadata must use upstream-supported mechanisms and pass unmodified FreeCAD round-trip tests.
-- Mutable preferences, history, and reloadable UI overrides live under XDG paths (see README).
-  Changing a dock or QML must not require a full rebuild. `operations.ndjson` is for inspection
-  and the dock history, not recovery.
+- Mutable preferences and history live under XDG paths (see README). `operations.ndjson` is for
+  inspection and `anthracite log`, not recovery.
 - Linux: Nix owns native dependencies and tooling. macOS: Nix supplies tooling and Pixi;
   upstream's pinned `pixi.toml`/`pixi.lock` and CMake preset supply native dependencies. Use the
   locked environment, not host/Homebrew CAD libraries. Keep dependency provenance explicit.
