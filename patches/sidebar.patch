@@ -170,7 +170,7 @@
 +    sMenuText = QT_TR_NOOP("Pick CAD &geometry");
 +    sToolTipText = QT_TR_NOOP("Copy a model reference to the clipboard");
 +    sStatusTip = QT_TR_NOOP("Copy a model reference to the clipboard");
-+    sAccel = "Ctrl+Shift+E";
++    sAccel = "B";
 +    sWhatsThis = "Anthracite_PickReference";
 +}
 +
@@ -1000,7 +1000,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,148 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -1027,13 +1027,17 @@
 +            icon.source: "qrc:/Anthracite/icons/color-picker.svg"
 +            icon.width: 18; icon.height: 18
 +            icon.color: "transparent"
++            background: Rectangle {
++                radius: 4
++                color: geometryPicker.hovered || geometryPicker.checked ? chrome.midColor : "transparent"
++            }
 +            Accessible.name: qsTr("Pick CAD geometry")
 +            onClicked: anthraciteController.togglePicker()
 +            Hint {
 +                hovered: parent.hovered
 +                text: anthraciteController.picking
 +                      ? qsTr("Click a face, edge, vertex or object · Esc cancels")
-+                      : qsTr("Copy a model reference to the clipboard (Ctrl+Shift+E)")
++                      : qsTr("Copy a model reference to the clipboard (B)")
 +            }
 +        }
 +        ToolButton {
@@ -1049,6 +1053,10 @@
 +            font.pixelSize: 12
 +            leftPadding: 16
 +            rightPadding: 16
++            background: Rectangle {
++                radius: 4
++                color: consoleButton.hovered || consoleButton.checked ? chrome.midColor : "transparent"
++            }
 +            contentItem: RowLayout {
 +                spacing: 6
 +                Image {
