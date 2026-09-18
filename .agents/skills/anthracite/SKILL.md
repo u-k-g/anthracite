@@ -61,10 +61,40 @@ failure roll it back instead of half-applying edits across calls.
   constraints; `cad.explain('BasePad')` gives the native dependency chain;
   `cad.diagnostics()` reports under-constraint, conflicts, opaque shapes, and recompute errors.
 - `cad.parameters('Pad')` lists the editable design parameters (native properties and sketch
-  dimensions). The user also has an editable Parameters tab in FreeCAD for the same values.
+  dimensions), which is also how you find what the user can turn without another agent call.
 
 Paged results carry `total` and `nextOffset`. Follow `nextOffset` until it is null rather than
 assuming the returned page is everything.
+
+## Part Design first; Part only as a last resort
+
+Default to **PartDesign**. It is the only workbench that keeps a design editable: one Body builds
+one contiguous solid as a linear history of sketches and features, so changing a sketch dimension
+or a feature parameter rebuilds everything downstream. That is the parametric behaviour the user
+expects, and it is what `cad.editability()` scores.
+
+Use native features for intent: `Hole` instead of a cylinder cut, `Pattern`/`Mirrored` instead of
+repeated booleans, `Fillet`/`Chamfer`/`Draft` on the feature rather than on raw faces. Attach
+sketches to datum planes instead of a fragile top face so names and face indices survive.
+
+Reach for **Part** (CSG: primitives, `Cut`/`Fuse`, one-shot `Fillet`) only when PartDesign cannot
+express the job:
+
+- Imported geometry — a STEP or mesh arrives as an opaque `Part::Feature` with no history to
+  preserve, so edit it with Part.
+- `ShapeString`/lettering and other Draft objects, which exist only in Part/Draft.
+- Scripted shape building — Part is FreeCAD's native shape API (`Part.makeBox`, `Part.Wire`,
+  lofts from raw geometry).
+- Multi-solid results or tooling shapes used to cut several bodies: a Body is one contiguous
+  solid, so several solids need several bodies (or Part).
+- Quick CSG you will never revisit.
+
+Weak spots to avoid: booleans standing in for design intent, fillets/chamfers bound to face or
+edge indices that break when anything upstream changes, and literals with no expressions. Those
+are exactly what drags `cad.editability()` down.
+
+Hybrid is normal and expected: keep imported bases and lettering in Part, remodel the parts you
+will iterate on as PartDesign Bodies, and use Part booleans only as tools between them.
 
 ## Editing discipline
 
