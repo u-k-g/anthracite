@@ -223,7 +223,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,405 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -319,8 +319,18 @@
 +        assert QtSvg.QSvgRenderer(':/Anthracite/icons/' + alias + '.svg').isValid(), alias
 +    assert not QtCore.QDir.searchPaths('iconOverrides'), 'Native icons must not be overridden'
 +    assert not Gui.getIcon('PartDesign_Pad').isNull()
++    measure_labels = [widget for widget in QtWidgets.QApplication.allWidgets()
++                      if widget.inherits('Gui::StatusBarLabel')]
++    measure = next((widget for widget in measure_labels if widget.windowTitle() == 'Quick measure'), None)
++    assert measure is not None and not measure.isHidden(), (
++        'Native Quick measure must stay on the status bar',
++        [(widget.objectName(), widget.windowTitle(), widget.isHidden()) for widget in measure_labels],
++    )
++    assert root.findChild(QtCore.QObject, 'AnthraciteBridgeDot') is None
 +    bridge_indicator = root.findChild(QtCore.QObject, 'AnthraciteBridgeIndicator')
 +    assert bridge_indicator is not None, 'Status bar must expose the bridge indicator'
++    bridge_label = root.findChild(QtCore.QObject, 'AnthraciteBridgeLabel')
++    assert bridge_label is not None and bridge_label.property('text') == 'anthracite'
 +    hint = bridge_indicator.findChild(QtCore.QObject, 'AnthraciteHint')
 +    assert hint is not None
 +    hint.setProperty('hovered', True)
@@ -354,7 +364,7 @@
 +        App.Console.PrintMessage(message + '\n')
 +        QtTest.QTest.qWait(100)
 +        assert abs(console_button.property('width') - console_width) <= 1
-+    assert console_width > 260, 'Console preview should fill available status-bar space'
++    assert 130 <= console_width <= 150, ('Console preview should stay compact', console_width)
 +    assert console_preview.property('truncated'), 'Long console preview must end in an ellipsis'
 +    for name in ('AnthraciteConsoleDivider', 'AnthraciteAgentDivider'):
 +        divider = root.findChild(QtCore.QObject, name)
@@ -368,8 +378,8 @@
 +    navigation = console_dock.findChild(QtQuickWidgets.QQuickWidget, 'AnthraciteConsoleNavigation')
 +    assert navigation is not None and navigation.status() == QtQuickWidgets.QQuickWidget.Ready
 +    assert navigation.width() == 150
-+    assert console_button.property('leftPadding') == 16
-+    assert console_button.property('rightPadding') == 16
++    assert console_button.property('leftPadding') == 8
++    assert console_button.property('rightPadding') == 8
 +    assert console_preview.property('opacity') < 0.7
 +    notifications_view = tabs.widget(1)
 +    assert notifications_view.status() == QtQuickWidgets.QQuickWidget.Ready
@@ -403,6 +413,18 @@
 +    assert controller.property('bridgeRunning')
 +    assert controller.property('bridgePort') == '43210'
 +    assert controller.property('bridgeClients') == 2
++    assert bridge_label.property('color').name() == '#a06666'
++    hint.setProperty('hovered', True)
++    QtTest.QTest.qWait(800)
++    assert '43210' in hint.property('text') and 'connected' in hint.property('text')
++    hint.setProperty('hovered', False)
++    AnthraciteGui.push_bridge_status(json.dumps({
++        'running': False, 'port': 0, 'clients': 0, 'document': '', 'revision': 0,
++        'cliHint': '', 'cliCommand': '',
++    }))
++    QtTest.QTest.qWait(50)
++    assert not controller.property('bridgeRunning')
++    assert bridge_label.property('color').name() == '#96918e'
 +
 +    render_document = App.newDocument("AnthraciteRender")
 +    render_result = AnthraciteExecutor.execute(
@@ -609,7 +631,7 @@
 +QtCore.QTimer.singleShot(0, finish)
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.cpp
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,351 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#include "Chrome.h"
 +#include "StatusController.h"
@@ -623,6 +645,7 @@
 +#include <QPalette>
 +#include <QQmlContext>
 +#include <QQuickWidget>
++#include <QSizePolicy>
 +#include <QStatusBar>
 +#include <QTextBlock>
 +#include <QTextEdit>
@@ -795,6 +818,7 @@
 +
 +QString Chrome::accentColor() const { return qApp->palette().color(QPalette::Highlight).name(); }
 +QString Chrome::textColor() const { return qApp->palette().color(QPalette::WindowText).name(); }
++QString Chrome::mutedColor() const { return qApp->palette().color(QPalette::PlaceholderText).name(); }
 +QString Chrome::backgroundColor() const { return qApp->palette().color(QPalette::Window).name(); }
 +QString Chrome::midColor() const { return qApp->palette().color(QPalette::Mid).name(); }
 +
@@ -813,6 +837,12 @@
 +    if (auto* notifications = window->findChild<QWidget*>(QStringLiteral("notificationArea")))
 +        notifications->setVisible(statusPreferences->GetBool("notificationArea", false));
 +    auto windowPreferences = App::GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/MainWindow");
++    // Earlier chrome hid Quick measure on every launch, which persisted
++    // QuickMeasureEnabled=false. Restore it once; later toggles stay.
++    if (!preferences->GetBool("QuickMeasureRestored", false)) {
++        windowPreferences->SetBool("QuickMeasureEnabled", true);
++        preferences->SetBool("QuickMeasureRestored", true);
++    }
 +    if (preferences->GetBool("UseAnthraciteTheme", true)) {
 +        // Native cube settings update existing views and remain user-editable.
 +        if (!preferences->GetBool("NaviCubeThemeInitialized", false)) {
@@ -929,24 +959,24 @@
 +    auto* chrome = new Chrome(window);
 +    auto* bar = new QQuickWidget(window->statusBar());
 +    bar->setObjectName(QStringLiteral("AnthraciteStatusBar"));
-+    bar->setResizeMode(QQuickWidget::SizeRootObjectToView);
++    bar->setResizeMode(QQuickWidget::SizeViewToRootObject);
 +    bar->setFixedHeight(30);
++    bar->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
 +    bar->rootContext()->setContextProperty(QStringLiteral("chrome"), chrome);
 +    bar->rootContext()->setContextProperty(QStringLiteral("anthraciteController"), statusController());
 +    bar->setSource(QUrl(QStringLiteral("qrc:/Anthracite/" ANTHRACITE_QML_VERSION "/qml/StatusBar.qml")));
 +    QObject::connect(statusController(), &StatusController::notified, window->statusBar(),
 +        [window](const QString& text) { window->statusBar()->showMessage(text, 4000); });
-+    // Keep native command hints, progress, and navigation. Only the duplicate
-+    // coordinate/measurement label is replaced by the QML coordinate display.
++    // Keep native command hints, progress, navigation, and Quick measure.
++    // Do not removeWidget them: QStatusBar hides removed widgets, and this
++    // runs before the status bar is shown, so they would stay hidden.
 +    for (auto* label : window->statusBar()->findChildren<QLabel*>(QString(), Qt::FindDirectChildrenOnly)) {
-+        window->statusBar()->removeWidget(label);
-+        if (label->objectName() == QStringLiteral("rightSideLabel")) label->hide();
-+        else {
++        if (label->objectName() != QStringLiteral("rightSideLabel"))
 +            label->setMaximumWidth(260);
-+            window->statusBar()->addWidget(label, 0);
-+        }
 +    }
-+    window->statusBar()->addPermanentWidget(bar, 1);
++    if (auto* measure = window->findChild<QWidget*>(QStringLiteral("rightSideLabel")))
++        measure->setVisible(windowPreferences->GetBool("QuickMeasureEnabled", true));
++    window->statusBar()->addPermanentWidget(bar, 0);
 +    for (auto* widget : QApplication::allWidgets()) {
 +        if (widget->inherits("Gui::DimensionWidget")) {
 +            widget->setStyleSheet(QStringLiteral("min-width:%1px;").arg(widget->fontMetrics().horizontalAdvance(QStringLiteral("9999.99 mm x 9999.99 mm")) + 32));
@@ -955,7 +985,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Chrome.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,44 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#pragma once
 +
@@ -972,6 +1002,7 @@
 +    Q_PROPERTY(QString coordinateSource READ coordinateSource NOTIFY changed)
 +    Q_PROPERTY(QString accentColor READ accentColor NOTIFY changed)
 +    Q_PROPERTY(QString textColor READ textColor NOTIFY changed)
++    Q_PROPERTY(QString mutedColor READ mutedColor NOTIFY changed)
 +    Q_PROPERTY(QString backgroundColor READ backgroundColor NOTIFY changed)
 +    Q_PROPERTY(QString midColor READ midColor NOTIFY changed)
 +public:
@@ -983,6 +1014,7 @@
 +    // once the module owns no other QQuickWidget, so expose the theme roles directly.
 +    QString accentColor() const;
 +    QString textColor() const;
++    QString mutedColor() const;
 +    QString backgroundColor() const;
 +    QString midColor() const;
 +    Q_INVOKABLE void toggleConsole();
@@ -1000,7 +1032,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/StatusBar.qml
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,160 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +import QtQuick 2.15
 +import QtQuick.Controls 2.15
@@ -1008,6 +1040,10 @@
 +import QtQuick.Layouts 1.15
 +
 +Rectangle {
++    implicitWidth: content.implicitWidth + 8
++    implicitHeight: 30
++    width: implicitWidth
++    height: implicitHeight
 +    color: chrome.backgroundColor
 +    component Divider: Rectangle {
 +        Layout.preferredWidth: 1
@@ -1016,7 +1052,10 @@
 +        color: chrome.midColor
 +    }
 +    RowLayout {
-+        anchors.fill: parent
++        id: content
++        x: 4
++        anchors.verticalCenter: parent.verticalCenter
++        height: parent.height
 +        spacing: 8
 +        ToolButton {
 +            id: geometryPicker
@@ -1043,16 +1082,17 @@
 +        ToolButton {
 +            id: consoleButton
 +            objectName: "AnthraciteConsoleToggle"
-+            Layout.minimumWidth: 60
-+            Layout.fillWidth: true
++            Layout.preferredWidth: 140
++            Layout.maximumWidth: 140
++            Layout.minimumWidth: 140
 +            Layout.fillHeight: true
 +            text: chrome.latestMessage
 +            icon.source: "qrc:/Anthracite/icons/terminal.svg"
 +            icon.width: 16; icon.height: 16
 +            icon.color: "transparent"
 +            font.pixelSize: 12
-+            leftPadding: 16
-+            rightPadding: 16
++            leftPadding: 8
++            rightPadding: 8
 +            background: Rectangle {
 +                radius: 4
 +                color: consoleButton.hovered || consoleButton.checked ? chrome.midColor : "transparent"
@@ -1086,7 +1126,6 @@
 +        RowLayout {
 +            id: coordinateLabel
 +            objectName: "AnthraciteCoordinates"
-+            visible: parent.width > 640
 +            spacing: 8
 +            readonly property var parts: chrome.coordinates.trim().split(/\s+/)
 +            FontMetrics { id: coordinateFont; font.pixelSize: 12 }
@@ -1121,31 +1160,36 @@
 +            id: bridgeIndicator
 +            objectName: "AnthraciteBridgeIndicator"
 +            Layout.fillHeight: true
-+            Layout.preferredWidth: bridgeRow.implicitWidth + 20
++            Layout.preferredWidth: bridgeLabel.implicitWidth + 8
 +            Accessible.name: qsTr("Anthracite bridge status")
 +            onClicked: anthraciteController.copyBridgeConfig()
-+            contentItem: RowLayout {
-+                id: bridgeRow
-+                spacing: 6
-+                Rectangle {
-+                    objectName: "AnthraciteBridgeDot"
-+                    Layout.preferredWidth: 8
-+                    Layout.preferredHeight: 8
-+                    radius: 4
-+                    color: anthraciteController.bridgeRunning ? "#4caf50" : chrome.midColor
-+                }
-+                Text {
-+                    objectName: "AnthraciteBridgeLabel"
-+                    text: anthraciteController.bridgeRunning
-+                          ? (anthraciteController.bridgeClients > 0
-+                             ? qsTr("Bridge :%1 · %2").arg(anthraciteController.bridgePort).arg(anthraciteController.bridgeClients)
-+                             : qsTr("Bridge :%1").arg(anthraciteController.bridgePort))
-+                          : qsTr("Bridge offline")
-+                    color: chrome.textColor
-+                    font.pixelSize: 12
-+                }
++            background: Rectangle {
++                radius: 4
++                color: bridgeIndicator.hovered ? chrome.midColor : "transparent"
 +            }
-+            Hint { hovered: parent.hovered; text: anthraciteController.bridgeCommand }
++            contentItem: Text {
++                id: bridgeLabel
++                objectName: "AnthraciteBridgeLabel"
++                text: "anthracite."
++                color: !anthraciteController.bridgeRunning
++                       ? chrome.mutedColor
++                       : (anthraciteController.bridgeClients > 0 ? chrome.accentColor : chrome.textColor)
++                font.pixelSize: 12
++                verticalAlignment: Text.AlignVCenter
++            }
++            Hint {
++                hovered: parent.hovered
++                text: !anthraciteController.bridgeRunning
++                      ? qsTr("Bridge offline")
++                      : (anthraciteController.bridgeClients > 0
++                         ? qsTr("Bridge :%1 · %2 connected\n%3")
++                           .arg(anthraciteController.bridgePort)
++                           .arg(anthraciteController.bridgeClients)
++                           .arg(anthraciteController.bridgeCommand)
++                         : qsTr("Bridge :%1\n%2")
++                           .arg(anthraciteController.bridgePort)
++                           .arg(anthraciteController.bridgeCommand))
++            }
 +        }
 +    }
 +}
@@ -1443,7 +1487,7 @@
 +}
 --- a/src/Gui/NotificationArea.cpp
 +++ b/src/Gui/NotificationArea.cpp
-@@ -946,7 +946,7 @@
+@@ -946,7 +946,7 @@ NotificationArea::NotificationArea(QWidg
          qApp->sendEvent(pImp->menu, &re);
  
          // This corrects the position of the menu
@@ -1452,7 +1496,7 @@
              QWidget* statusbar = static_cast<QWidget*>(this->parent());
              QPoint statusbar_top_right = statusbar->mapToGlobal(statusbar->rect().topRight());
              QSize menusize = pImp->menu->size();
-@@ -1243,6 +1243,7 @@
+@@ -1243,6 +1243,7 @@ void NotificationArea::showInNotificatio
                  if (!item->isShown()) {
                      QTimer::singleShot(
                          pImp->notificationExpirationTime,
@@ -1510,7 +1554,7 @@
 +}
 --- a/src/Gui/WorkbenchSelector.cpp
 +++ b/src/Gui/WorkbenchSelector.cpp
-@@ -358,11 +358,13 @@
+@@ -358,11 +358,13 @@ int WorkbenchTabWidget::addWorkbenchTab(
      }
  
      tabBar->setTabToolTip(tabIndex, action->toolTip());
@@ -1534,7 +1578,7 @@
  #include <QMenu>
  #include <QToolButton>
  #include <QLayout>
-@@ -75,13 +76,77 @@
+@@ -75,13 +76,77 @@ class GuiExport WorkbenchTabWidget: publ
      public:
          explicit WbTabBar(QWidget* parent)
              : QTabBar(parent)
@@ -1614,7 +1658,7 @@
                  return sizeFromParent;
              }
  
-@@ -139,6 +204,7 @@
+@@ -139,6 +204,7 @@ class GuiExport WorkbenchTabWidget: publ
          }
  
      private:
