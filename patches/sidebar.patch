@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/AppAnthraciteGui.cpp
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,143 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include <QJsonArray>
@@ -45,6 +45,16 @@
 +            &Module::pushBridgeStatus,
 +            "push_bridge_status(json) -- Update the bridge status shown in the sidebar and status bar."
 +        );
++        add_varargs_method(
++            "push_parameters",
++            &Module::pushParameters,
++            "push_parameters(json) -- Update the parameters panel."
++        );
++        add_varargs_method(
++            "take_parameter_request",
++            &Module::takeParameterRequest,
++            "take_parameter_request() -- Return and clear a pending parameters-panel request."
++        );
 +        initialize("Native GUI integration for Anthracite.");
 +    }
 +
@@ -81,6 +91,26 @@
 +        }
 +        sidebarController()->applyBridgeStatus(document.object().toVariantMap());
 +        return Py::None();
++    }
++
++    Py::Object pushParameters(const Py::Tuple& args)
++    {
++        const char* text = nullptr;
++        if (!PyArg_ParseTuple(args.ptr(), "s", &text)) {
++            throw Py::Exception();
++        }
++        QJsonParseError error;
++        const auto document = QJsonDocument::fromJson(QByteArray(text), &error);
++        if (error.error != QJsonParseError::NoError || !document.isObject()) {
++            throw Py::ValueError("push_parameters expects a JSON object.");
++        }
++        sidebarController()->applyParameters(document.object().toVariantMap());
++        return Py::None();
++    }
++
++    Py::Object takeParameterRequest(const Py::Tuple&)
++    {
++        return Py::String(sidebarController()->takeParameterRequest().toStdString());
 +    }
 +};
 +
@@ -556,7 +586,7 @@
 +</RCC>
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Resources/qml/Main.qml
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,774 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import QtQuick 2.15
@@ -570,6 +600,8 @@
 +    FontMetrics { id: controlFont; font: root.font }
 +    readonly property real compactControlHeight: Math.max(28, Math.ceil(controlFont.height) + 8)
 +    property bool reducedMotion: true
++    property string activeTab: "activity"
++    onActiveTabChanged: if (activeTab === "parameters") anthraciteController.refreshParameters()
 +    onReducedMotionChanged: {
 +        if (reducedMotion && latestMotion && latestMotion.running) {
 +            latestMotion.stop()
@@ -741,8 +773,39 @@
 +            }
 +        }
 +
-+        Transcript.TranscriptView {
-+            id: timeline
++        RowLayout {
++            id: tabBar
++            Layout.fillWidth: true
++            Layout.leftMargin: 14
++            Layout.rightMargin: 14
++            Layout.topMargin: 6
++            spacing: 6
++
++            Button {
++                text: qsTr("Activity")
++                checkable: true
++                checked: root.activeTab === "activity"
++                onClicked: root.activeTab = "activity"
++            }
++
++            Button {
++                text: qsTr("Parameters")
++                checkable: true
++                checked: root.activeTab === "parameters"
++                onClicked: root.activeTab = "parameters"
++            }
++
++            Item { Layout.fillWidth: true }
++        }
++
++        StackLayout {
++            id: contentStack
++            Layout.fillWidth: true
++            Layout.fillHeight: true
++            currentIndex: root.activeTab === "activity" ? 0 : 1
++
++            Transcript.TranscriptView {
++                id: timeline
 +            objectName: "AnthraciteTimeline"
 +            Layout.fillWidth: true
 +            Layout.fillHeight: true
@@ -1098,6 +1161,174 @@
 +            }
 +        }
 +
++            Rectangle {
++                id: parametersPanel
++                objectName: "AnthraciteParameters"
++                Layout.fillWidth: true
++                Layout.fillHeight: true
++                color: "transparent"
++
++                ColumnLayout {
++                    anchors.fill: parent
++                    anchors.margins: 12
++                    spacing: 8
++
++                    RowLayout {
++                        Layout.fillWidth: true
++                        spacing: 6
++
++                        ComboBox {
++                            id: parameterObjectBox
++                            Layout.fillWidth: true
++                            model: anthraciteController.parameterTargets
++                            textRole: "label"
++                            valueRole: "name"
++                            function syncIndex() {
++                                for (let index = 0; index < model.length; ++index) {
++                                    if (model[index].name === anthraciteController.parameterObject) {
++                                        currentIndex = index
++                                        return
++                                    }
++                                }
++                                currentIndex = -1
++                            }
++                            Component.onCompleted: syncIndex()
++                            onActivated: anthraciteController.chooseParameterObject(currentValue)
++                            Connections {
++                                target: anthraciteController
++                                function onParametersChanged() { parameterObjectBox.syncIndex() }
++                            }
++                        }
++
++                        Button {
++                            text: qsTr("Refresh")
++                            onClicked: anthraciteController.refreshParameters()
++                        }
++                    }
++
++                    Label {
++                        Layout.fillWidth: true
++                        visible: anthraciteController.parameterNote.length > 0
++                        text: anthraciteController.parameterNote
++                        wrapMode: Text.WordWrap
++                        color: systemPalette.text
++                        opacity: 0.8
++                    }
++
++                    ScrollView {
++                        id: parameterScroll
++                        Layout.fillWidth: true
++                        Layout.fillHeight: true
++                        clip: true
++                        ScrollBar.vertical.policy: ScrollBar.AsNeeded
++
++                        ColumnLayout {
++                            width: parameterScroll.availableWidth
++                            spacing: 6
++
++                            Repeater {
++                                model: anthraciteController.parameters
++
++                                delegate: RowLayout {
++                                    Layout.fillWidth: true
++                                    spacing: 8
++
++                                    Label {
++                                        Layout.preferredWidth: 120
++                                        text: modelData.label
++                                        elide: Text.ElideRight
++                                        color: systemPalette.text
++                                    }
++
++                                    Loader {
++                                        Layout.fillWidth: true
++                                        sourceComponent: {
++                                            if (modelData.kind === "bool") return boolEditor
++                                            if (modelData.kind === "enum") return enumEditor
++                                            if (modelData.kind === "text") return textEditor
++                                            return numberEditor
++                                        }
++                                        onLoaded: item.entry = modelData
++                                    }
++
++                                    Label {
++                                        text: modelData.unit ? String(modelData.unit) : ""
++                                        visible: text.length > 0
++                                        opacity: 0.7
++                                        color: systemPalette.text
++                                    }
++
++                                    Label {
++                                        visible: !!modelData.expression
++                                        text: "fx"
++                                        opacity: 0.7
++                                        color: systemPalette.text
++                                        HoverHandler { id: expressionHover }
++                                        ToolTip.visible: expressionHover.hovered
++                                        ToolTip.text: modelData.expression ? String(modelData.expression) : ""
++                                    }
++                                }
++                            }
++
++                            Label {
++                                Layout.fillWidth: true
++                                visible: anthraciteController.parameters.length === 0
++                                    && anthraciteController.parameterNote.length === 0
++                                text: qsTr("Select an object to edit its parameters.")
++                                wrapMode: Text.WordWrap
++                                opacity: 0.7
++                                color: systemPalette.text
++                            }
++                        }
++                    }
++                }
++
++                Component {
++                    id: numberEditor
++                    TextField {
++                        property var entry
++                        text: entry ? String(entry.value) : ""
++                        enabled: !(entry && entry.expression)
++                        onEditingFinished: if (entry) anthraciteController.editParameter(entry.id, text)
++                    }
++                }
++
++                Component {
++                    id: textEditor
++                    TextField {
++                        property var entry
++                        text: entry ? String(entry.value) : ""
++                        enabled: !(entry && entry.expression)
++                        onEditingFinished: if (entry) anthraciteController.editParameter(entry.id, text)
++                    }
++                }
++
++                Component {
++                    id: boolEditor
++                    CheckBox {
++                        property var entry
++                        checked: entry ? entry.value === true : false
++                        enabled: !(entry && entry.expression)
++                        onClicked: if (entry) anthraciteController.editParameter(entry.id, checked ? "true" : "false")
++                    }
++                }
++
++                Component {
++                    id: enumEditor
++                    ComboBox {
++                        property var entry
++                        model: entry ? entry.options : []
++                        onEntryChanged: syncIndex()
++                        function syncIndex() {
++                            if (!entry) { currentIndex = -1; return }
++                            currentIndex = model.indexOf(entry.value)
++                        }
++                        onActivated: if (entry) anthraciteController.editParameter(entry.id, currentText)
++                    }
++                }
++            }
++        }
++
 +    }
 +
 +    Rectangle {
@@ -1132,7 +1363,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.cpp
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,458 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#include "Sidebar.h"
@@ -1424,6 +1655,48 @@
 +    showToast(tr("MCP configuration copied"));
 +}
 +
++void SidebarController::applyParameters(const QVariantMap& payload)
++{
++    parameterTargetsValue = payload.value(QStringLiteral("targets")).toList();
++    parameterObjectValue = payload.value(QStringLiteral("object")).toString();
++    parametersValue = payload.value(QStringLiteral("entries")).toList();
++    parameterNoteValue = payload.value(QStringLiteral("note")).toString();
++    Q_EMIT parametersChanged();
++}
++
++void SidebarController::chooseParameterObject(const QString& name)
++{
++    QJsonObject request{
++        {QStringLiteral("kind"), QStringLiteral("select")},
++        {QStringLiteral("object"), name},
++    };
++    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
++}
++
++void SidebarController::editParameter(const QString& id, const QString& text)
++{
++    QJsonObject request{
++        {QStringLiteral("kind"), QStringLiteral("set")},
++        {QStringLiteral("object"), parameterObjectValue},
++        {QStringLiteral("id"), id},
++        {QStringLiteral("text"), text},
++    };
++    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
++}
++
++void SidebarController::refreshParameters()
++{
++    QJsonObject request{{QStringLiteral("kind"), QStringLiteral("refresh")}};
++    pendingParameterRequest = QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact));
++}
++
++QString SidebarController::takeParameterRequest()
++{
++    const QString request = pendingParameterRequest;
++    pendingParameterRequest.clear();
++    return request;
++}
++
 +void SidebarController::applyTimelineEdit(const QVariantMap& edit)
 +{
 +    conversation.apply(edit);
@@ -1551,7 +1824,7 @@
 +}
 --- /dev/null
 +++ b/src/Mod/Anthracite/Gui/Sidebar.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,129 @@
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +#ifndef ANTHRACITEGUI_SIDEBAR_H
@@ -1585,6 +1858,10 @@
 +    Q_PROPERTY(QString bridgeConfig READ bridgeConfig NOTIFY bridgeStatusChanged)
 +    Q_PROPERTY(QString bridgeCommand READ bridgeCommand NOTIFY bridgeStatusChanged)
 +    Q_PROPERTY(QString toastMessage READ toastMessage NOTIFY toastChanged)
++    Q_PROPERTY(QVariantList parameterTargets READ parameterTargets NOTIFY parametersChanged)
++    Q_PROPERTY(QString parameterObject READ parameterObject NOTIFY parametersChanged)
++    Q_PROPERTY(QVariantList parameters READ parameters NOTIFY parametersChanged)
++    Q_PROPERTY(QString parameterNote READ parameterNote NOTIFY parametersChanged)
 +
 +public:
 +    explicit SidebarController(QObject* parent = nullptr);
@@ -1599,13 +1876,22 @@
 +    QString bridgeConfig() const { return bridgeConfigValue; }
 +    QString bridgeCommand() const { return bridgeCommandValue; }
 +    QString toastMessage() const { return currentToast; }
++    QVariantList parameterTargets() const { return parameterTargetsValue; }
++    QString parameterObject() const { return parameterObjectValue; }
++    QVariantList parameters() const { return parametersValue; }
++    QString parameterNote() const { return parameterNoteValue; }
 +
 +    Q_INVOKABLE bool reducedMotion() const;
 +    Q_INVOKABLE void togglePicker();
++    Q_INVOKABLE void chooseParameterObject(const QString& name);
++    Q_INVOKABLE void editParameter(const QString& id, const QString& text);
++    Q_INVOKABLE void refreshParameters();
 +    void setPicking(bool active);
 +
 +    void pushOperation(const QVariantMap& operation, const QVariantList& images = {});
 +    void applyBridgeStatus(const QVariantMap& status);
++    void applyParameters(const QVariantMap& payload);
++    QString takeParameterRequest();
 +    Q_INVOKABLE void copyBridgeConfig();
 +    Q_INVOKABLE void dismissToast();
 +    void applyTimelineEdit(const QVariantMap& edit);
@@ -1614,6 +1900,7 @@
 +    void pickingChanged();
 +    void bridgeStatusChanged();
 +    void toastChanged();
++    void parametersChanged();
 +
 +private:
 +    bool eventFilter(QObject* watched, QEvent* event) override;
@@ -1633,6 +1920,13 @@
 +
 +    QString currentToast;
 +    QTimer toastTimer;
++
++    QVariantList parameterTargetsValue;
++    QString parameterObjectValue;
++    QVariantList parametersValue;
++    QString parameterNoteValue;
++    QString pendingParameterRequest;
++
 +    boost::signals2::scoped_connection selectionConnection;
 +};
 +
@@ -1662,7 +1956,7 @@
 +#endif  // ANTHRACITEGUI_SIDEBAR_H
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthraciteGui.py
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,768 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import os
@@ -1859,6 +2153,8 @@
 +        raise AssertionError("Anthracite QML does not expose the geometry picker.")
 +    if root.findChild(QtCore.QObject, "AnthraciteTimeline") is None:
 +        raise AssertionError("Anthracite QML does not expose the activity timeline.")
++    if root.findChild(QtCore.QObject, "AnthraciteParameters") is None:
++        raise AssertionError("Anthracite QML does not expose the parameters panel.")
 +    if root.findChild(QtCore.QObject, "AnthraciteBridgeStatusLabel") is None:
 +        raise AssertionError("Anthracite QML does not expose the bridge status header.")
 +    for removed in ('AnthraciteInteractionCard', 'AnthraciteRequestedInput', 'AnthraciteThreadPicker',
@@ -2352,6 +2648,39 @@
 +    assert controller.property('toastMessage').startswith('Copied ')
 +    controller.dismissToast()
 +    Gui.Selection.clearSelection()
++
++    # Parameters panel: the bridge lists editable values, the panel chooses an object, and
++    # an edit is applied through the same checked executor path as an agent edit.
++    import AnthraciteBridge
++    import AnthraciteInspect
++    AnthraciteBridge.start()
++    QtTest.QTest.qWait(400)
++    listed = AnthraciteInspect.parameters(render_document, 'BasePad')
++    if 'Length' not in {entry['label'] for entry in listed['entries']}:
++        raise AssertionError(f"parameters() did not list Pad.Length: {listed['entries']}")
++    sketch_params = AnthraciteInspect.parameters(render_document, 'BaseSketch')
++    dimensions = [entry for entry in sketch_params['entries'] if entry['id'].startswith('con:')]
++    if not dimensions or not all(entry['kind'] == 'number' and entry['unit'] for entry in dimensions):
++        raise AssertionError(f"parameters() did not list sketch dimensions: {sketch_params['entries']}")
++
++    controller.chooseParameterObject('BasePad')
++    QtTest.QTest.qWait(700)
++    if controller.property('parameterObject') != 'BasePad':
++        raise AssertionError("The parameters panel did not follow the chosen object.")
++    if not any(row['id'] == 'prop:Length' for row in controller.property('parameters')):
++        raise AssertionError("The parameters panel did not receive Pad.Length.")
++
++    controller.editParameter('prop:Length', '17.5')
++    request = json.loads(AnthraciteGui.take_parameter_request())
++    if request.get('kind') != 'set' or request.get('id') != 'prop:Length' or request.get('text') != '17.5':
++        raise AssertionError(f"Unexpected parameter edit request: {request}")
++    # Leave the request in place for the bridge timer, which applies it for real.
++    controller.editParameter('prop:Length', '17.5')
++    QtTest.QTest.qWait(2500)
++    pad_length = render_document.getObject('BasePad').Length.Value
++    if abs(pad_length - 17.5) > 1e-6:
++        raise AssertionError(f"The parameters panel did not apply the edit: Length={pad_length}")
++
 +    diagram = AnthraciteExecutor.execute("cad.render_sketch('BaseSketch')")
 +    assert diagram["ok"], diagram
 +    assert diagram["observation"]["renders"][0]["view"] == "sketch-local-XY"
@@ -3386,7 +3715,7 @@
 +}
 --- a/src/Gui/NotificationArea.cpp
 +++ b/src/Gui/NotificationArea.cpp
-@@ -946,7 +946,7 @@
+@@ -946,7 +946,7 @@ NotificationArea::NotificationArea(QWidg
          qApp->sendEvent(pImp->menu, &re);
  
          // This corrects the position of the menu
@@ -3395,7 +3724,7 @@
              QWidget* statusbar = static_cast<QWidget*>(this->parent());
              QPoint statusbar_top_right = statusbar->mapToGlobal(statusbar->rect().topRight());
              QSize menusize = pImp->menu->size();
-@@ -1243,6 +1243,7 @@
+@@ -1243,6 +1243,7 @@ void NotificationArea::showInNotificatio
                  if (!item->isShown()) {
                      QTimer::singleShot(
                          pImp->notificationExpirationTime,
@@ -3453,7 +3782,7 @@
 +}
 --- a/src/Gui/WorkbenchSelector.cpp
 +++ b/src/Gui/WorkbenchSelector.cpp
-@@ -358,11 +358,13 @@
+@@ -358,11 +358,13 @@ int WorkbenchTabWidget::addWorkbenchTab(
      }
  
      tabBar->setTabToolTip(tabIndex, action->toolTip());
@@ -3477,7 +3806,7 @@
  #include <QMenu>
  #include <QToolButton>
  #include <QLayout>
-@@ -75,13 +76,77 @@
+@@ -75,13 +76,77 @@ class GuiExport WorkbenchTabWidget: publ
      public:
          explicit WbTabBar(QWidget* parent)
              : QTabBar(parent)
@@ -3557,7 +3886,7 @@
                  return sizeFromParent;
              }
  
-@@ -139,6 +204,7 @@
+@@ -139,6 +204,7 @@ class GuiExport WorkbenchTabWidget: publ
          }
  
      private:

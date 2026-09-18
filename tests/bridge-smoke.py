@@ -80,8 +80,10 @@ def main():
     client.close()
     AnthraciteBridge.stop()
     App.closeDocument(document.Name)
-    print(MARKER, flush=True)
-    QtWidgets.QApplication.instance().quit()
+    # Write straight to the pipe: FreeCAD buffers its Python stdout and only flushes it
+    # during the Qt teardown that crashes on this platform.
+    os.write(1, (MARKER + "\n").encode("utf-8"))
+    os._exit(0)
 
 
 try:

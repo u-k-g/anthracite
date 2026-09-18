@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1531 @@
+@@ -0,0 +1,1535 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -762,6 +762,10 @@
 +            self._reference_revision()
 +        return Inspect.measure(self.doc, obj, _revisions.get(self.doc.Name, 0), other)
 +
++    def parameters(self, obj):
++        """List editable design parameters (native properties and sketch dimensions)."""
++        return Inspect.parameters(self.doc, obj)
++
 +    def verify(self, checks):
 +        if self.doc.Name in _executing_docs:
 +            self.check_requests.append(checks)
@@ -924,7 +928,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -2250,7 +2254,7 @@
 +            "checkpoint": identity, "originalDocumentPreserved": True}
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteInspect.py
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,553 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Readable, bounded native CAD observations; never a replacement geometry API."""
 +import FreeCAD as App
@@ -2477,6 +2481,100 @@
 +            result[name] = {"error": str(error)}
 +    return {"properties": result, "total": len(names),
 +            "nextOffset": offset + limit if offset + limit < len(names) else None}
++
++
++_EDITABLE_NUMBERS = {
++    "App::PropertyLength": "mm",
++    "App::PropertyDistance": "mm",
++    "App::PropertyAngle": "deg",
++    "App::PropertyPercent": "%",
++    "App::PropertyFloat": "",
++    "App::PropertyFloatConstraint": "",
++    "App::PropertyInteger": "",
++    "App::PropertyIntegerConstraint": "",
++}
++_EDITABLE_TEXT = {"App::PropertyString"}
++_EDITABLE_BOOL = {"App::PropertyBool"}
++_EDITABLE_ENUM = {"App::PropertyEnumeration"}
++_DIMENSION_CONSTRAINTS = {"Distance", "DistanceX", "DistanceY", "Radius", "Diameter", "Angle"}
++# Attachment, visibility, and derived bookkeeping are not design parameters.
++_SKIP_PROPERTIES = {
++    "Visibility", "Label2", "ExpressionEngine", "MapMode", "MapPathParameter", "MapReversed",
++    "AttacherEngine", "AttacherType", "AttachmentSupport", "AttachmentOffset",
++    "FullyConstrained", "Support", "Profile", "BaseFeature", "Tip", "Shape", "Placement",
++}
++_SKIP_TARGET_TYPES = {"App::Origin", "App::Plane", "App::Line", "App::Point"}
++
++
++def parameter_targets(doc):
++    """Objects a parameters panel can inspect, in document order."""
++    return [{"name": obj.Name, "label": obj.Label, "type": obj.TypeId}
++            for obj in doc.Objects if obj.TypeId not in _SKIP_TARGET_TYPES]
++
++
++def _expressions(obj):
++    result = {}
++    for path, expression in (getattr(obj, "ExpressionEngine", None) or []):
++        result[str(path)] = str(expression)
++    return result
++
++
++def parameters(doc, target):
++    """Editable design parameters for one object: native properties and sketch dimensions.
++
++    Read-only and derived properties are omitted; anything returned can be assigned back
++    through the checked executor.
++    """
++    obj = resolve(doc, target)
++    expressions = _expressions(obj)
++    entries = []
++    for name in obj.PropertiesList:
++        if name.startswith("_") or name in _SKIP_PROPERTIES:
++            continue
++        status = []
++        try:
++            status = [str(item).casefold() for item in obj.getPropertyStatus(name)]
++        except Exception:
++            pass
++        if "readonly" in status or "immutable" in status:
++            continue
++        type_id = obj.getTypeIdOfProperty(name)
++        entry = {"id": f"prop:{name}", "group": "Properties", "label": name,
++                 "expression": expressions.get(name)}
++        if type_id in _EDITABLE_NUMBERS:
++            entry.update({"kind": "number", "value": value(getattr(obj, name)),
++                          "unit": _EDITABLE_NUMBERS[type_id],
++                          "integer": type_id in {"App::PropertyInteger", "App::PropertyIntegerConstraint"}})
++        elif type_id in _EDITABLE_BOOL:
++            entry.update({"kind": "bool", "value": bool(getattr(obj, name))})
++        elif type_id in _EDITABLE_TEXT:
++            entry.update({"kind": "text", "value": str(getattr(obj, name))})
++        elif type_id in _EDITABLE_ENUM:
++            options = []
++            try:
++                options = [str(item) for item in obj.getEnumerationsOfProperty(name)]
++            except Exception:
++                pass
++            entry.update({"kind": "enum", "value": str(getattr(obj, name)), "options": options})
++        else:
++            continue
++        entries.append(entry)
++    if obj.isDerivedFrom("Sketcher::SketchObject"):
++        for index, constraint in enumerate(obj.Constraints):
++            try:
++                if not constraint.Driving or constraint.Type not in _DIMENSION_CONSTRAINTS:
++                    continue
++                current = constraint.Value
++            except Exception:
++                continue
++            if current is None:
++                continue
++            label = str(getattr(constraint, "Name", "") or f"{constraint.Type}{index + 1}")
++            entries.append({"id": f"con:{index}", "group": "Constraints", "label": label,
++                            "kind": "number", "value": float(current),
++                            "unit": "deg" if constraint.Type == "Angle" else "mm",
++                            "expression": None})
++    return {"object": obj.Name, "label": obj.Label, "type": obj.TypeId, "entries": entries}
 +
 +
 +def sketch(obj, offset=0, limit=40):
