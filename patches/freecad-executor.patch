@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteExecutor.py
-@@ -0,0 +1,1622 @@
+@@ -0,0 +1,1683 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +"""Transactional execution surface exposed to coding agents inside FreeCAD."""
@@ -99,6 +99,33 @@
 +        _observed_snapshots.pop(str(doc.Name), None)
 +        _revisions.pop(str(doc.Name), None)
 +        History.forget(doc)
++
++
++def _document_exists(name: str) -> bool:
++    """Whether a document is open; App.getDocument() raises instead of returning None."""
++    try:
++        return name in App.listDocuments()
++    except Exception:
++        return False
++
++
++def _open_documents():
++    """Open documents as (name, document) pairs; FreeCAD returns a dict keyed by name."""
++    documents = App.listDocuments()
++    if isinstance(documents, dict):
++        return list(documents.items())
++    return [(document.Name, document) for document in documents]
++
++
++def revision(document=None) -> int:
++    """Current revision for a document (the active one by default)."""
++    document = document if document is not None else App.ActiveDocument
++    return _revisions.get(document.Name, 0) if document is not None else 0
++
++
++def open_document_names() -> list[str]:
++    """Names of open documents, for the bridge's live status cache."""
++    return [name for name, _ in _open_documents()]
 +
 +
 +_revision_observer = _RevisionObserver()
@@ -792,6 +819,28 @@
 +        """List editable design parameters (native properties and sketch dimensions)."""
 +        return Inspect.parameters(self.doc, obj)
 +
++    def documents(self):
++        """List open documents, which one is active, and how many objects each holds.
++
++        Works with no active document, so it answers "is my project even open?".
++        """
++        active = App.ActiveDocument
++        entries = []
++        for _name, document in _open_documents():
++            try:
++                entries.append({
++                    "name": document.Name,
++                    "label": document.Label,
++                    "active": document is active,
++                    "objects": len(document.Objects),
++                    "revision": _revisions.get(document.Name, 0),
++                    "fileName": document.FileName or None,
++                })
++            except Exception:
++                continue
++        return {"documents": entries, "active": active.Name if active is not None else None,
++                "count": len(entries)}
++
 +    def editability(self):
 +        """Audit how parametric the native feature tree is (the E half of a G/E verdict)."""
 +        return Inspect.editability(self.doc)
@@ -982,7 +1031,7 @@
 +    })
 +
 +
-+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap"}
++_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents"}
 +_HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint"}
 +
 +
@@ -1237,7 +1286,7 @@
 +        if standalone:
 +            method, args, kwargs = standalone
 +            try:
-+                if method in {"guide", "checkpoints"} or (method == "api" and kwargs.get("kind") in {"modules", "commands", "workbenches"}):
++                if method in {"guide", "checkpoints", "documents"} or (method == "api" and kwargs.get("kind") in {"modules", "commands", "workbenches"}):
 +                    result = getattr(Cad(None), method)(*args, **kwargs)
 +                elif method in {"tree", "inspect"} and not args and not kwargs:
 +                    result = {"document": None, "nodes": [], "total": 0, "nextOffset": None}
@@ -1355,8 +1404,11 @@
 +        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
 +            exec(code, namespace, namespace)
 +
-+        if App.getDocument(document_name) is not doc:
-+            raise RuntimeError("The active document was closed during the tool call.")
++        if not _document_exists(document_name):
++            raise RuntimeError(
++                "The call closed the active document, so nothing was rolled back. Open or "
++                "activate a document in a separate call."
++            )
 +        if App.ActiveDocument is not doc:
 +            # A transaction cannot span a document switch, so the observation and
 +            # revision bookkeeping would describe the wrong document.
@@ -1408,28 +1460,37 @@
 +        error_traceback = traceback.format_exc()
 +        rolled_back = False
 +        remapped = []
-+        try:
-+            progress("rollback")
-+            doc.abortTransaction()
-+            doc.recompute()
-+            rolled_back = True
-+        except Exception:
-+            error_traceback += "\nRollback failure:\n" + traceback.format_exc()
++        observation = None
++        # A program may close the document it started with. Nothing can be rolled back
++        # then, and touching the deleted object would raise a confusing error that
++        # masks the real one.
++        document_alive = _document_exists(document_name)
++        if not document_alive:
++            error_traceback += ("\nThe call closed the active document, so its work could "
++                                "not be rolled back.")
++        if document_alive:
++            try:
++                progress("rollback")
++                doc.abortTransaction()
++                doc.recompute()
++                rolled_back = True
++            except Exception:
++                error_traceback += "\nRollback failure:\n" + traceback.format_exc()
++            try:
++                after_rollback = _document_snapshot(doc)
++                observation = _observation(doc, before, after_rollback)
++                equivalent, remapped = History.equivalent(before, after_rollback)
++                rolled_back = rolled_back and equivalent
++            except Exception:
++                rolled_back = False
++                observation = None
++                error_traceback += "\nPost-rollback inspection failure:\n" + traceback.format_exc()
++            if not rolled_back or remapped:
++                # Invalidate previously issued references when restoration is uncertain.
++                revision += 1
++                _revisions[document_name] = revision
++                History.invalidate(doc, "Rollback failed or could not be verified.")
 +        _executing_docs.discard(document_name)
-+        try:
-+            after_rollback = _document_snapshot(doc)
-+            observation = _observation(doc, before, after_rollback)
-+            equivalent, remapped = History.equivalent(before, after_rollback)
-+            rolled_back = rolled_back and equivalent
-+        except Exception:
-+            rolled_back = False
-+            observation = None
-+            error_traceback += "\nPost-rollback inspection failure:\n" + traceback.format_exc()
-+        if not rolled_back or remapped:
-+            # Invalidate previously issued references when restoration is uncertain.
-+            revision += 1
-+            _revisions[document_name] = revision
-+            History.invalidate(doc, "Rollback failed or could not be verified.")
 +        return {
 +            "ok": False,
 +            "revision": revision,
@@ -1625,7 +1686,7 @@
 +    )
 --- /dev/null
 +++ b/src/Mod/Anthracite/TestAnthracite.py
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,529 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +
 +import unittest
@@ -2067,7 +2128,8 @@
 +                raise RuntimeError("deliberate rollback failure")
 +
 +        proxy = FailedRollback()
-+        app = SimpleNamespace(ActiveDocument=proxy, getDocument=lambda name: proxy)
++        app = SimpleNamespace(ActiveDocument=proxy, getDocument=lambda name: proxy,
++                              listDocuments=lambda: {document.Name: proxy})
 +        with patch.object(AnthraciteExecutor, "App", app):
 +            result = AnthraciteExecutor.execute(
 +                "doc.addObject('App::FeaturePython', 'Remaining')\n"

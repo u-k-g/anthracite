@@ -34,6 +34,12 @@ JSON to a file. **`print()` goes to the `stdout` field** — read it instead of 
 - `anthracite shots` — list saved viewport images (`--clear` to remove them).
 - `anthracite log --limit 20` — recent operations, one line each, without parsing `operations.ndjson`.
 
+`status` lists **every open document** (`documents`) and which one is active
+(`activeDocument`/`document`). Use it — or `cad.documents()`, which adds each document's object
+count and revision — before assuming a project is open. A named project that is not in that list
+is not open; open it yourself with `App.openDocument(path)` in its own call rather than reading the
+`.FCStd` as a zip.
+
 Exit code is `0` when the edit committed, `1` when it was rejected or rolled back, `2` for a
 transport problem. Always read the JSON even on `1`; the summary line on stderr says why.
 
@@ -62,6 +68,9 @@ failure roll it back instead of half-applying edits across calls.
   `cad.diagnostics()` reports under-constraint, conflicts, opaque shapes, and recompute errors.
 - `cad.parameters('Pad')` lists the editable design parameters (native properties and sketch
   dimensions), which is also how you find what the user can turn without another agent call.
+- `cad.documents()` lists open documents with their active flag, object count, revision, and file
+  path. Call it when the user refers to "the open project" and you need to confirm which document
+  they mean; an empty document is not a missing one.
 
 Paged results carry `total` and `nextOffset`. Follow `nextOffset` until it is null rather than
 assuming the returned page is everything.

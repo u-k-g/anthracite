@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/Mod/Anthracite/AnthraciteBridge.py
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,546 @@
 +# SPDX-License-Identifier: LGPL-2.1-or-later
 +"""Anthracite bridge: expose the checked FreeCAD executor to external agents.
 +
@@ -46,6 +46,7 @@
 +
 +BRIDGE_VERSION = 1
 +TIMER_INTERVAL_MS = 40
++CONTEXT_INTERVAL_MS = 500
 +IDLE_TIMEOUT_SECONDS = 1800
 +MAX_REQUEST_BYTES = 8 * 1024 * 1024
 +MAX_LOG_BYTES = 8 * 1024 * 1024
@@ -142,7 +143,7 @@
 +        self._started_at: str | None = None
 +        self._queue: collections.deque[_Pending] = collections.deque()
 +        self._queue_lock = threading.Lock()
-+        self._context = {"document": None, "documentToken": None, "revision": 0}
++        self._context = {"document": None, "documentToken": None, "revision": 0, "documents": []}
 +        self._clients = 0
 +        self._busy = False
 +        self._blocked = False
@@ -175,12 +176,21 @@
 +        self._timer.setInterval(TIMER_INTERVAL_MS)
 +        self._timer.timeout.connect(self._drain)
 +        self._timer.start()
++        self._context_timer = QtCore.QTimer(application)
++        self._context_timer.setInterval(CONTEXT_INTERVAL_MS)
++        self._context_timer.timeout.connect(self._refresh_context)
++        self._context_timer.start()
++        self._refresh_context()
 +        return self.status()
 +
 +    def stop(self) -> None:
 +        if self._timer is not None:
 +            self._timer.stop()
-+            self._timer = None
++        self._timer = None
++        self._context_timer = None
++        if self._context_timer is not None:
++            self._context_timer.stop()
++            self._context_timer = None
 +        if self._server is not None:
 +            self._server.shutdown()
 +            self._server.server_close()
@@ -206,6 +216,8 @@
 +            "port": self._port,
 +            "startedAt": self._started_at,
 +            "document": self._context["document"],
++            "activeDocument": self._context["document"],
++            "documents": list(self._context["documents"]),
 +            "documentToken": self._context["documentToken"],
 +            "revision": self._context["revision"],
 +            "busy": self._busy,
@@ -376,20 +388,37 @@
 +            result = {"ok": False, "notExecuted": True,
 +                      "error": {"type": type(error).__name__, "message": str(error)}}
 +        finally:
-+            if App.ActiveDocument is not None:
-+                document_name = App.ActiveDocument.Name
-+                try:
-+                    document_token = AnthraciteInspect.document_token(App.ActiveDocument)
-+                except Exception:
-+                    pass
-+                self._context = {
-+                    "document": document_name,
-+                    "documentToken": document_token,
-+                    "revision": result.get("revision", self._context["revision"]),
-+                }
++            self._refresh_context()
++            document = App.ActiveDocument
++            document_name = document.Name if document is not None else None
++            document_token = self._context["documentToken"]
 +            self._busy = False
 +            pending.finish(result, images, document_name, document_token)
 +            self._record(operation_id, client, code, result, images, started, pending.stages)
++
++    def _refresh_context(self) -> None:
++        """Keep the cached context live; status is served off the GUI thread.
++
++        Without this the bridge reports whatever document the last call ran against,
++        which is wrong as soon as the user switches or closes documents.
++        """
++        document = App.ActiveDocument
++        token = None
++        if document is not None:
++            try:
++                token = AnthraciteInspect.document_token(document)
++            except Exception:
++                token = None
++        try:
++            names = AnthraciteExecutor.open_document_names()
++        except Exception:
++            names = []
++        self._context = {
++            "document": document.Name if document is not None else None,
++            "documentToken": token,
++            "revision": AnthraciteExecutor.revision(document),
++            "documents": names,
++        }
 +
 +    # -- operation log -----------------------------------------------------
 +
