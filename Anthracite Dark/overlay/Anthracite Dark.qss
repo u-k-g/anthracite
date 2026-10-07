@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+Gui--OverlayTabWidget, Gui--OverlayProxyWidget,
+QDockWidget, Gui--TreePanel, Gui--TreePanel QTreeView,
+Gui--PropertyEditor--PropertyEditor, QAbstractScrollArea,
+QAbstractScrollArea > QWidget, QTabWidget::pane {
+    background-color: transparent;
+    color: palette(window-text);
+    border: none;
+}
+Gui--OverlayTabWidget {
+    qproperty-effectColor: #080808;
+    qproperty-effectBlurRadius: 0;
+    qproperty-effectOffsetX: 0;
+    qproperty-effectOffsetY: 0;
+    qproperty-effectWidth: 1;
+    qproperty-effectHeight: 1;
+    qproperty-enableEffect: 1;
+}
+Gui--OverlayTitleBar, Gui--OverlaySplitterHandle {
+    background-color: palette(window);
+    color: palette(window-text);
+}
+QAbstractItemView {
+    background-color: transparent;
+    alternate-background-color: transparent;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+    color: palette(text);
+    border: none;
+}
+QAbstractItemView::item:hover { background-color: palette(mid); }
+QAbstractItemView::item:selected { background-color: palette(highlight); color: palette(highlighted-text); }
+QHeaderView::section { background-color: palette(window); color: palette(window-text); border: none; }
+QTabBar::tab { background-color: palette(window); color: palette(window-text); padding: 5px; }
+QTabBar::tab:selected { border-bottom: 2px solid palette(highlight); }
+QScrollBar { background-color: transparent; }

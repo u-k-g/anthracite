@@ -25,7 +25,8 @@ def main():
     import AnthraciteBridge
 
     application = QtWidgets.QApplication.instance()
-    status = AnthraciteBridge.start()
+    application.processEvents()
+    status = AnthraciteBridge.status()
     assert status["running"] is True, status
 
     with open(AnthraciteBridge.discovery_path(), encoding="utf-8") as handle:
@@ -67,11 +68,11 @@ def main():
     created = call({
         "id": 3,
         "type": "execute",
-        "params": {"code": "cad.action('Create smoke box')\ndoc.addObject('Part::Box', 'Box')"},
+        "params": {"code": "cad.action('Create smoke box')\ndoc.addObject('Part::Box', 'BridgeBox')"},
     })
     result = created["result"]
     assert result["ok"] is True, result
-    assert document.getObject("Box") is not None, "the edit did not commit"
+    assert document.getObject("BridgeBox") is not None, "the edit did not commit"
     assert result["revision"] >= 1, result
 
     history = AnthraciteBridge.recent(20)
@@ -88,20 +89,27 @@ def main():
         "doc.getObject('Box').Length = 25\n"
         "cad.render(view='front', width=200, height=150)"
     )
-    child = subprocess.Popen([interpreter, cli, "exec", program],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.time() + 60
-    while child.poll() is None and time.time() < deadline:
-        application.processEvents()
-        time.sleep(0.05)
-    stdout, stderr = child.communicate(timeout=10)
-    assert child.returncode == 0, f"cli failed: {stderr}"
-    payload = json.loads(stdout)
-    assert payload["ok"] is True, payload
-    assert "images" not in payload, "the CLI must not print base64 images"
-    shots = payload.get("shots") or []
-    assert shots, payload
-    assert all(os.path.isfile(shot["path"]) for shot in shots), shots
+    for code in ['doc.addObject("Part::Box", "Box")', program]:
+        child = subprocess.Popen([interpreter, cli, "exec", code],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while child.poll() is None and time.time() < deadline:
+            application.processEvents()
+            time.sleep(0.05)
+        if child.poll() is None:
+            # Terminating the client does not establish whether the native edit
+            # finished. Never replay this request; retain the profile for inspection.
+            child.kill()
+            child.communicate()
+            raise TimeoutError("CLI outcome is uncertain; inspect the retained test profile")
+        stdout, stderr = child.communicate(timeout=10)
+        assert child.returncode == 0, f"cli failed: {stderr}"
+        payload = json.loads(stdout)
+        assert payload["ok"] is True, payload
+        assert "images" not in payload, "the CLI must not print base64 images"
+        shots = payload.get("shots") or []
+        assert shots, payload
+        assert all(os.path.isfile(shot["path"]) for shot in shots), shots
     assert abs(document.getObject("Box").Length.Value - 25.0) < 1e-6, "the CLI edit did not apply"
 
     client.close()

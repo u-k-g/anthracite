@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
-"""FreeCAD-embedded assertions, launched by tests/runtests.nu."""
+"""Addon autoload and native executor assertions in stock FreeCAD's GUI."""
 import os
 import traceback
 import unittest
@@ -9,34 +9,37 @@ try:
         raise RuntimeError("Run this test through just test with an isolated profile")
     import FreeCAD as App
     import FreeCADGui as Gui
+    from PySide6 import QtWidgets
+    import AnthraciteBridge
+    import TestAnthracite
 
-    # Native notification widgets can re-enter Qt logging/accessibility on
-    # macOS. Keep diagnostics in the report/log, not transient test widgets.
-    from PySide6 import QtCore, QtTest, QtWidgets
-    QtTest.QTest.qWait(100)
-    notifications = Gui.getMainWindow().findChild(QtWidgets.QWidget, 'notificationArea')
-    assert notifications is not None and notifications.isHidden(), 'Hide only the notification indicator'
-    App.ParamGet("User parameter:BaseApp/Preferences/NotificationArea").SetBool(
-        "NotificationAreaEnabled", False)
-    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    if tuple(int(part) for part in App.Version()[:2]) < (1, 0):
+        raise RuntimeError("Anthracite requires FreeCAD 1.0 or newer")
+    installed = os.path.realpath(os.environ["ANTHRACITE_TEST_ADDON"])
+    assert os.path.dirname(os.path.realpath(AnthraciteBridge.__file__)) == installed
+    # Let InitGui's deferred callback run; do not start the bridge ourselves.
+    application = QtWidgets.QApplication.instance()
+    application.processEvents()
+    assert AnthraciteBridge.status()["running"], "InitGui did not start the bridge"
+    assert AnthraciteBridge.status()["port"] > 0
 
+    probe = App.newDocument("AnthracitePortabilityProbe")
+    print("FreeCAD:", App.Version(), "HasPendingTransaction:",
+          getattr(probe, "HasPendingTransaction", "absent"), flush=True)
+    App.closeDocument(probe.Name)
     for workbench in ("PartDesignWorkbench", "PartWorkbench", "SketcherWorkbench"):
-        if workbench not in Gui.listWorkbenches():
-            raise RuntimeError(f"Missing editing workbench: {workbench}")
+        assert workbench in Gui.listWorkbenches(), workbench
         Gui.activateWorkbench(workbench)
     Gui.activateWorkbench("PartDesignWorkbench")
-    import TestAnthracite
-    print("Testing installed executor:", TestAnthracite.__file__, flush=True)
 
     result = unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromModule(TestAnthracite)
     )
     if not result.wasSuccessful():
         raise RuntimeError("Executor tests failed")
-    # This module checks docking, reload, invalid-QML fallback, selection and
-    # real viewport rendering, then schedules a normal QApplication shutdown.
-    import TestAnthraciteGui
+    AnthraciteBridge.stop()
+    os.write(1, b"ANTHRACITE_GUI_SMOKE_OK\n")
+    os._exit(0)
 except BaseException:
     traceback.print_exc()
-    # FreeCAD otherwise catches script errors and leaves the application open.
     os._exit(1)

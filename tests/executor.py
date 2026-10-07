@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
-"""Headless native executor tests; pass this script to the built FreeCADCmd."""
+"""Headless native executor tests; pass this script to stock FreeCADCmd."""
 import os
 import unittest
 import TestAnthracite

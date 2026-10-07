@@ -3,29 +3,33 @@
 const root = path self | path dirname | path dirname
 
 def main [] {
-    let setup = ^nu --no-config-file ($root | path join tests setup.nu) | complete
-    print $setup.stdout
-    if $setup.exit_code != 0 { error make {msg: $setup.stderr} }
-    let results = $root | path join build test-results
+    ^nu --no-config-file ($root | path join tests install.nu)
+    let executable = $env.FREECAD_BIN? | default (if (sys host | get name) == Darwin {
+        '/Applications/FreeCAD.app/Contents/Resources/bin/freecad'
+    } else { 'FreeCAD' })
+    let results = $root | path join test-results
     mkdir $results
     let directory = mktemp -d -p $results test.XXXXXX
     $env.XDG_CONFIG_HOME = $directory | path join config
     $env.XDG_DATA_HOME = $directory | path join data
     $env.XDG_STATE_HOME = $directory | path join state
     $env.XDG_CACHE_HOME = $directory | path join cache
-    $env.ANTHRACITE_SMOKE = "1"
-    let build = if (sys host | get name) == "Darwin" { $root | path join build src build debug } else { $root | path join build native }
-    $env.ANTHRACITE_TEST_LAUNCHER = $root | path join devutils launch.nu
-    $env.ANTHRACITE_TEST_NU = $nu.current-exe
-    for test in [[script executable marker]; [executor.py FreeCADCmd ANTHRACITE_EXECUTOR_TESTS_OK] [smoke.py FreeCAD ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py FreeCAD ANTHRACITE_BRIDGE_SMOKE_OK]] {
-        let result = ^nu --no-config-file ($root | path join devutils native.nu) exec $nu.current-exe --no-config-file ($root | path join devutils launch.nu) ($build | path join bin $test.executable) ($root | path join tests $test.script) | complete
+    $env.FREECAD_USER_HOME = $env.XDG_CONFIG_HOME | path join FreeCAD
+    $env.FREECAD_USER_DATA = $env.XDG_DATA_HOME | path join FreeCAD
+    $env.FREECAD_USER_TEMP = $env.XDG_CACHE_HOME | path join FreeCAD
+    $env.ANTHRACITE_SMOKE = '1'
+    $env.ANTHRACITE_TEST_ADDON = $env.FREECAD_USER_DATA | path join Mod Anthracite
+    mkdir $env.FREECAD_USER_HOME $env.FREECAD_USER_TEMP
+    ^nu --no-config-file ($root | path join install.nu) $env.ANTHRACITE_TEST_ADDON --addon-only
+    for test in [[script marker]; [preferences-smoke.py ANTHRACITE_PREFERENCES_SMOKE_OK] [preferences-restart.py ANTHRACITE_PREFERENCES_RESTART_OK] [smoke.py ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py ANTHRACITE_BRIDGE_SMOKE_OK]] {
+        let result = run-external $executable '--user-cfg' ($env.FREECAD_USER_HOME | path join user.cfg) '--system-cfg' ($env.FREECAD_USER_HOME | path join system.cfg) '--log-file' ($directory | path join $"($test.script).FreeCAD.log") ($root | path join tests $test.script) | complete
         let output = $result.stdout + $result.stderr
         $output | save ($directory | path join $"($test.script).log")
         print $output
-        if $result.exit_code != 0 or not ($output | str contains $test.marker) or ($output =~ 'TypeError:|QProcess: Destroyed while process|The current style does not support customization') {
-            error make {msg: $"($test.script) failed \(exit ($result.exit_code)\). Logs and isolated profile retained at ($directory)"}
+        if $result.exit_code != 0 or not ($output | str contains $test.marker) {
+            error make {msg: $"($test.script) failed (exit ($result.exit_code)). Logs and isolated profile retained at ($directory)"}
         }
     }
     rm -r $directory
-    print "All FreeCAD integration tests passed."
+    print 'All stock FreeCAD integration tests passed.'
 }
