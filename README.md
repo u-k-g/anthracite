@@ -24,6 +24,15 @@ Python console, `App.getUserAppDataDir()` identifies the user-data directory.
 On macOS this may be `~/Library/Application Support/FreeCAD/v1-1/`; pass that directory's
 `Mod/Anthracite` path to `just install`.
 
+For that macOS location, this command works in Nushell and zsh:
+
+```sh
+just install '~/Library/Application Support/FreeCAD/v1-1/Mod/Anthracite'
+```
+
+In Nushell, `$HOME` inside a quoted string is literal text. Use the `~/` path above
+or construct the path with `($env.HOME | path join ...)`.
+
 For manual installation, copy or symlink this addon folder into your FreeCAD user
 `Mod/Anthracite` directory, symlink the bundled `anthracite` into `~/.local/bin/`, and
 copy `.agents/skills/anthracite/SKILL.md` to `~/.agents/skills/anthracite/SKILL.md`.

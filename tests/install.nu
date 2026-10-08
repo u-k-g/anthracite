@@ -6,6 +6,11 @@ def main [] {
     let directory = mktemp -d -t anthracite-install.XXXXXX
     # Supply only a subprocess's HOME; never alter the current shell's home.
     let installer = $root | path join install.nu
+    let literal = with-env {HOME: $directory} {
+        ^nu --no-config-file $installer '$HOME/Library/FreeCAD/Mod/Anthracite' | complete
+    }
+    assert ($literal.exit_code != 0)
+    assert ($literal.stderr | str contains 'unexpanded home variable')
     for attempt in [1 2] {
         let result = with-env {HOME: $directory} {
             ^nu --no-config-file $installer | complete

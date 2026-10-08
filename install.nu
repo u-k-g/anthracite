@@ -3,6 +3,9 @@
 const root = path self | path dirname
 
 def main [addon: string = "", --addon-only] {
+    if ($addon | str contains '$HOME') or ($addon | str contains '$env.HOME') {
+        error make {msg: 'The installation path contains an unexpanded home variable. Use a ~/ path, or evaluate ($env.HOME | path join ...) in Nushell.'}
+    }
     let destination = if $addon == "" {
         $env.HOME | path join .local share FreeCAD Mod Anthracite
     } else {
