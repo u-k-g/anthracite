@@ -20,8 +20,9 @@ def main [] {
     $env.ANTHRACITE_SMOKE = '1'
     $env.ANTHRACITE_TEST_ADDON = $env.FREECAD_USER_DATA | path join Mod Anthracite
     mkdir $env.FREECAD_USER_HOME $env.FREECAD_USER_TEMP
+    '<FCParameters><FCParamGroup Name="Root"><FCParamGroup Name="BaseApp"><FCParamGroup Name="Preferences"><FCParamGroup Name="AnthraciteTest"><FCText Name="Sentinel">keep</FCText></FCParamGroup><FCParamGroup Name="RecentFiles"><FCText Name="MRU0">keep.FCStd</FCText></FCParamGroup><FCParamGroup Name="NotificationArea"><FCBool Name="NotificationAreaEnabled" Value="0" /></FCParamGroup></FCParamGroup></FCParamGroup></FCParamGroup></FCParameters>' | save ($env.FREECAD_USER_HOME | path join user.cfg)
     ^nu --no-config-file ($root | path join install.nu) $env.ANTHRACITE_TEST_ADDON --addon-only
-    for test in [[script marker]; [preferences-smoke.py ANTHRACITE_PREFERENCES_SMOKE_OK] [preferences-restart.py ANTHRACITE_PREFERENCES_RESTART_OK] [smoke.py ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py ANTHRACITE_BRIDGE_SMOKE_OK]] {
+    for test in [[script marker]; [preferences-smoke.py ANTHRACITE_PREFERENCES_SMOKE_OK] [preferences-restart.py ANTHRACITE_PREFERENCES_RESTART_OK] [ui-smoke.py ANTHRACITE_UI_SMOKE_OK] [smoke.py ANTHRACITE_GUI_SMOKE_OK] [bridge-smoke.py ANTHRACITE_BRIDGE_SMOKE_OK]] {
         let result = run-external $executable '--user-cfg' ($env.FREECAD_USER_HOME | path join user.cfg) '--system-cfg' ($env.FREECAD_USER_HOME | path join system.cfg) '--log-file' ($directory | path join $"($test.script).FreeCAD.log") ($root | path join tests $test.script) | complete
         let output = $result.stdout + $result.stderr
         $output | save ($directory | path join $"($test.script).log")

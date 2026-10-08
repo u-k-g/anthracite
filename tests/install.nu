@@ -14,6 +14,9 @@ def main [] {
     }
     let addon = $directory | path join .local share FreeCAD Mod Anthracite
     assert ($addon | path join package.xml | path exists)
+    assert ($addon | path join AnthraciteUi.py | path exists)
+    assert ($addon | path join Resources eyedropper.svg | path exists)
+    assert ($addon | path join Resources ui.qss | path exists)
     assert ($addon | path join 'Anthracite Dark' 'Anthracite Dark.cfg' | path exists)
     assert ($addon | path join 'Anthracite Dark' parameters 'Anthracite Dark.yaml' | path exists)
     assert ($addon | path join 'Anthracite Dark' overlay 'Anthracite Dark.qss' | path exists)

@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 <package format="1">
   <name>Anthracite</name>
-  <description>Checked FreeCAD execution for external coding agents, with an optional native theme and preference pack.</description>
+  <description>Checked FreeCAD execution for external coding agents, with a global geometry picker, console and notifications, and native appearance defaults.</description>
   <version>1.0.0</version>
   <maintainer>Anthracite contributors</maintainer>
   <license file="LICENSE">LGPL-2.1-or-later</license>
@@ -16,7 +16,7 @@
     <preferencepack>
       <name>Anthracite Dark</name>
       <type>Theme</type>
-      <description>Anthracite's dark surfaces, muted rose accents, viewport colors, navigation, units, and native editing defaults. Applied only when selected.</description>
+      <description>Anthracite's dark surfaces, muted rose accents, viewport colors, navigation, units, and native editing defaults. Applied automatically at first startup; later changes are preserved.</description>
       <version>1.0.0</version>
       <tag>dark</tag>
       <tag>preferences</tag>

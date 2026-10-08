@@ -12,10 +12,11 @@ def main [addon: string = "", --addon-only] {
         error make {msg: "Choose an installation directory outside this checkout."}
     }
     mkdir $destination
-    for file in [Init.py InitGui.py AnthraciteExecutor.py AnthraciteInspect.py AnthraciteHistory.py AnthraciteBridge.py TestAnthracite.py anthracite LICENSE README.md justfile install.nu package.xml] {
+    for file in [Init.py InitGui.py AnthraciteExecutor.py AnthraciteInspect.py AnthraciteHistory.py AnthraciteBridge.py AnthraciteUi.py TestAnthracite.py anthracite LICENSE README.md justfile install.nu package.xml] {
         cp -f ($root | path join $file) ($destination | path join $file)
     }
     cp -r -f ($root | path join 'Anthracite Dark') $destination
+    cp -r -f ($root | path join Resources) $destination
     mkdir ($destination | path join tests) ($destination | path join .agents skills anthracite)
     for file in (glob ($root | path join tests '*.py') | append (glob ($root | path join tests '*.nu'))) {
         cp -f $file ($destination | path join tests ($file | path basename))

@@ -17,6 +17,14 @@ def _start_bridge():
     except Exception as error:  # Never block FreeCAD startup.
         FreeCAD.Console.PrintWarning(f"Anthracite bridge did not start: {error}\n")
 
+    try:
+        import AnthraciteUi
+
+        AnthraciteUi.apply_defaults()
+        AnthraciteUi.start()
+    except Exception as error:  # Appearance must not prevent the bridge from running.
+        FreeCAD.Console.PrintWarning(f"Anthracite interface did not start: {error}\n")
+
 
 from PySide6 import QtCore
 

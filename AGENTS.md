@@ -23,11 +23,12 @@ report ambiguity and remapping instead of guessing. On timeouts or lost connecti
 inspect uncertain outcomes and never replay automatically. Keep session identity outside
 `.FCStd`. Operation logs support inspection, not recovery.
 
-Stock FreeCAD owns presentation, preferences, workbenches, and native selection. Keep the
-bridge startup independent of custom chrome. Do not add an empty workbench just to expose
-the bridge. Require FreeCAD >= 1.0 with PySide6 and Python >= 3.11.
+Use Python and Qt for the global geometry picker, console/notification dock, compact
+workbench tabs, and widget polish; retain native selection and the real Python console.
+Keep bridge startup independent of presentation. Do not add an empty workbench just to
+expose the bridge. Require FreeCAD >= 1.0 with PySide6 and Python >= 3.11.
 Bundle portable appearance and behavior settings as a native preference pack. Apply it
-only when the user selects it, never at installation or each startup. Keep serialized
+automatically once at first startup, with a backup; preserve later user changes. Keep serialized
 window layouts, recent-item history, machine-specific paths/fonts, and fork flags out.
 The package metadata's workbench entry only locates root Init.py/InitGui.py; it does not
 register a selectable workbench.

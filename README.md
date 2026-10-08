@@ -29,24 +29,26 @@ For manual installation, copy or symlink this addon folder into your FreeCAD use
 copy `.agents/skills/anthracite/SKILL.md` to `~/.agents/skills/anthracite/SKILL.md`.
 Names remain Anthracite; use one installation and one running bridge at a time.
 Installation is by Mod-directory copy. The bundled `package.xml` lets FreeCAD discover
-the optional preference pack and load the bridge; no selectable Anthracite workbench is added.
+the preference pack and load the bridge; no selectable Anthracite workbench is added.
 
 ## Theme and preferences
 
-After installing, choose **Edit → Preferences → General → Theme → Anthracite Dark**,
-then click **Apply**. Restart FreeCAD for settings that require it.
+The first FreeCAD startup after installation automatically applies **Anthracite Dark**
+and the bundled settings. Restart FreeCAD for native settings that require it.
 
 This applies the bundled [preference pack](<Anthracite Dark/Anthracite Dark.cfg>):
 `#080808` backgrounds, `#A06666` accents, the native overlay stylesheet, viewport and
 navigation-cube colors, touchpad navigation, units, toolbar sizing, workbench choices,
 and native editing/display defaults from the original Anthracite profile.
-Native notification popups are disabled by the pack; diagnostics remain in the report
-view, avoiding the macOS popup loop that the old fork addressed in core code.
-Selecting the pack applies those preferences to the current FreeCAD user profile.
-FreeCAD provides preference-pack backups through its native preferences dialog.
+Native notification popups are disabled; native user messages appear in the addon's
+Notifications panel. Developer diagnostics remain available on the Report page.
+This avoids the macOS popup loop that the old fork addressed in core code.
 
-Installation and ordinary startup do not apply the pack. Your later preference changes
-remain in place across restarts. Saved window geometry, recent-item history, machine-specific
+Defaults apply once, rather than at every startup. Your later preference changes remain
+in place across restarts. The original preferences are backed up to
+`App.getUserAppDataDir()/Anthracite/preferences-before.cfg` before applying defaults.
+You can select the pack again through FreeCAD's native Theme preferences to reset them.
+Saved window geometry, recent-item history, machine-specific
 fonts, external theme references, and fork initialization flags are excluded.
 The theme YAML and overlay stylesheet retain their original LGPL notices.
 
@@ -72,13 +74,25 @@ Preserve editable feature trees with sketches and native PartDesign features.
 come from the requirement. Use `cad.compare('reference.step')` for geometry and
 `cad.editability()` for the tree. A high geometry score with low editability is a failure.
 The [agent skill](.agents/skills/anthracite/SKILL.md) covers inspection and editing discipline.
-The skill is preserved unchanged; its former `just connect` and status-bar picker notes
-are superseded by this addon's installation instructions and native selection workflow.
+The skill is preserved unchanged; its former `just connect` instructions are superseded
+by this addon's installation instructions.
 
-Stock FreeCAD owns its preferences and UI. The former custom selector, notification fix,
-status bar, themed panels, and Ctrl+Shift+E picker are removed. Use native selection with
-`cad.selection()`; Python reference helpers remain available. Portable preferences and
-theme resources are provided by the optional native preference pack instead of branding.
+The **Anthracite** global toolbar keeps the eyedropper available across workbenches.
+Click it or press **Ctrl+Shift+E**, then click geometry to copy a JSON reference and pick
+point to the clipboard. **Esc** cancels. The reference carries the document token and
+revision, so later geometry edits invalidate it. Native selection and `cad.selection()`
+remain available independently.
+
+Click the latest-message preview in the status bar to show or hide the bottom console
+dock. Its compact navigation switches between FreeCAD's real **Console**, **Report**,
+and **Notifications**. Notification rows show the time received by the panel, severity,
+source, and selectable message text; **Copy selected** copies complete rows. The panel
+retains up to 1,000 messages for the current session.
+
+Workbench tabs keep the active label visible, collapse inactive labels, and reveal them
+on hover. Qt styling supplies compact toolbar spacing, status-bar styling, dimension
+display widths, and selected-tab accents. These additions use Python and Qt with stock
+FreeCAD, independently of bridge startup.
 
 ## Local data
 
@@ -97,8 +111,9 @@ FreeCAD. Consider this access when using a shared machine.
 just test
 ```
 
-Tests copy the addon into a temporary FreeCAD user profile, apply the pack through the
-native theme selector, verify persistence and user overrides across restart, check startup autoload,
+Tests copy the addon into a temporary FreeCAD user profile, check automatic defaults,
+verify persistence and user overrides across restart, exercise real console widgets,
+native notifications, workbench tabs and geometry picking, check startup autoload,
 run the unchanged native executor tests, then exercise the real bridge and CLI transport,
 including committed edits and viewport files. No model calls or FreeCAD rebuilds are used.
 Set `FREECAD_BIN` to your stock GUI executable if needed. On macOS the default is

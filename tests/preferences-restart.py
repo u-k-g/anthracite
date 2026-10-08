@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
-"""Selected theme survives restart without reapplying its defaults."""
+"""Automatic theme survives restart without reapplying its defaults."""
 import os
 import time
 import traceback

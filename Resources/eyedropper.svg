@@ -1,0 +1,6 @@
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <g fill="none" stroke="#E5E1DE" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m14 5 5 5M15 6l3-3a2.1 2.1 0 0 1 3 3l-3 3M15 7 5 17l-1 4 4-1L18 10M8 14l3 3"/>
+  </g>
+</svg>
