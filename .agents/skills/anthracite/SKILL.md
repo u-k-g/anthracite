@@ -29,6 +29,10 @@ PY
 Add `--full` for the entire observation, `--select ok,result,verification` for chosen keys,
 `--print-stdout` to see your program's `print()` output as text, and `--out obs.json` to write the
 JSON to a file. **`print()` goes to the `stdout` field** — read it instead of guessing.
+For text without repeating it inside JSON, use
+`--select ok,result,events,verification,shots --print-stdout` (text goes to stderr).
+`cad.emit('dimensions', value)` appends to **events**, not result; events are included
+in compact output. A standalone read helper's return value appears in **result**.
 
 - `anthracite status` — bridge and active-document status. `pendingTransaction.open` is a
   native undo step still held by the GUI (spreadsheet, sketcher, task panel); it is not the
@@ -61,6 +65,10 @@ failure roll it back instead of half-applying edits across calls.
 
 - `cad.guide()` returns short native recipes (partdesign, edit, expressions, attachments,
   patterns, repair); `cad.guide('edit')` returns one. Start here.
+- `cad.bodies()` lists Bodies and tips without dumping sketch constraints. Start here for
+  an existing multi-part project, then inspect the relevant tree.
+- `cad.api(kind='helpers', query='render')` returns actual `cad` helper signatures and
+  documentation without invoking them. Use it before guessing arguments.
 - `cad.api(query='Pad', kind='types')` lists installed object types; `cad.api('BasePad',
   kind='methods')` documents an object's native methods; `kind` may also be `commands`,
   `workbenches`, or `modules`. Never guess a type, property, or argument you can look up.
@@ -77,6 +85,8 @@ failure roll it back instead of half-applying edits across calls.
   `cad.set_parameters({'thickness':'5 mm'})` preflights the whole batch and uses the current
   checked action. Derived inputs cannot be assigned; edit their independent inputs.
   Numeric values use declared units. Bounds are checked again after recompute.
+  `nativeBounds` reports known native limits; `App::PropertyLength` cannot represent
+  negative offsets. Use `App::PropertyDistance` for signed coordinates.
 - `cad.select_geometry('Pad', surface='Plane', where={'centerOfMass_mm':[10,5,5]},
   unique=True)` finds geometry by measured facts. Ambiguous unique queries fail. Inspect
   candidate lists instead of silently picking the first face. References still expire on edits.
@@ -93,6 +103,25 @@ Paged results carry `total` and `nextOffset`. Follow `nextOffset` until it is nu
 assuming the returned page is everything.
 
 ## Part Design first; Part only as a last resort
+
+Before authoring, identify independent fit/section dimensions, derived relationships,
+and the intended feature tree. Read `cad.guide('design-intent')` for parameter ownership,
+`cad.guide('profiles')` for coherent outlines/shared profiles, and `cad.guide('arcs')`
+when junction rounding must survive dimension edits.
+
+Store shared inputs once in an independent native parameter container; do not put the
+Body it drives inside that container or reference a containing Body from its child.
+Keep expressions native and expose meaningful knobs rather than duplicated vertex values.
+Prefer a coherent base outline plus shared wall/lip profiles to an accumulated copied tree.
+Several distinct Pads are not repetition; use patterns when placement actually repeats.
+
+Fully constrained alone does not establish editability: Block constraints, fragile
+generated-edge dress-ups, and literal coordinate spans can still encode the wrong intent.
+For an angled strip, check perpendicular width separately from an end-edge span and
+material thickness. `cad.measure(edge)` includes `length_mm`; for parallel straight
+edges, `cad.measure(a, other=b)` includes `lineSeparation_mm` for their infinite supporting
+lines, while `distance_mm` stays the finite-edge distance. Build joins without protruding
+caps or contour gaps. For arcs, check actual endpoint order, sweep, radius and tangency.
 
 Default to **PartDesign**. It is the only workbench that keeps a design editable: one Body builds
 one contiguous solid as a linear history of sketches and features, so changing a sketch dimension
@@ -201,6 +230,14 @@ Judge the result on two axes, not one:
   pattern, literal dimensions with no expressions, pockets that should be holes, blocked sketches.
 
 A high G with a low E is a **failure** — fix the tree before calling the task done.
+
+Scope the heuristic to a variant with `cad.editability('BodyName')`. Establish actual
+editability by perturbing each independent knob and a coupled batch on isolated candidates,
+then testing native undo/redo and save/reopen followed by another edit. Preserve the source
+and restore nominal values after testing. Use `cad.guide('engineering')` for the checks.
+A heuristic score does not replace these tests or prove strength, fatigue or every parameter
+combination. If evaluation or checked history refuses verification, report that failure;
+do not bypass its guard or count it as a passing test.
 
 Interface checks count as geometry too. `cad.measure(<face reference>)` returns `faceType`,
 `normal` for a plane, or `axis` / `axisPosition` / `radius_mm` for a cylinder; `cad.measure(a,

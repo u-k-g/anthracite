@@ -82,10 +82,12 @@ def surface(doc):
     for name, (obj, spec) in sorted(_bindings(doc).items()):
         _, current, native_unit, expression, integer = _binding(obj, spec)
         scale = _quantity(1, spec["unit"], native_unit)
+        limits = Inspect.native_bounds(obj, spec["path"]) if spec["kind"] == "property" else [None, None]
         entries.append({"name": name, "object": obj.Name, "kind": spec["kind"],
                         "path": spec["path"], "unit": spec["unit"], "value": current / scale,
                         "bounds": spec["bounds"], "expression": expression,
-                        "independent": not bool(expression), "integer": integer})
+                        "independent": not bool(expression), "integer": integer,
+                        "nativeBounds": [None if v is None else v / scale for v in limits]})
     return {"document": doc.Name, "entries": entries,
             "authority": "Native properties and ExpressionEngine; declarations store bindings only."}
 
@@ -121,6 +123,12 @@ def declare(doc, name, target, *, property=None, constraint=None, unit=None, bou
     lo, hi = normalized
     if lo is not None and hi is not None and lo > hi:
         raise ValueError("Minimum bound exceeds maximum")
+    if spec["kind"] == "property":
+        lower, upper = Inspect.native_bounds(obj, spec["path"])
+        if ((lo is not None and lower is not None and lo * scale < lower)
+                or (hi is not None and upper is not None and hi * scale > upper)):
+            hint = "; use App::PropertyDistance for signed offsets" if obj.getTypeIdOfProperty(spec["path"]) == "App::PropertyLength" else ""
+            raise ValueError(f"Declared bounds exceed native bounds {lower, upper} {native_unit}{hint}")
     if (lo is not None and current / scale < lo) or (hi is not None and current / scale > hi):
         raise ValueError("Current native value is outside the declared bounds")
     spec["bounds"] = normalized
@@ -154,6 +162,10 @@ def set_parameters(doc, values):
             raise ValueError(f"{name} must be within {spec['bounds']} {spec['unit']}")
         if integer and number != int(number):
             raise ValueError(f"{name} requires an integer")
+        if spec["kind"] == "property":
+            lower, upper = Inspect.native_bounds(obj, spec["path"])
+            if (lower is not None and number < lower) or (upper is not None and number > upper):
+                raise ValueError(f"{name} exceeds native bounds {lower, upper} {native_unit}; use App::PropertyDistance for signed offsets when appropriate")
         # Aliases may bind the same input; reject conflicting assignments.
         key = (obj.Name, spec["kind"], path)
         if any(key == old[0] and number != old[4] for old in edits):

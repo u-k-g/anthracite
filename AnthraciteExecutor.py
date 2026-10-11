@@ -38,6 +38,10 @@ except ImportError:
     Gui = None
 
 
+class SourceChanged(RuntimeError):
+    """Isolated evaluation changed its source; the outcome needs inspection."""
+
+
 class PendingTransaction(Exception):
     """A native FreeCAD undo step is open; mutations cannot nest into it."""
 
@@ -275,6 +279,11 @@ def _object_snapshot(obj: Any) -> dict[str, Any]:
                                 "sha256": digest.hexdigest(), "members": members}
             if properties[name]["type"] == "Part::PropertyPartShape":
                 properties[name]["geometryHash"] = History.shape_digest(value)
+            elif properties[name]["type"] == "Part::PropertyGeometryList":
+                import AnthraciteIR
+                properties[name]["normalizedHash"] = hashlib.sha256(
+                    AnthraciteIR.canonical_bytes(AnthraciteIR._native_xml(obj, name))).hexdigest()
+                properties[name]["nativeGeometry"] = AnthraciteIR._native_xml(obj, name, precision=None)
         except Exception as error:
             # Never confirm restoration when a property's content is unknown.
             raise RuntimeError(f"Cannot inspect {obj.Name}.{name}: {error}") from error
@@ -456,6 +465,8 @@ def _render_spec(
     width = int(width)
     height = int(height)
     view = str(view).lower()
+    if view == "isometric":
+        view = "axonometric"
     supported_views = {
         "current",
         "axonometric",
@@ -835,7 +846,30 @@ class Cad:
         return Inspect.sketch(Inspect.resolve(self.doc, obj), offset, limit)
 
     def api(self, obj=None, query="", offset=0, limit=40, kind="types"):
+        if kind == "helpers":
+            import inspect
+            if (obj is not None or not isinstance(query, str)
+                    or type(offset) is not int or type(limit) is not int
+                    or offset < 0 or not 1 <= limit <= 100):
+                raise ValueError("Helper discovery takes no object; limit is 1..100 and offset is non-negative")
+            entries = [{"name": name, "signature": str(inspect.signature(getattr(self, name))),
+                        "documentation": inspect.getdoc(getattr(self, name)) or ""}
+                       for name in sorted(dir(type(self)))
+                       if not name.startswith("_") and query.casefold() in name.casefold()
+                       and callable(getattr(self, name))]
+            return {"helpers": entries[offset:offset + limit], "total": len(entries),
+                    "nextOffset": offset + limit if offset + limit < len(entries) else None}
         return Inspect.api(self.doc, obj, query, offset, limit, kind)
+
+    def bodies(self):
+        """List native Bodies, tips, visibility and feature counts without dumping sketches."""
+        return {"document": self.doc.Name if self.doc else None,
+                "bodies": [{"name": obj.Name, "label": obj.Label,
+                            "tip": obj.Tip.Name if obj.Tip else None,
+                            "features": len(obj.Group),
+                            "visible": bool(obj.ViewObject.Visibility) if App.GuiUp else None}
+                           for obj in (self.doc.Objects if self.doc else [])
+                           if obj.isDerivedFrom("PartDesign::Body")]}
 
     def guide(self, topic=None):
         return Inspect.guide(topic)
@@ -911,7 +945,20 @@ class Cad:
 
     def evaluate(self, values, **options):
         import AnthraciteEvaluate
-        return AnthraciteEvaluate.evaluate(self.doc, values, **options)
+        doc = self.doc
+        before = _document_snapshot(doc)
+        stacks = History.stacks(doc)
+        nested = doc.Name in _executing_docs
+        _executing_docs.add(doc.Name)
+        try:
+            result = AnthraciteEvaluate.evaluate(doc, values, **options)
+        finally:
+            if not nested:
+                _executing_docs.discard(doc.Name)
+            if not History.equivalent(before, _document_snapshot(doc))[0] or stacks != History.stacks(doc):
+                _bump_revision(doc)
+                raise SourceChanged("Isolated evaluation changed source state; inspect the document. Do not replay.")
+        return result
 
     def documents(self):
         """List open documents, which one is active, and how many objects each holds.
@@ -935,9 +982,9 @@ class Cad:
         return {"documents": entries, "active": active.Name if active is not None else None,
                 "count": len(entries)}
 
-    def editability(self):
+    def editability(self, obj=None):
         """Audit how parametric the native feature tree is (the E half of a G/E verdict)."""
-        return Inspect.editability(self.doc)
+        return Inspect.editability(self.doc, obj)
 
     def ir(self, target=None):
         """Derive a canonical supported native feature graph without modifying CAD."""
@@ -1009,6 +1056,7 @@ class Cad:
         return _selection_snapshot(self.doc)
 
     def emit(self, label: str, value: Any) -> None:
+        """Append labeled data to the response's events list; this does not set result."""
         self.events.append({"label": str(label), "value": _json_safe(value)})
 
     def assert_valid(self) -> None:
@@ -1139,7 +1187,7 @@ def context_json() -> str:
     })
 
 
-_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "ir", "model_hash", "select_geometry", "evaluate"}
+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "bodies", "ir", "model_hash", "select_geometry", "evaluate"}
 _HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint", "yield_transaction"}
 
 
@@ -1429,7 +1477,7 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
         if standalone:
             method, args, kwargs = standalone
             try:
-                if method in {"guide", "checkpoints", "documents"} or (method == "api" and kwargs.get("kind") in {"modules", "commands", "workbenches"}):
+                if method in {"guide", "checkpoints", "documents", "bodies"} or (method == "api" and kwargs.get("kind") in {"modules", "commands", "workbenches", "helpers"}):
                     result = getattr(Cad(None), method)(*args, **kwargs)
                 elif method in {"tree", "inspect"} and not args and not kwargs:
                     result = {"document": None, "nodes": [], "total": 0, "nextOffset": None}
@@ -1505,6 +1553,10 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
             if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute):
                 if item.func.attr in _HISTORY_HELPERS:
                     raise ValueError("History operations must be standalone literal cad calls, not nested in mutations.")
+    except SourceChanged as error:
+        return {"ok": False, "rolledBack": False, "requiresInspection": True,
+                "revisionBefore": revision, "revision": _revisions.get(doc.Name, revision),
+                "error": {"type": type(error).__name__, "message": str(error)}}
     except PendingTransaction as error:
         return {"ok": False, "notExecuted": True, "revision": revision,
                 "error": {"type": "PendingTransaction", "message": str(error)},

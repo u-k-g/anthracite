@@ -32,10 +32,12 @@ def _hash(value):
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def _number(value):
+def _number(value, precision=12):
     number = float(value)
     if not math.isfinite(number):
         raise ValueError("IR cannot represent a non-finite number")
+    if precision is not None:
+        number = round(number, precision)
     return 0.0 if number == 0 else number
 
 
@@ -48,11 +50,11 @@ def _quaternion(rotation):
         quaternion = [-number for number in quaternion]
     # FreeCAD normalizes rotations on restore, which can move a component one
     # ulp. This declared precision makes those persistence artifacts stable.
-    return [_number(round(number, 14)) for number in quaternion]
+    return [_number(number) for number in quaternion]
 
 
-def _native_xml(obj, name):
-    """Lossless native persistence for complex inputs, excluding ZIP metadata."""
+def _native_xml(obj, name, *, precision=12):
+    """Native persistence normalized at declared precision, excluding cache identities."""
     with zipfile.ZipFile(io.BytesIO(obj.dumpPropertyContent(name, 0))) as archive:
         blobs = {member: hashlib.sha256(archive.read(member)).hexdigest()
                  for member in archive.namelist() if member != "Persistence.xml"}
@@ -63,12 +65,23 @@ def _native_xml(obj, name):
             if re.fullmatch(r"[-+]?\d+", value):
                 return int(value)
             if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", value):
-                return _number(value)
+                return _number(value, precision)
             return value
 
         def element(node):
             # These sketch constraint attributes only place/show dimension labels.
             excluded = {"LabelDistance", "LabelPosition", "IsVisible"} if node.tag == "Constrain" else set()
+            # The resolved ExternalGeometry links already encode these dependencies.
+            # Cached projection Ref strings contain document-local element-map hashes
+            # that FreeCAD rewrites while copying/saving, without changing geometry.
+            if name == "ExternalGeo" and obj.isDerivedFrom("Sketcher::SketchObject"):
+                if node.tag == "Geometry":
+                    excluded = excluded | {"ref", "refIndex"}
+                if node.tag == "GeoExtension" and node.attrib.get("type") == "Sketcher::ExternalGeometryExtension":
+                    # Older projections omit the cache index; copying writes it
+                    # explicitly. ExternalGeometry's ordered resolved links encode
+                    # the dependencies. Preserve projection order, flags and geometry.
+                    excluded = excluded | {"Ref", "RefIndex"}
             return {"tag": node.tag,
                     "attributes": {key: attribute(value) for key, value in node.attrib.items()
                                    if key not in excluded},
@@ -216,7 +229,8 @@ def compile_document(doc, target=None):
     output_hashes = ([hashes[obj.Name] for obj in roots if obj.Name not in consumed]
                      if target is None else [hashes[target]])
     definition = {"format": "anthracite.feature-ir", "version": 1,
-                  "normalization": {"rotationDecimalPlaces": 14},
+                  "normalization": {"rotationDecimalPlaces": 12, "numberDecimalPlaces": 12,
+                                    "externalProjectionReferences": "resolved native links"},
                   "units": ["mm", "kg", "s", "A", "K", "mol", "cd", "rad"],
                   "roots": sorted(output_hashes), "nodes": nodes,
                   "instances": sorted(hashes.values())}

@@ -204,7 +204,7 @@ def present(result: dict, shots: list[Path]) -> dict:
 _COMPACT_OBSERVATION = ("document", "workbench", "selection", "created", "deleted", "objectCount")
 _COMPACT_CHANGE = ("name", "label", "type", "parameterChanges")
 _COMPACT_RESULT = ("ok", "revision", "revisionBefore", "rolledBack", "requiresInspection",
-                   "conflict", "notExecuted", "error", "result", "stdout", "stderr",
+                   "conflict", "notExecuted", "error", "result", "events", "stdout", "stderr",
                    "verification", "interveningChanges", "nextActions", "createdDocument",
                    "pendingTransaction", "shots")
 

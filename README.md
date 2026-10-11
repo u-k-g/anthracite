@@ -101,10 +101,12 @@ lookup map outside the hash. Document/object names, creation order, labels, visi
 and cached computed shapes do not determine identity.
 
 Quantities use mm/kg/s/A/K/mol/cd/rad bases, quaternion signs are normalized, negative
-zero becomes zero, and JSON keys are sorted. Scalar inputs retain their finite
-round-trip precision. Quaternion components use **14 decimal places**, declared in
-the schema, to absorb FreeCAD's one-ulp rotation normalization on file restore. This
-is a quantized rotation identity, not exact floating-point identity. The authoritative
+zero becomes zero, and JSON keys are sorted. Numbers use **12 decimal places** in
+native base units, declared in the schema, to absorb last-bit solver and rotation
+normalization on native copy/restore. This is a quantized input identity, not exact
+floating-point identity. Cached external-sketch projection IDs are excluded; resolved
+external links, projected geometry and projection flags remain in the definition.
+The authoritative
 attachment engine type is retained; its derived UI selector is excluded. Expression whitespace
 is normalized with token boundaries and string literals preserved; algebraic
 equivalence is not inferred. Complex native inputs use normalized persistence XML and
@@ -151,7 +153,13 @@ features in the sketch's Body. Use native attachment APIs for datum-plane attach
 the helpers do not guess support faces. They return native objects for further edits.
 
 `cad.parameters('Pad')` discovers native inputs. `cad.parameters()` lists declared
-names, bindings, current values, units, bounds, expressions, and independence.
+names, bindings, current values, units, declared bounds, native bounds, expressions,
+and independence. `App::PropertyLength` cannot be negative; use native
+`App::PropertyDistance` for signed offsets. Bounds outside a known native range are
+rejected, and a whole batch is preflighted before assigning any input. A `None` native
+limit means unknown: FreeCAD's constrained scalar properties do not expose their
+runtime min/max through public Python APIs. Native clamping is still detected and
+the action rolled back.
 Declarations persist as an `AnthraciteParameters` string property on the bound
 object. Values and expressions live exclusively in native properties and
 ExpressionEngine. Object label changes and constraint index changes preserve named
@@ -173,6 +181,21 @@ values; a violation rolls back the action. Direct GUI edits remain native FreeCA
 edits, and inspection reads their current values. Geometry changes receive the same
 automatic viewport PNG feedback as other checked edits.
 
+For larger parts, use a separate native parameter group and keep dependent dimensions
+in expressions; a child sketch referencing its containing Body can create a dependency
+cycle. `cad.guide('design-intent')`, `cad.guide('profiles')`, `cad.guide('arcs')`, and
+`cad.guide('engineering')` provide native recipes and checks. Prefer a coherent base
+outline and shared manufacturing features over accumulating copied solids. Test
+individual knobs and a coupled edit, checked undo/redo, then save/reopen/edit.
+`cad.editability('BodyName')` audits only that Body and its dependencies; the score is
+a heuristic and does not replace these tests.
+
+`cad.bodies()` gives a concise orientation view. `cad.api(kind='helpers', query='render')`
+lists actual helper signatures and documentation. `cad.emit('label', data)` writes
+to `events`; a standalone read helper returns its value in `result`. Compact CLI output
+includes events. Use `--select ok,result,events,verification,shots --print-stdout` when
+printing text to avoid also dumping its JSON-contained stdout.
+
 ### Geometry selection and isolated candidates
 
 `cad.select_geometry('Pad', surface='Plane', where={'centerOfMass_mm': [15, 6, 3]},
@@ -184,6 +207,13 @@ and are signed analytic directions, not oriented outward face normals. `toleranc
 is an absolute scalar/component-distance tolerance in each queried fact's units.
 Without `unique=True`, all matching candidates are paged. A unique query errors on
 zero or multiple matches rather than choosing an arbitrary face.
+
+For an edge, `cad.measure(reference)` includes `length_mm`. Measuring two linear
+edges also reports angle, parallelism and `lineSeparation_mm`, the perpendicular
+distance between their infinite supporting lines. `distance_mm` remains the closest
+distance between the finite edges. Distinguish perpendicular strip width, angled end
+span and material thickness when checking a design. `isometric` is accepted as an
+alias for the `axonometric` render view.
 
 ```python
 cad.evaluate({'width': '30 mm', 'height': '12 mm'}, target='Pad', checks=[
@@ -200,8 +230,17 @@ evaluation request completed; inspect the candidate result before applying it.
 Headless candidates have no viewport images. Apply an accepted candidate with
 `cad.set_parameters(...)` to obtain GUI feedback.
 
-The source document's properties, geometry, topology maps, revision and undo history
-are retained. Only self-contained native documents supported by the IR can be
+The source document's native inputs, full BRep geometry, revision and undo history
+are checked after copying, including failures. FreeCAD may rewrite external-sketch
+projection cache IDs; those are compared through resolved links and normalized
+geometry rather than document-local IDs. Checked undo uses the same narrow sketch
+normalization, with a pairwise absolute 1e-12 bound on sketch solver floats when a
+rounding boundary differs. Sketch structure, flags, constraints and resolved links
+remain checked. Full BRep records are compared at 14 decimal places to handle OCCT's
+last-bit direction-vector normalization on restore; derived bounds/area/volume summaries
+do not override that full-geometry check. Those summaries alone never establish
+restoration. Only self-contained native documents
+supported by the IR can be
 evaluated: Python features, external files and cross-document links fail explicitly.
 Finish any open native transaction first. The worker is synchronous; FreeCAD's GUI
 waits while it runs. `timeout` defaults to 60 seconds (range 1–300); the separate

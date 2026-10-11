@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 """Authoring API boundary cases and isolated-worker failures in stock FreeCAD."""
 import base64
+import io
 import json
 import math
 import os
@@ -8,6 +9,9 @@ from pathlib import Path
 import tempfile
 import traceback
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
+from unittest.mock import patch
 
 import FreeCAD as App
 import AnthraciteExecutor as Executor
@@ -201,7 +205,7 @@ cad.declare_parameter('angle',s,constraint='Angle',unit='deg',bounds=[0,180])
         response = self.edit("cad.assert_valid()\ncad.emit('found',[x.Name for x in cad.find(type_id='PartDesign::Pad')])\n_result=[x.Name for x in cad.find(name='Pad')]")
         self.assertEqual(response['events'][0]['value'], ['Pad'])
         self.assertEqual(response['result'], ['Pad'])
-        for kind in ('modules', 'workbenches', 'commands', 'types'):
+        for kind in ('modules', 'workbenches', 'commands', 'types', 'helpers'):
             gui_only = kind in ('workbenches', 'commands') and not App.GuiUp
             result = self.call("cad.api(kind=" + repr(kind) + ",limit=5)", not gui_only)
             if gui_only:
@@ -210,6 +214,13 @@ cad.declare_parameter('angle',s,constraint='Angle',unit='deg',bounds=[0,180])
             self.assertIsInstance(result['result'], dict)
         self.call("cad.guide('authoring')")
         self.call("cad.guide('parameters')")
+        for topic in ('design-intent', 'profiles', 'arcs', 'engineering'):
+            self.call("cad.guide(" + repr(topic) + ")")
+        helper = self.call("cad.api(kind='helpers',query='render_views')")['result']['helpers'][0]
+        self.assertEqual(helper['name'], 'render_views')
+        self.assertIn('width', helper['signature'])
+        bodies = self.call("cad.bodies()")['result']['bodies']
+        self.assertEqual((bodies[0]['name'], bodies[0]['tip']), ('Body', 'Pad'))
         reference = self.call("cad.topology('Pad',limit=1)")['result']['items'][0]['reference']
         self.edit("_result=cad.resolve_ref(" + repr(reference) + ").ShapeType")
         if not App.GuiUp:
@@ -230,12 +241,157 @@ cad.declare_parameter('angle',s,constraint='Angle',unit='deg',bounds=[0,180])
         before = Executor._document_snapshot(self.doc)
         for code, count in [("cad.review('Sketch')", 1), ("cad.review('Pad')", 2),
                             ("cad.render_sketch('Sketch',width=640,height=400)", 1),
-                            ("cad.render_views(['front','top'],width=200,height=150)", 2)]:
+                            ("cad.render_views(['front','top'],width=200,height=150)", 2),
+                            ("cad.render_views(['isometric'],width=200,height=150)", 1)]:
             result = self.edit(code)
             self.assertEqual(len(result['images']), count)
             for image in result['images']:
                 self.assertTrue(base64.b64decode(image.split(',', 1)[1]).startswith(b'\x89PNG\r\n\x1a\n'))
             self.assertEqual(Executor._document_snapshot(self.doc), before)
+
+    def test_native_limits_and_signed_offsets(self):
+        self.fixture()
+        self.unchanged_failure("cad.declare_parameter('negative','Box',property='Length',bounds=[-5,20])")
+        self.edit("""inputs=doc.addObject('App::DocumentObjectGroup','Inputs')
+inputs.addProperty('App::PropertyDistance','Offset')
+inputs.Offset=-10
+inputs.addProperty('App::PropertyFloatConstraint','Limited')
+inputs.Limited=(5,0,10,1)
+cad.declare_parameter('offset',inputs,property='Offset',bounds=[-20,0])
+cad.declare_parameter('limited',inputs,property='Limited')
+""")
+        entries = {e['name']: e for e in self.call('cad.parameters()')['result']['entries']}
+        self.assertEqual(entries['length']['nativeBounds'], [0, None])
+        self.assertEqual(entries['limited']['nativeBounds'], [None, None])
+        self.unchanged_failure("cad.set_parameters({'length':12,'limited':11})")
+        self.assertEqual(self.doc.Box.Length.Value, 10)
+        self.edit("cad.set_parameters({'offset':-15,'limited':8})")
+        self.assertEqual(self.doc.Inputs.Offset.Value, -15)
+
+    def test_perpendicular_width_and_scoped_audit(self):
+        self.edit("""s=doc.addObject('Sketcher::SketchObject','Segments')
+s.addGeometry(Part.LineSegment(App.Vector(0,0,0),App.Vector(2,0,0)),False)
+s.addGeometry(Part.LineSegment(App.Vector(5,3,0),App.Vector(7,3,0)),False)
+s.addGeometry(Part.LineSegment(App.Vector(0,0,0),App.Vector(0,2,0)),False)
+body=doc.addObject('PartDesign::Body','Body')
+base=cad.rectangle_sketch(body,'Base',20,10)
+cad.pad(base,'BasePad',2)
+upper=cad.rectangle_sketch(body,'Upper',10,5,placement=App.Placement(App.Vector(0,0,2),App.Rotation()))
+cad.pad(upper,'UpperPad',3)
+third=cad.circle_sketch(body,'Third',2,placement=App.Placement(App.Vector(2,2,5),App.Rotation()))
+cad.pad(third,'ThirdPad',1)
+opaque=doc.addObject('Part::Feature','Opaque')
+opaque.Shape=Part.makeBox(1,1,1)
+""")
+        edges = self.call("cad.topology('Segments',kind='edges')")['result']['items']
+        horizontal = [item for item in edges if abs(item['direction'][0]) > 0.99]
+        a, b = [item['reference'] for item in horizontal]
+        c = next(item['reference'] for item in edges if abs(item['direction'][1]) > 0.99)
+        self.assertAlmostEqual(self.call('cad.measure(' + repr(a) + ')')['result']['length_mm'], 2)
+        measure = self.call('cad.measure(' + repr(a) + ',other=' + repr(b) + ')')['result']
+        self.assertTrue(measure['parallel'])
+        self.assertAlmostEqual(measure['lineSeparation_mm'], 3)
+        self.assertGreater(measure['distance_mm'], 3)
+        angled = self.call('cad.measure(' + repr(a) + ',other=' + repr(c) + ')')['result']
+        self.assertIsNone(angled['lineSeparation_mm'])
+        scoped = self.call("cad.editability('Body')")['result']
+        codes = {f['code'] for f in scoped['findings']}
+        self.assertNotIn('opaque-solid', codes)
+        self.assertNotIn('pattern-as-copies', codes)
+        self.assertIn('opaque-solid', {f['code'] for f in self.call('cad.editability()')['result']['findings']})
+
+    def test_expression_sketch_history_and_copy_identity(self):
+        self.edit("""inputs=doc.addObject('App::DocumentObjectGroup','Inputs')
+inputs.addProperty('App::PropertyLength','Width')
+inputs.addProperty('App::PropertyLength','Depth')
+inputs.addProperty('App::PropertyFloat','Slope')
+inputs.Width=22.217
+inputs.Depth=46.9
+inputs.setExpression('Slope','Width / Depth')
+body=doc.addObject('PartDesign::Body','Body')
+s=cad.rectangle_sketch(body,'Sketch',20,10)
+s.setExpression('Constraints.Width','Inputs.Width')
+s.setExpression('Constraints.Height','Inputs.Depth')
+cad.pad(s,'Pad',2)
+doc.recompute()
+external=body.newObject('Sketcher::SketchObject','External')
+external.addExternal('Pad','Edge1')
+external.addExternal('Pad','Edge3')
+cad.declare_parameter('width',inputs,property='Width',bounds=[10,40])
+cad.declare_parameter('depth',inputs,property='Depth',bounds=[20,60])
+""")
+        # Older native files omit projection cache indices. Reproduce that native
+        # persistence here so copying must preserve identity for multiple links.
+        original = self.doc.External.dumpPropertyContent('ExternalGeo', 0)
+        rewritten = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original)) as source, zipfile.ZipFile(rewritten, 'w') as output:
+            for member in source.namelist():
+                data = source.read(member)
+                if member == 'Persistence.xml':
+                    tree = ET.fromstring(data)
+                    for node in tree.iter():
+                        node.attrib.pop('refIndex', None)
+                        node.attrib.pop('RefIndex', None)
+                    data = ET.tostring(tree)
+                output.writestr(member, data)
+        self.doc.External.restorePropertyContent('ExternalGeo', rewritten.getvalue())
+        self.doc.recompute()
+        self.doc.commitTransaction()
+        baseline = AnthraciteIR.compile_document(self.doc)['definitionHash']
+        before = Executor._document_snapshot(self.doc)
+        edited = self.edit("cad.set_parameters({'width':23.781,'depth':49.33})")
+        undone = self.call(f"cad.undo(action={edited['action']['id']!r},revision={edited['revision']})")
+        import AnthraciteHistory
+        self.assertTrue(AnthraciteHistory.equivalent(before, Executor._document_snapshot(self.doc))[0])
+        self.assertEqual(AnthraciteIR.compile_document(self.doc)['definitionHash'], baseline)
+        self.call(f"cad.redo(action={edited['action']['id']!r},revision={undone['revision']})")
+        snapshot = Executor._document_snapshot(self.doc)
+        revision = Executor._revisions[self.doc.Name]
+        projection = AnthraciteIR._native_xml(self.doc.External, 'ExternalGeo')
+        candidate = self.call("cad.evaluate({'width':24},target='Pad')")['result']
+        if not candidate['ok']:
+            after = Executor._document_snapshot(self.doc)
+            differences = [(name, prop, old, after[name]['properties'][prop])
+                           for name, item in snapshot.items() for prop, old in item['properties'].items()
+                           if old != after[name]['properties'][prop]]
+            Path(os.environ.get('FREECAD_USER_HOME', tempfile.gettempdir()), 'evaluation-source-differences.json').write_text(json.dumps(differences, indent=2))
+            Path(os.environ.get('FREECAD_USER_HOME', tempfile.gettempdir()), 'evaluation-projection-differences.json').write_text(json.dumps([projection, AnthraciteIR._native_xml(self.doc.External, 'ExternalGeo')], indent=2))
+        self.assertTrue(candidate['ok'], candidate)
+        self.assertTrue(AnthraciteHistory.equivalent(snapshot, Executor._document_snapshot(self.doc))[0])
+        self.assertEqual(Executor._revisions[self.doc.Name], revision)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'copy.FCStd')
+            definition = AnthraciteIR.compile_document(self.doc)['definitionHash']
+            self.doc.saveCopy(path)
+            reopened = App.openDocument(path)
+            try:
+                reopened.recompute()
+                self.assertEqual(AnthraciteIR.compile_document(reopened)['definitionHash'], definition)
+                reopened.External.delExternal(0)
+                reopened.External.addExternal('Pad','Edge2')
+                reopened.recompute()
+                self.assertNotEqual(AnthraciteIR.compile_document(reopened)['definitionHash'], definition)
+            finally:
+                App.closeDocument(reopened.Name)
+                App.setActiveDocument(self.doc.Name)
+
+    def test_evaluation_source_guard_even_on_error(self):
+        self.fixture()
+        import AnthraciteEvaluate
+        before = Executor._revisions[self.doc.Name]
+        def corrupt(*args, **kwargs):
+            self.doc.Box.Length = 12
+            self.doc.recompute()
+            raise ValueError('Worker failed after a source mutation')
+        with patch.object(AnthraciteEvaluate, 'evaluate', corrupt):
+            failed = self.call('cad.evaluate({})', False)
+        self.assertIn('inspect the document', failed['error']['message'])
+        self.assertEqual(failed['error']['type'], 'SourceChanged')
+        self.assertTrue(failed['requiresInspection'])
+        self.assertFalse(failed.get('notExecuted', False))
+        self.assertEqual(failed['revision'], Executor._revisions[self.doc.Name])
+        self.assertGreater(Executor._revisions[self.doc.Name], before)
+        self.assertNotIn(self.doc.Name, Executor._executing_docs)
 
 
 try:

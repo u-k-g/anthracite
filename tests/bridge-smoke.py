@@ -99,8 +99,9 @@ def main():
     reference = os.path.join(reference_directory.name, 'bridge-reference.brep')
     document.getObject('BridgeBox').Shape.exportBrep(reference)
     compare_code = f'cad.compare({reference!r}, "BridgeBox", samples=128, starts=8)'
+    events_code = "cad.feedback(images=False)\ncad.emit('probe', {'part':'Box'})"
     previous_revision = None
-    for code in ['doc.addObject("Part::Box", "Box")', program, 'cad.ir()', 'cad.model_hash()', compare_code]:
+    for code in ['doc.addObject("Part::Box", "Box")', program, events_code, 'cad.ir()', 'cad.model_hash()', compare_code]:
         child = subprocess.Popen([interpreter, cli, "exec", code],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
@@ -119,6 +120,10 @@ def main():
         assert payload["ok"] is True, payload
         assert "images" not in payload, "the CLI must not print base64 images"
         shots = payload.get("shots") or []
+        if code == events_code:
+            assert payload['events'] == [{'label': 'probe', 'value': {'part': 'Box'}}], payload
+            assert not shots, payload
+            continue
         if code == 'cad.ir()':
             definition_hash = payload["result"]["definitionHash"]
             assert not shots, payload

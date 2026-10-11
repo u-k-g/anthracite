@@ -2,6 +2,7 @@
 """Guards around FreeCAD's native undo stack and non-destructive document checkpoints."""
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -51,18 +52,22 @@ def forget(doc):
 
 
 def shape_digest(shape):
-    """Hash full native BRep text, normalizing Checked flags and signed zero.
+    """Hash full native BRep text at 14 decimal places, normalizing Checked flags.
 
     OCCT's BRep specification defines the third bit of the seven-bit shape flag
     word as Checked. Require the following subshape record to avoid matching
-    numeric geometry data. Signed zero is numerically identical to zero; all
-    geometry, tolerances and other flags stay exact.
+    numeric geometry data. OCCT renormalizes direction vectors by an ulp when
+    restoring native BRep bytes. Normalize floating tokens at a precision far
+    below kernel tolerance; retain every geometry record, tolerance and other
+    flag. This is not a comparison of rounded bounds or volume summaries.
     https://github.com/Open-Cascade-SAS/OCCT/wiki/brep_format
     """
     text = shape.exportBrepToString()
     text = re.sub(r"(?m)^([01]{2})[01]([01]{4})(\r?\n)(?=[+\-ie*])",
                   r"\g<1>0\g<2>\g<3>", text)
     text = re.sub(r"(?<!\S)-0(?=\s|$)", "0", text)
+    text = re.sub(r"(?<!\S)[+-]?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+)(?:[eE][+-]?\d+)?(?=\s|$)",
+                  lambda match: format(round(float(match.group()), 14) or 0.0, '.14f').rstrip('0').rstrip('.'), text)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -129,14 +134,33 @@ def guard(doc, direction, action, expected_revision, revision, snapshot):
     return entry
 
 
+def _geometry_equivalent(before, after):
+    """Full sketch persistence, with a 1e-12 absolute bound on solver float drift.
+
+    Pairwise comparison avoids rounding-boundary failures in a quantized digest.
+    Integers, geometry modes, dependency order, blobs and all structure stay exact.
+    """
+    if isinstance(before, float) and isinstance(after, float):
+        return math.isclose(before, after, rel_tol=0, abs_tol=1e-12)
+    if type(before) is not type(after):
+        return False
+    if isinstance(before, dict):
+        return before.keys() == after.keys() and all(_geometry_equivalent(v, after[k]) for k, v in before.items())
+    if isinstance(before, list):
+        return len(before) == len(after) and all(_geometry_equivalent(a, b) for a, b in zip(before, after))
+    return before == after
+
+
 def equivalent(expected, actual):
-    """Exact inputs/BRep comparison, with explicit native cache exceptions.
+    """Persisted inputs/BRep comparison, with explicit native cache exceptions.
 
     Native recompute can rewrite FreeCAD's *.Map.txt topology naming tables on undo.
     Topology maps/version and the OCCT Checked bit can change on recompute. Shape
-    binary differences require identical full text BRep digests excluding only
-    Checked and signed zero; property XML, values, other members and recompute
-    state still match. Tessellation-dependent summary bounds are not a guard.
+    binary differences require matching full text BRep digests at the declared
+    precision, excluding Checked; property XML, values, other members and recompute
+    state still match. Sketch geometry uses the IR's declared numeric precision
+    and resolved external links instead of document-local projection cache IDs.
+    Tessellation-dependent summary bounds are not a guard.
     Never use this to identify an old face/edge in the new revision.
     """
     remapped = []
@@ -144,12 +168,16 @@ def equivalent(expected, actual):
         return False, []
     for name, old in expected.items():
         new = actual[name]
-        # BoundBox can use viewport tessellation, which native shape restoration
-        # discards. Full BRep digests below check the actual geometry instead.
+        # Bounds can depend on tessellation; area/volume integrate renormalized
+        # curve directions and can drift by an ulp on restore. Compare full BRep
+        # records below, retaining validity and all topology counts here.
         def metadata(obj):
             result = {k: v for k, v in obj.items() if k != "properties"}
             if isinstance(result.get("shape"), dict):
-                result["shape"] = {k: v for k, v in result["shape"].items() if k != "bounds"}
+                derived = {"bounds"}
+                if obj["properties"].get("Shape", {}).get("geometryHash"):
+                    derived.update({"area", "volume"})
+                result["shape"] = {k: v for k, v in result["shape"].items() if k not in derived}
             return result
         if metadata(old) != metadata(new):
             return False, []
@@ -158,6 +186,20 @@ def equivalent(expected, actual):
         for prop, previous in old["properties"].items():
             current = new["properties"][prop]
             if previous == current:
+                continue
+            # Display floats can differ by an ulp even when FreeCAD's complete
+            # persisted property bytes are identical. The bytes are authoritative.
+            if (previous["type"] == current["type"]
+                    and previous["type"] in {"App::PropertyFloat", "App::PropertyFloatConstraint",
+                                             "App::PropertyLength", "App::PropertyDistance", "App::PropertyAngle"}
+                    and previous["sha256"] == current["sha256"]):
+                continue
+            if (previous["type"] == current["type"] == "Part::PropertyGeometryList"
+                    and previous.get("normalizedHash")
+                    and (previous["normalizedHash"] == current.get("normalizedHash")
+                         or (previous.get("nativeGeometry") is not None and current.get("nativeGeometry") is not None
+                             and _geometry_equivalent(previous["nativeGeometry"], current["nativeGeometry"])))):
+                remapped.append({"object": name, "property": prop})
                 continue
             if (prop == "_ElementMapVersion" and previous["type"] == current["type"]
                     == "App::PropertyString"):

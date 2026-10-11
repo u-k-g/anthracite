@@ -445,7 +445,18 @@ class ExecutorTest(unittest.TestCase):
         equivalent, _ = AnthraciteHistory.equivalent(before, AnthraciteExecutor._document_snapshot(self.doc))
         self.assertFalse(equivalent)
 
-    def test_history_brep_digest_ignores_only_checked_flags(self):
+    def test_sketch_history_float_drift_guard_preserves_structure(self):
+        same = AnthraciteHistory._geometry_equivalent
+        # Native solver coordinates can fall on opposite sides of a decimal
+        # rounding boundary even though their difference is below 1e-12 mm.
+        old = {'StartY': -33.798649165556476, 'flags': 0, 'points': [1.0, 2.0]}
+        drift = {'StartY': -33.798649165556554, 'flags': 0, 'points': [1.0, 2.0]}
+        self.assertTrue(same(old, drift))
+        self.assertFalse(same(old, {**drift, 'StartY': old['StartY'] + 1e-10}))
+        self.assertFalse(same(old, {**drift, 'flags': 1}))
+        self.assertFalse(same(old, {**drift, 'points': [2.0, 1.0]}))
+
+    def test_history_brep_digest_normalization_preserves_geometry_and_orientation(self):
         import Part
         import re
         shape = Part.makeBox(10, 12, 14)

@@ -146,7 +146,7 @@ def _surface_facts(shape):
     try:
         return _geometry_facts(shape.Surface)
     except Exception:
-        return {}
+        return _geometry_facts(shape.Curve) if shape.ShapeType == "Edge" else {}
 
 
 def measure(doc, target, revision, other=None):
@@ -171,12 +171,26 @@ def measure(doc, target, revision, other=None):
             dot = sum(a * b for a, b in zip(first_normal, second_normal))
             result["angleDeg"] = round(math.degrees(math.acos(max(-1.0, min(1.0, abs(dot))))), 6)
             result["parallel"] = abs(abs(dot) - 1.0) <= 1e-6
+        if (shape.ShapeType == second.ShapeType == "Edge"
+                and type(shape.Curve).__name__ == type(second.Curve).__name__ == "Line"):
+            direction = shape.Curve.Direction
+            direction.normalize()
+            other_direction = second.Curve.Direction
+            other_direction.normalize()
+            dot = max(-1.0, min(1.0, abs(direction.dot(other_direction))))
+            result["angleDeg"] = math.degrees(math.acos(dot))
+            result["parallel"] = abs(dot - 1) <= 1e-9
+            result["lineSeparation_mm"] = ((second.Vertexes[0].Point - shape.Vertexes[0].Point).cross(direction).Length
+                                            if result["parallel"] else None)
+            result["lineSeparationScope"] = "Infinite supporting lines; distance_mm remains finite-edge distance."
         result["note"] = "Zero distance alone does not distinguish touching from overlap. Null overlap volume means this check is unavailable for non-solids."
     else:
         b = shape.BoundBox
         result.update(valid=shape.isValid(), solids=len(shape.Solids), volume_mm3=shape.Volume,
                       area_mm2=shape.Area, size_mm=[b.XLength, b.YLength, b.ZLength])
         result.update(_surface_facts(shape))
+        if shape.ShapeType == "Edge":
+            result["length_mm"] = shape.Length
         center = _center_of_mass(shape)
         if center is not None:
             result["centerOfMass_mm"] = center
@@ -379,6 +393,15 @@ _EDITABLE_TEXT = {"App::PropertyString"}
 _EDITABLE_BOOL = {"App::PropertyBool"}
 _EDITABLE_ENUM = {"App::PropertyEnumeration"}
 _DIMENSION_CONSTRAINTS = {"Distance", "DistanceX", "DistanceY", "Radius", "Diameter", "Angle"}
+
+
+def native_bounds(obj, name):
+    """Known native numeric domains, in FreeCAD's native units."""
+    kind = obj.getTypeIdOfProperty(name)
+    # Constraint properties expose only their scalar value through public Python
+    # APIs; their runtime min/max are not serialized either. Unknown stays unknown,
+    # and the checked setter still detects native clamping and rolls back.
+    return [0.0, None] if kind == "App::PropertyLength" else [None, None]
 # Attachment, visibility, and derived bookkeeping are not design parameters.
 _SKIP_PROPERTIES = {
     "Visibility", "Label2", "ExpressionEngine", "MapMode", "MapPathParameter", "MapReversed",
@@ -429,6 +452,7 @@ def parameters(doc, target):
         if type_id in _EDITABLE_NUMBERS:
             entry.update({"kind": "number", "value": value(getattr(obj, name)),
                           "unit": _EDITABLE_NUMBERS[type_id],
+                          "nativeBounds": native_bounds(obj, name),
                           "integer": type_id in {"App::PropertyInteger", "App::PropertyIntegerConstraint"}})
         elif type_id in _EDITABLE_BOOL:
             entry.update({"kind": "bool", "value": bool(getattr(obj, name))})
@@ -622,6 +646,36 @@ def diagnostics(doc, objects=None):
 
 # Small native examples, returned on demand rather than injected in every prompt.
 GUIDES = {
+    "design-intent": {
+        "purpose": "Own independent fit/section dimensions once; derive geometry in native expressions before creating features.",
+        "code": "dimensions = doc.addObject('App::DocumentObjectGroup', 'DesignDimensions')\n"
+                "dimensions.addProperty('App::PropertyLength', 'Thickness', 'Section')\n"
+                "dimensions.Thickness = 2\n"
+                "dimensions.addProperty('App::PropertyDistance', 'JunctionOffset', 'Position')\n"
+                "dimensions.JunctionOffset = -10\n"
+                "cad.declare_parameter('thickness', dimensions, property='Thickness', unit='mm', bounds=[1,4])\n"
+                "doc.BasePad.setExpression('Length', 'DesignDimensions.Thickness')",
+        "checks": "Keep this parameter container independent of Bodies it drives; putting a Body inside it or referencing the containing Body from a child can create cycles. Length is nonnegative; Distance is signed. Expose meaningful inputs, not independently duplicated vertex coordinates. Plan the native feature tree and relationships first."},
+    "profiles": {
+        "purpose": "Use one coherent constrained outline and shared feature profiles instead of accumulating copied trees.",
+        "code": "sketch = body.newObject('Sketcher::SketchObject', 'Outline')\n"
+                "a = sketch.addGeometry(Part.LineSegment(App.Vector(0,0,0), App.Vector(20,0,0)), False)\n"
+                "b = sketch.addGeometry(Part.LineSegment(App.Vector(20,0,0), App.Vector(20,10,0)), False)\n"
+                "sketch.addConstraint(Sketcher.Constraint('Coincident', a, 2, b, 1))\n"
+                "sketch.addConstraint(Sketcher.Constraint('Horizontal', a))\n"
+                "sketch.addConstraint(Sketcher.Constraint('Vertical', b))",
+        "checks": "This is an open-profile fragment: close and dimension the remaining geometry before padding. Use dimensional/coincidence/tangency constraints and expressions, not Block/Frozen geometry. Multiple closed profiles can share one Pad when they join its existing base into one solid. Use a pattern for genuine repeated placement, not merely because several operations are Pads. Intersect joining outlines deliberately; fixed axis spans do not preserve perpendicular strip width when angles change."},
+    "arcs": {
+        "purpose": "Keep a parameter-sensitive junction radius in the driving sketch instead of a fragile generated-edge fillet when practical.",
+        "code": "import math\n"
+                "circle = Part.Circle(App.Vector(0,0,0), App.Vector(0,0,1), 2)\n"
+                "arc = sketch.addGeometry(Part.ArcOfCircle(circle, 0, math.pi/2), False)\n"
+                "radius = sketch.addConstraint(Sketcher.Constraint('Radius', arc, 2))\n"
+                "sketch.renameConstraint(radius, 'JunctionRadius')",
+        "checks": "Use explicit positive-normal arcs. Native arc start/end positions can differ from a negative-normal Part.Arc construction. Connect the actual endpoints, constrain the radius and tangency/position, check the intended sweep and zero DoF, then perturb dependent dimensions. Generated-edge dress-ups are appropriate when intent demands them; verify their references survive representative edits."},
+    "engineering": {
+        "purpose": "Test design intent and native editability beyond a successful recompute or heuristic score.",
+        "checks": "Preserve the original in variant work. Check fit gaps, matching interfaces, perpendicular widths, material thickness, contour continuity and intended radius/tangency against requirements. Perturb every independent dimension and a coupled batch on isolated candidates; test native undo/redo and save/reopen with another edit. Inspect result.ok and accepted from cad.evaluate; copy/hash refusal is not a passed candidate. Bounds alone do not prove every parameter combination works. Do not claim strength or fatigue from geometric checks."},
     "authoring": {
         "purpose": "Create native constrained profiles and features with persistent named inputs.",
         "code": "body = doc.addObject('PartDesign::Body', 'Body')\n"
@@ -688,17 +742,18 @@ def _has_solid(obj):
 
 def _numeric_dimensions(obj):
     values = []
+    expressions = _expressions(obj)
     for name in obj.PropertiesList:
-        if name.startswith("_") or name in _SKIP_PROPERTIES:
+        if name.startswith("_") or name in _SKIP_PROPERTIES or name in expressions:
             continue
         try:
-            if obj.getTypeIdOfProperty(name) not in _EDITABLE_NUMBERS:
+            if obj.getTypeIdOfProperty(name) not in {"App::PropertyLength", "App::PropertyDistance", "App::PropertyAngle"}:
                 continue
             current = getattr(obj, name)
         except Exception:
             continue
-        if isinstance(current, (int, float)) and not isinstance(current, bool):
-            values.append((name, float(current)))
+        if isinstance(current, App.Units.Quantity):
+            values.append((name, float(current.Value)))
     return values
 
 
@@ -712,7 +767,7 @@ def _single_circle_sketch(profile):
         return False
 
 
-def editability(doc):
+def editability(doc, target=None):
     """Audit how parametric the native feature tree is: the E half of a G/E verdict.
 
     Flags the patterns that quietly turn a design into a frozen copy: opaque solids,
@@ -721,7 +776,8 @@ def editability(doc):
     held by blocks instead of dimensions. Heuristic: it flags likely problems, not intent.
     """
     findings = []
-    objects = list(doc.Objects)
+    root = resolve(doc, target) if target is not None else None
+    objects = list(doc.Objects) if root is None else [root, *root.OutListRecursive]
 
     opaque = [o.Name for o in objects if o.TypeId in _OPAQUE_SOLID_TYPES and _has_solid(o)]
     if opaque:
@@ -739,10 +795,19 @@ def editability(doc):
         if any(o.isDerivedFrom("PartDesign::Transformed") for o in group):
             continue
         for type_id in _REPEATABLE_FEATURES:
-            names = [o.Name for o in group if o.TypeId == type_id]
-            if len(names) >= 2:
+            repeated = {}
+            for feature in [o for o in group if o.TypeId == type_id]:
+                profile = getattr(feature, "Profile", None)
+                profile = profile[0] if isinstance(profile, (list, tuple)) and profile else profile
+                if profile is None:
+                    continue
+                intent = (profile.Name, tuple((p, repr(value(getattr(feature, p))))
+                                             for p in ("Length", "Angle", "Reversed", "Midplane", "Direction")
+                                             if p in feature.PropertiesList))
+                repeated.setdefault(intent, []).append(feature.Name)
+            for names in [names for names in repeated.values() if len(names) >= 2]:
                 findings.append({"code": "pattern-as-copies", "severity": "warning", "objects": names,
-                                 "message": f"{len(names)} {type_id.split('::')[-1]} features repeat with no pattern; use a native pattern feature."})
+                                 "message": "Features reuse the same profile and extent. Confirm whether a native pattern expresses the intended repetition."})
 
     expression_users = [o for o in objects if getattr(o, "ExpressionEngine", None)]
     dimensioned = [o for o in objects if _numeric_dimensions(o)]
@@ -752,12 +817,13 @@ def editability(doc):
                          "message": "No expressions are used; bind related dimensions so one change propagates."})
     seen = {}
     for obj in dimensioned:
-        for _, current in _numeric_dimensions(obj):
-            if current in (0.0, 1.0):
+        for prop, current in _numeric_dimensions(obj):
+            if current in (-1.0, 0.0, 1.0):
                 continue
-            seen.setdefault(current, set()).add(obj.Name)
-    duplicates = [{"value": value, "objects": sorted(names)}
-                  for value, names in seen.items() if len(names) >= 2]
+            unit = _EDITABLE_NUMBERS[obj.getTypeIdOfProperty(prop)]
+            seen.setdefault((current, unit), set()).add(obj.Name)
+    duplicates = [{"value": number, "unit": unit, "objects": sorted(names)}
+                  for (number, unit), names in seen.items() if len(names) >= 2]
     if duplicates:
         findings.append({"code": "repeated-literal-dimensions", "severity": "warning",
                          "duplicates": duplicates[:20],
@@ -793,7 +859,8 @@ def editability(doc):
     verdict = "parametric" if score >= 0.8 else "mixed" if score >= 0.5 else "opaque"
     return {"document": doc.Name, "score": score, "verdict": verdict, "findings": findings,
             "expressionCount": len(expression_users),
-            "scope": "Heuristic editability audit; flags likely non-parametric patterns, not design intent."}
+            "target": root.Name if root is not None else None,
+            "scope": "Heuristic editability audit of the target dependency closure or whole document; parameter-change and persistence tests establish editability."}
 
 
 def _default_export_objects(doc):
