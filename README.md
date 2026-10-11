@@ -16,22 +16,24 @@ With Nushell and just installed, run from this checkout:
 just install
 ```
 
-This copies the addon to `~/.local/share/FreeCAD/Mod/Anthracite/`, symlinks its CLI into
-`~/.local/bin/anthracite`, and copies the agent skill into `~/.agents/skills/anthracite/`.
-Put `~/.local/bin` on PATH, then restart FreeCAD. For a different FreeCAD user-data
-location, use `just install '/absolute/path/to/FreeCAD/Mod/Anthracite'`. In FreeCAD's
-Python console, `App.getUserAppDataDir()` identifies the user-data directory.
-On macOS this may be `~/Library/Application Support/FreeCAD/v1-1/`; pass that directory's
-`Mod/Anthracite` path to `just install`.
+The installer finds FreeCAD, checks that it is version 1.0 or newer, and asks it for
+its user-data directory without opening the GUI. It copies the addon into that
+directory's `Mod/Anthracite/`, symlinks its CLI into `~/.local/bin/anthracite`, and copies
+the agent skill into `~/.agents/skills/anthracite/`. This also selects the correct
+version-specific directory on macOS automatically.
 
-For that macOS location, this command works in Nushell and zsh:
+Put `~/.local/bin` on PATH, then restart FreeCAD. On macOS the installer finds
+`/Applications/FreeCAD.app` or `~/Applications/FreeCAD.app`; elsewhere it finds FreeCAD
+on PATH. For a different installation or multiple installed versions, select the
+command-line executable with `FREECAD_CMD`. In zsh:
 
 ```sh
-just install '~/Library/Application Support/FreeCAD/v1-1/Mod/Anthracite'
+FREECAD_CMD='/path/to/freecadcmd' just install
 ```
 
-In Nushell, `$HOME` inside a quoted string is literal text. Use the `~/` path above
-or construct the path with `($env.HOME | path join ...)`.
+An explicit destination remains available: `just install '/absolute/path/to/Mod/Anthracite'`.
+This bypasses detection. In Nushell, `$HOME` inside a quoted string is literal text;
+use a `~/` path or construct the path with `($env.HOME | path join ...)`.
 
 For manual installation, copy or symlink this addon folder into your FreeCAD user
 `Mod/Anthracite` directory, symlink the bundled `anthracite` into `~/.local/bin/`, and
@@ -94,12 +96,15 @@ remain available independently.
 
 Click the latest-message preview in the status bar to show or hide the bottom console
 dock. Its compact navigation switches between FreeCAD's real **Console**, **Report**,
-and **Notifications**. Notification rows show the time received by the panel, severity,
-source, and selectable message text; **Copy selected** copies complete rows. The panel
+and **Notifications**, using the original compact side navigation. Notifications show
+the time received by the panel, severity, source, and selectable message text. Select
+text and copy it with the usual keyboard shortcut. The panel
 retains up to 1,000 messages for the current session.
 
-Workbench tabs keep the active label visible, collapse inactive labels, and reveal them
-on hover. Qt styling supplies compact toolbar spacing, status-bar styling, dimension
+Standard tools sit on the top left, with workbench tabs and the eyedropper to their
+right. Workbench-specific tools occupy the row below. Workbench tabs keep the
+active label visible; inactive tabs stay icon-only, including on hover. Qt styling
+and the Anthracite palette supply compact toolbar spacing, status-bar styling, dimension
 display widths, and selected-tab accents. These additions use Python and Qt with stock
 FreeCAD, independently of bridge startup.
 
@@ -133,3 +138,4 @@ Failed runs retain their profile and logs in `test-results/`.
 
 [LGPL-2.1-or-later](LICENSE), as in the original Anthracite sources. Existing source
 attribution and license notices are preserved.
+Bundled Iconoir icons retain their [MIT notice](Resources/icons/LICENSE-Iconoir).

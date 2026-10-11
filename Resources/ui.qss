@@ -1,15 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-QToolBar { spacing: 2px; padding: 1px; }
+QMainWindow, QMenuBar, QMenu, QToolBar, QDockWidget { background: palette(window); color: palette(window-text); }
+QToolBar { border: none; spacing: 4px; padding: 1px; }
 QToolBar::separator { width: 6px; height: 6px; }
 QToolBar QToolButton { padding: 3px; margin: 0px; }
-QStatusBar { padding: 0px 4px; min-height: 24px; border-top: 1px solid palette(mid); }
-QStatusBar::item { border: none; }
+QStatusBar { background: palette(window); padding: 0px 4px; min-height: 30px; border-top: 1px solid palette(mid); }
+QStatusBar::item { border: none; border-right: 1px solid palette(mid); }
 QStatusBar QPushButton { padding: 2px 6px; border: none; }
-QPushButton#AnthraciteConsolePreview { text-align: left; color: palette(text); }
-QPushButton#AnthraciteConsolePreview:hover,
-QPushButton#AnthraciteConsolePreview[consoleOpen="true"] { background: palette(alternate-base); }
-QTabBar#AnthraciteWorkbenchTabs::tab { min-width: 18px; padding: 4px 6px; margin: 0px; border: none; }
-QTabBar#AnthraciteWorkbenchTabs::tab:selected { background: palette(alternate-base); border-bottom: 2px solid #A06666; }
-QTabBar#AnthraciteWorkbenchTabs::tab:hover { background: palette(mid); }
-QWidget#AnthraciteConsoleNavigation QToolButton:checked { border-bottom: 2px solid #A06666; }
-QTreeWidget#AnthraciteNotifications { border: none; }
+QToolButton#AnthraciteConsolePreview { text-align: left; padding: 4px 8px; background: transparent; border: none; border-radius: 4px; }
+QToolButton#AnthraciteConsolePreview:hover,
+QToolButton#AnthraciteConsolePreview[consoleOpen="true"] { background: palette(mid); }
+QToolBar#AnthraciteTools { padding: 1px; }
+QTabBar#AnthraciteWorkbenchTabs::tab { background: palette(window); color: palette(window-text); min-width: 18px; padding: 4px 6px; margin: 0px; border: none; border-bottom: 2px solid transparent; font-weight: normal; }
+QTabBar#AnthraciteWorkbenchTabs::tab:selected { background: palette(window); border-bottom: 2px solid palette(highlight); }
+QTabBar#AnthraciteWorkbenchTabs::tab:hover { background: palette(alternate-base); }
+QWidget#AnthraciteConsoleNavigation { border-right: 1px solid palette(mid); }
+QWidget#AnthraciteConsoleNavigation QPushButton { text-align: left; padding: 6px; background: transparent; border: none; border-radius: 4px; }
+QWidget#AnthraciteConsoleNavigation QPushButton:hover { background: palette(alternate-base); }
+QWidget#AnthraciteConsoleNavigation QPushButton:checked { background: palette(highlight); color: palette(window-text); }
+QPlainTextEdit#AnthraciteNotifications { background: palette(window); color: palette(window-text); border: none; padding: 8px; }

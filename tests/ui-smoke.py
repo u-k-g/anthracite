@@ -28,6 +28,10 @@ try:
     # FreeCAD's Start page is opened by a later startup timer. Finish startup
     # before creating the document, as a user opening a model would do.
     QtTest.QTest.qWait(1500)
+    palette = QtWidgets.QApplication.instance().palette()
+    assert palette.color(QtGui.QPalette.Window).name() == "#080808"
+    assert palette.color(QtGui.QPalette.AlternateBase).name() == "#111111"
+    assert palette.color(QtGui.QPalette.Highlight).name() == "#a06666"
     document = App.newDocument("AnthraciteUiTest")
     box = document.addObject("Part::Box", "Box")
     document.recompute()
@@ -38,24 +42,49 @@ try:
         ui.refresh()
         assert ui.toolbar.isVisible(), "Global eyedropper disappeared with a workbench change"
         assert ui.pick_action.isEnabled()
+        assert ui.tabs.isVisible(), "Workbench selector was hidden in toolbar overflow"
+        assert ui.tabs.mapTo(ui.window, QtCore.QPoint()).x() > ui.window.width() * 0.4, "Workbench selector is not on the right"
+        assert not ui.toolbar.isMovable(), "Global navigation has a drag handle"
+        top_bars = [bar for bar in ui.window.findChildren(QtWidgets.QToolBar)
+                    if bar is not ui.toolbar and bar.isVisible()
+                    and ui.window.toolBarArea(bar) == QtCore.Qt.TopToolBarArea]
+        standard = {"File", "Edit", "Clipboard", "Workbench", "Macro", "View",
+                    "Individual Views", "Structure", "Help"}
+        common = [bar for bar in top_bars if bar.objectName() in standard]
+        specific = [bar for bar in top_bars if bar.objectName() not in standard]
+        assert common and specific, "Missing standard or workbench toolbars"
+        assert all(bar.y() == ui.toolbar.y() and bar.x() < ui.toolbar.x() for bar in common), "Standard tools are not on the top left beside the selector"
+        assert all(bar.y() >= ui.toolbar.y() + ui.toolbar.height() for bar in specific), "Workbench tools are not below the standard tools"
+        assert sum(ui.window.toolBarBreak(bar) for bar in top_bars) == 1, "Command rows have extra breaks"
+        assert all(bar.palette().color(QtGui.QPalette.Window).name() == "#080808" for bar in top_bars), "Native toolbars retained their gray Fusion palettes"
+        # QSS can keep an old gray brush even after QPalette reports the right
+        # color. Check the rendered surface, not just the preference/palette.
+        image = top_bars[0].grab().toImage()
+        assert image.pixelColor(image.width() // 2, 0).name() == "#080808", "Toolbar QSS cached a gray background"
     tabs = ui.tabs
     assert tabs.tabText(tabs.currentIndex()), "Selected workbench label is missing"
     inactive = next(i for i in range(tabs.count()) if i != tabs.currentIndex() and not tabs.tabIcon(i).isNull())
     assert not tabs.tabText(inactive), "Inactive labels were not collapsed"
+    QtTest.QTest.qWait(100)
+    width = tabs.tabRect(inactive).width()
     point = QtCore.QPointF(tabs.tabRect(inactive).center())
     QtWidgets.QApplication.sendEvent(tabs, QtGui.QMouseEvent(
         QtCore.QEvent.MouseMove, point, tabs.mapToGlobal(point.toPoint()),
         QtCore.Qt.NoButton, QtCore.Qt.NoButton, QtCore.Qt.NoModifier))
-    assert tabs.tabText(inactive) == tabs.tabData(inactive), "Hover did not reveal the label"
+    assert not tabs.tabText(inactive), "Hover revealed an inactive workbench name"
+    assert not tabs.tabToolTip(inactive), "Hover shows an inactive workbench tooltip"
+    assert tabs.tabRect(inactive).width() == width, "Hover resized an inactive tab"
     QtWidgets.QApplication.sendEvent(tabs, QtCore.QEvent(QtCore.QEvent.Leave))
     assert not tabs.tabText(inactive)
     QtTest.QTest.mouseClick(tabs, QtCore.Qt.LeftButton, pos=tabs.tabRect(inactive).center())
     assert tabs.currentIndex() == inactive and tabs.source.currentIndex() == inactive
+    assert tabs.tabText(inactive) == tabs.tabData(inactive), "Active workbench name is missing"
     Gui.activateWorkbench("PartWorkbench")
     QtTest.QTest.qWait(300)
 
     App.Console.PrintMessage("Latest console preview test\n")
-    wait_until(lambda: "Latest console preview test" in ui.preview.text(), "Preview did not follow native report output")
+    wait_until(lambda: "Latest console preview test" in ui.preview.toolTip(), "Preview did not follow native report output")
+    assert ui.preview.width() == 140, "Console preview expanded across the status bar"
     ui.dock.hide()
     QtTest.QTest.mouseClick(ui.preview, QtCore.Qt.LeftButton)
     assert ui.dock.isVisible()
@@ -68,25 +97,28 @@ try:
     del App.AnthraciteConsoleTest
     ui.show_page(2)
     assert ui.pages.currentIndex() == 2
+    assert ui.dock.titleBarWidget().height() == 0
+    sidebar = ui.dock.findChild(QtWidgets.QWidget, "AnthraciteConsoleNavigation")
+    assert sidebar.width() == 150 and sidebar.x() < ui.pages.x(), "Console navigation is not a compact side column"
+    assert ui.dock.palette().color(QtGui.QPalette.Window).name() == "#080808"
     App.Console.PrintNotification("UiTestSource", "Native user notice")
     App.Console.PrintUserWarning("UiTestSource", "Native user warning")
     App.Console.PrintUserError("UiTestSource", "Native user error")
-    wait_until(lambda: {ui.messages.topLevelItem(i).text(3) for i in range(ui.messages.topLevelItemCount())}
-               >= {"Native user notice", "Native user warning", "Native user error"},
+    wait_until(lambda: all(message in ui.messages.toPlainText() for message in
+                          ("Native user notice", "Native user warning", "Native user error")),
                "Native user notifications were not captured")
-    rows = [ui.messages.topLevelItem(i) for i in range(ui.messages.topLevelItemCount())]
-    for message, severity in [("Native user notice", "Info"), ("Native user warning", "Warning"), ("Native user error", "Error")]:
-        row = next(row for row in rows if row.text(3) == message)
-        assert row.text(1) == severity, (message, row.text(1))
-        assert row.text(2) == "UiTestSource"
-        assert QtCore.QTime.fromString(row.text(0), "HH:mm:ss").isValid()
-        row.setSelected(True)
-    ui.copy_messages()
+    lines = ui.messages.toPlainText().splitlines()
+    for message, severity in [("Native user notice", "Notification"), ("Native user warning", "Warning"), ("Native user error", "Error")]:
+        caption = lines[lines.index(message) - 1].split(" · ")
+        assert caption[1:] == [severity, "UiTestSource"]
+        assert QtCore.QTime.fromString(caption[0], "HH:mm:ss").isValid()
+    ui.messages.selectAll()
+    QtTest.QTest.keyClick(ui.messages, QtCore.Qt.Key_C, QtCore.Qt.ControlModifier)
     assert "UiTestSource" in QtWidgets.QApplication.clipboard().text()
     assert "Native user warning" in QtWidgets.QApplication.clipboard().text()
-    count = ui.messages.topLevelItemCount()
+    count = len(ui.notifications)
     QtTest.QTest.qWait(600)
-    assert ui.messages.topLevelItemCount() == count, "Polling duplicated messages"
+    assert len(ui.notifications) == count, "Polling duplicated messages"
     QtTest.QTest.mouseClick(ui.preview, QtCore.Qt.LeftButton)
     assert not ui.dock.isVisible()
 
@@ -128,6 +160,9 @@ try:
     assert ui.picker.callback is None, "Closing the document left picking active"
     assert QtWidgets.QApplication.overrideCursor() is None
     ui.show_page(2)
+    cursor = ui.messages.textCursor()
+    cursor.clearSelection()
+    ui.messages.setTextCursor(cursor)
     screenshot = Path(__file__).parents[1] / "test-results" / "interface.png"
     assert ui.window.grab().save(str(screenshot))
     os.write(1, b"ANTHRACITE_UI_SMOKE_OK\n")
