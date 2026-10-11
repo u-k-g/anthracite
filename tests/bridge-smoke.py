@@ -168,8 +168,76 @@ def main():
         elif code.startswith('cad.set_parameters'):
             assert payload.get('shots'), payload
 
+    def cli_call(arguments, input_text=None, expected_code=0):
+        child = subprocess.Popen([interpreter, cli, *arguments], stdin=subprocess.PIPE if input_text is not None else None,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if input_text is not None:
+            child.stdin.write(input_text)
+            child.stdin.close()
+            child.stdin = None
+        deadline = time.time() + 60
+        while child.poll() is None and time.time() < deadline:
+            application.processEvents()
+            time.sleep(.02)
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+            raise TimeoutError('CLI outcome uncertain; inspect retained profile')
+        stdout, stderr = child.communicate()
+        assert child.returncode == expected_code, stderr
+        return stdout, stderr
+
+    stdout, _ = cli_call(['status'])
+    assert json.loads(stdout)['document'] == document.Name
+    stdout, _ = cli_call(['log', '--limit', '5'])
+    assert document.Name in stdout and len(stdout.splitlines()) <= 5
+    stdout, _ = cli_call(['shots'])
+    assert stdout.splitlines() and all(os.path.isfile(path) for path in stdout.splitlines())
+    with tempfile.TemporaryDirectory() as directory:
+        program_path = os.path.join(directory, 'input.py')
+        output_path = os.path.join(directory, 'output.json')
+        with open(program_path, 'w') as handle:
+            handle.write("print('file input reached FreeCAD')\n_result=doc.Box.Width.Value")
+        stdout, stderr = cli_call(['exec', '--file', program_path, '--out', output_path, '--select', 'ok,result,stdout'])
+        assert not stdout.strip() and os.path.isfile(output_path)
+        with open(output_path) as handle:
+            result = json.load(handle)
+        assert result == {'ok': True, 'result': 12.0, 'stdout': 'file input reached FreeCAD\n'}, result
+        stdout, stderr = cli_call(['exec', '-', '--select', 'ok,result', '--print-stdout'],
+                                 "print('stdin input reached FreeCAD')\n_result=42")
+        assert json.loads(stdout) == {'ok': True, 'result': 42}
+        assert 'stdin input reached FreeCAD' in stderr
+    cli_call(['shots', '--clear'])
+    stdout, _ = cli_call(['shots'])
+    assert not stdout.strip()
+    stdout, _ = cli_call(['exec', "doc.Box.Width=20\nraise RuntimeError('Deliberate CLI failure')"], expected_code=1)
+    rejected = json.loads(stdout)
+    assert not rejected['ok'] and rejected['error']['message'] == 'Deliberate CLI failure'
+    assert abs(document.Box.Width.Value - 12) < 1e-9
+
+    # Disconnect after queueing but before GUI execution. Inspect the uncertain
+    # outcome; never replay. The queued action still commits exactly once.
+    abandoned = socket.create_connection((discovery['host'], discovery['port']), timeout=10)
+    abandoned.sendall((discovery['token'] + '\n' + json.dumps({'id': 99, 'type': 'execute', 'params': {
+        'code': "cad.feedback(images=False)\ndoc.addObject('Part::Box','OnceOnly')"}}) + '\n').encode())
+    deadline = time.time() + 10
+    while not AnthraciteBridge._bridge._queue and time.time() < deadline:
+        time.sleep(.01)
+    assert AnthraciteBridge._bridge._queue, 'Disconnected request never reached the execution queue'
+    abandoned.close()
+    deadline = time.time() + 10
+    while document.getObject('OnceOnly') is None and time.time() < deadline:
+        application.processEvents()
+        time.sleep(.02)
+    assert len(document.getObjectsByLabel('OnceOnly')) == 1
+    assert document.OnceOnly.Shape.isValid()
+    assert any(row.get('status') == 'committed' and 'OnceOnly' in row.get('code', '')
+               for row in AnthraciteBridge.recent(50)), AnthraciteBridge.recent(50)
+
     client.close()
     AnthraciteBridge.stop()
+    stdout, stderr = cli_call(['status'], expected_code=2)
+    assert not stdout.strip() and stderr.strip()
     App.closeDocument(document.Name)
     # Write straight to the pipe: FreeCAD buffers its Python stdout and only flushes it
     # during the Qt teardown that crashes on this platform.

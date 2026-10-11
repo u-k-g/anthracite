@@ -252,9 +252,11 @@ def select_geometry(doc, target, revision, *, kind="faces", surface=None, where=
     where = where or {}
     if set(where) - allowed:
         raise ValueError(f"Unknown geometry facts: {sorted(set(where) - allowed)}")
-    if isinstance(tolerance, bool) or not math.isfinite(tolerance) or tolerance < 0:
+    if not isinstance(unique, bool):
+        raise ValueError("unique must be a boolean")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or tolerance < 0:
         raise ValueError("tolerance must be finite and non-negative")
-    if not isinstance(offset, int) or offset < 0 or not isinstance(limit, int) or not 1 <= limit <= 100:
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("Use non-negative offset and limit 1..100")
     for key, wanted in where.items():
         vector = key in {"normal", "axis", "direction", "centerOfMass_mm", "axisPosition"}

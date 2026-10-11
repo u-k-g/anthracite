@@ -211,6 +211,13 @@ Set `FREECAD_CMD` if the command-line executable cannot be found beside FreeCAD.
 Canonical JSON remains the derived representation and FreeCAD remains the evaluator.
 Gradients, an evaluation cache, and an optimizer are not implemented here.
 
+`cad.export('/path/model.step')` writes detached world-space geometry without
+changing the document's cached BRep data. Supported formats are STEP, IGES, BREP,
+STL and OBJ; `format='step'` can select the format independently of the filename.
+Writes replace the destination after successful export. STL/OBJ are triangulated
+with 0.1 mm linear and 0.5 rad angular deflection, reported in `meshOptions`.
+Revision-bound geometry references are validated before exporting subelements.
+
 An edit executes on FreeCAD's GUI thread as one named native transaction, recomputes,
 validates, and commits or rolls back. The CLI returns JSON, including `ok`, revision tokens,
 diagnostics, and viewport PNG paths. After a timeout or lost connection, inspect the

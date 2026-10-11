@@ -952,7 +952,9 @@ class Cad:
 
     def export(self, path, objects=None, *, format=None):
         """Write geometry to a file: step, iges, brep, stl, or obj."""
-        return Inspect.export(self.doc, path, objects, format)
+        if isinstance(objects, dict) or (isinstance(objects, (list, tuple)) and any(isinstance(obj, dict) for obj in objects)):
+            self._reference_revision()
+        return Inspect.export(self.doc, path, objects, format, _revisions.get(self.doc.Name, 0))
 
     def compare(self, reference, target=None, **options):
         """Rigid reference scorer; defaults to visible terminal solids, including assemblies."""
@@ -997,7 +999,7 @@ class Cad:
     yield_transaction = undo
 
     def selected(self) -> list[Any]:
-        if Gui is None:
+        if Gui is None or not App.GuiUp:
             return []
         return list(Gui.Selection.getSelection())
 

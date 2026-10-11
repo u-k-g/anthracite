@@ -300,8 +300,8 @@ def command_exec(args) -> int:
     text = json.dumps(output, indent=2, ensure_ascii=False)
     if args.print_stdout:
         for stream in ("stdout", "stderr"):
-            if output.get(stream):
-                print(str(output[stream]), file=sys.stderr, end="")
+            if result.get(stream):
+                print(str(result[stream]), file=sys.stderr, end="")
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
         print(f"anthracite: wrote {args.out}", file=sys.stderr)

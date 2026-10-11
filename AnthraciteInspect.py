@@ -4,6 +4,7 @@ import FreeCAD as App
 import math
 import os
 import re
+import tempfile
 import uuid
 
 try:
@@ -397,7 +398,9 @@ def parameter_targets(doc):
 def _expressions(obj):
     result = {}
     for path, expression in (getattr(obj, "ExpressionEngine", None) or []):
-        result[str(path)] = str(expression)
+        # Native Sketcher emits relative paths such as .Constraints.Width;
+        # other features emit Length without the leading dot.
+        result[str(path).lstrip(".")] = str(expression)
     return result
 
 
@@ -804,7 +807,7 @@ def _default_export_objects(doc):
     return targets
 
 
-def export(doc, path, objects=None, format=None):
+def export(doc, path, objects=None, format=None, revision=0):
     """Write geometry to a file (step, iges, brep, stl, obj); returns the absolute path."""
     if Part is None:
         raise ValueError("Part is unavailable; cannot export geometry.")
@@ -822,12 +825,37 @@ def export(doc, path, objects=None, format=None):
     resolved = [resolve(doc, target) for target in targets]
     if not resolved:
         raise ValueError("Nothing to export.")
+    # OCCT exporters can change shared BRep caches. Export detached world-space
+    # shapes, and replace the destination only after a complete file was written.
+    shapes = [native_shape(doc, target, revision) for target in targets]
+    destination = os.path.abspath(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".anthracite-export-", suffix="." + extension,
+                                             dir=os.path.dirname(destination))
+    os.close(descriptor)
+    try:
+        if _EXPORT_FORMATS[extension] == "Mesh":
+            import Mesh
+            import MeshPart
+            mesh = Mesh.Mesh()
+            for shape in shapes:
+                mesh.addMesh(MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.1,
+                                                   AngularDeflection=0.5, Relative=False))
+            mesh.write(temporary)
+        else:
+            shape = shapes[0] if len(shapes) == 1 else Part.makeCompound(shapes)
+            method = {"step": "exportStep", "stp": "exportStep", "iges": "exportIges",
+                      "igs": "exportIges", "brep": "exportBrep"}[extension]
+            getattr(shape, method)(temporary)
+        if not os.path.isfile(temporary) or os.path.getsize(temporary) == 0:
+            raise RuntimeError("Native exporter did not write a complete file")
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    result = {"path": destination, "format": extension, "objects": [o.Name for o in resolved]}
     if _EXPORT_FORMATS[extension] == "Mesh":
-        import Mesh
-        Mesh.export(resolved, path)
-    else:
-        Part.export(resolved, path)
-    return {"path": os.path.abspath(path), "format": extension, "objects": [o.Name for o in resolved]}
+        result["meshOptions"] = {"linearDeflection_mm": 0.1, "angularDeflection_rad": 0.5}
+    return result
 
 
 def compare(doc, reference, target, revision, **options):
@@ -931,6 +959,8 @@ def api(doc, obj=None, query="", offset=0, limit=40, kind="types"):
     if kind == "types":
         available = doc.supportedTypes()
     elif kind in ("commands", "workbenches"):
+        if not App.GuiUp:
+            raise ValueError(f"{kind} discovery requires the FreeCAD GUI")
         import FreeCADGui
         available = FreeCADGui.listCommands() if kind == "commands" else FreeCADGui.listWorkbenches().keys()
     elif kind == "modules":
