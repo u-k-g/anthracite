@@ -192,6 +192,15 @@ def main():
         assert child.returncode == expected_code, stderr
         return stdout, stderr
 
+    stdout, _ = cli_call(['exec', "cad.measure('BridgeBox',axis='x',at='max')"])
+    assert abs(json.loads(stdout)['result']['extent_mm']-10) < 1e-6
+    stdout, _ = cli_call(['exec', "cad.declare_checks('BridgeDimensions',[{'object':'BridgeBox','axis':'x','at':'max','metric':'extent_mm','expected':10,'tolerance':0.01}])"])
+    assert json.loads(stdout)['verification'][0]['status'] == 'pass'
+    stdout, _ = cli_call(['exec', "cad.preview_checks('BridgeDimensions',view='top')", '--full'])
+    preview = json.loads(stdout)
+    assert preview['shots'] and os.path.isfile(preview['shots'][0]['path']), preview
+    assert preview['shots'][0]['annotations']['items'][0]['status'] == 'pass', preview
+    assert 'data:image' not in stdout
     stdout, _ = cli_call(['status'])
     assert json.loads(stdout)['document'] == document.Name
     stdout, _ = cli_call(['log', '--limit', '5'])

@@ -521,7 +521,7 @@ def _render_view(spec: dict[str, Any]) -> dict[str, Any]:
     try:
         with _visual_scene(active_view, spec):
             active_view.saveImage(path, spec["width"], spec["height"], "Current")
-            if any(spec.get(key) for key in ("labels", "axes", "dimensions", "references")):
+            if any(spec.get(key) for key in ("labels", "axes", "dimensions", "references", "measurements")):
                 spec = {**spec, "annotations": _annotate_view(path, active_view, spec)}
         with open(path, "rb") as image_file:
             image = image_file.read(_MAX_RENDER_BYTES + 1)
@@ -618,6 +618,39 @@ def _annotate_view(path, view, spec):
                 painter.fillRect(0, height - 22, width, 22, QtGui.QColor("white"))
                 painter.setPen(QtGui.QColor("black"))
                 painter.drawText(6, height - 6, text)
+        for index, request in enumerate(spec.get("measurements", [])):
+            measurements = Inspect.measure(doc, request["object"], revision, request.get("other"),
+                **{k: request[k] for k in ("axis", "at", "other_at", "frame") if k in request})
+            point = project(App.Vector(*measurements["anchorWorld_mm"]))
+            other = project(App.Vector(*measurements.get("otherAnchorWorld_mm", measurements["anchorWorld_mm"])))
+            metric = request.get("metric", "axisDistance_mm" if "other" in request else "extent_mm")
+            def label(target):
+                return f"{target['object']}.{target['subelement']}" if isinstance(target, dict) else str(target)
+            text = f"{label(request['object'])}: {measurements['axis'].upper()} {request.get('at', 'center')}"
+            if "other" in request:
+                text += f" → {label(request['other'])} {request.get('other_at', 'center')}"
+            text += f": {measurements[metric]:.5g} mm [{measurements['coordinateFrame']}]"
+            status = "preview"
+            if "expected" in request:
+                claim = {k: v for k, v in request.items() if k != "label"}
+                claim["metric"] = metric
+                status = Inspect.verify(doc, [claim], revision)["status"]
+                text += f"; expected {request['expected']} ± {request.get('tolerance')} ({status})"
+            y = height-48-index*24
+            painter.fillRect(4, y-16, min(width-8, len(text)*8+12), 23, QtGui.QColor(255, 255, 255, 230))
+            color = "#d32626" if status != "pass" and status != "preview" else "#007c83"
+            painter.setPen(QtGui.QPen(QtGui.QColor(color), 2))
+            line = measurements.get("dimensionLineWorld_mm", [measurements["anchorWorld_mm"]]*2)
+            line_start, line_end = [project(App.Vector(*p)) for p in line]
+            painter.drawLine(line_start, line_end)
+            painter.drawLine(other, line_end)
+            painter.drawEllipse(point, 4, 4)
+            painter.drawEllipse(other, 4, 4)
+            painter.drawLine(QtCore.QPointF(12, y-4), point)
+            painter.drawText(10, y, text)
+            annotations.append({"label": text, "status": status, "measurement": measurements,
+                                "pixels": [[point.x(), point.y()], [other.x(), other.y()]],
+                                "occlusion": "not tested; extent anchors are projected bounds-center anchors"})
     finally:
         painter.end()
     if not image.save(path, "PNG"):
@@ -903,10 +936,49 @@ class Cad:
     def resolve_ref(self, reference):
         return Inspect.native_shape(self.doc, reference, self._reference_revision())
 
-    def measure(self, obj, other=None):
+    def measure(self, obj, other=None, *, axis=None, at="center", other_at="center", frame="world"):
+        """Finite extents or signed axis distance; min/max/center anchors in world or a named object frame."""
         if isinstance(obj, dict) or isinstance(other, dict):
             self._reference_revision()
-        return Inspect.measure(self.doc, obj, _revisions.get(self.doc.Name, 0), other)
+        return Inspect.measure(self.doc, obj, _revisions.get(self.doc.Name, 0), other,
+                               axis=axis, at=at, other_at=other_at, frame=frame)
+
+    def declare_checks(self, name, checks):
+        """Save explicit requirements in native document properties; reports do not drive geometry."""
+        return Inspect.declare_checks(self.doc, name, checks, _revisions.get(self.doc.Name, 0))
+
+    def checks(self, name=None):
+        """Re-evaluate saved requirements without editing the document."""
+        return Inspect.saved_checks(self.doc, _revisions.get(self.doc.Name, 0), name)
+
+    def preview_measurement(self, obj, other=None, *, axis="x", at="max", other_at="max",
+                            frame="world", expected=None, tolerance=None, view="current", focus=None):
+        """Render explicit extent anchors with a measured value and optional requirement status; no model edit."""
+        measurement = self.measure(obj, other, axis=axis, at=at, other_at=other_at, frame=frame)
+        request = {"object": obj, "axis": axis, "at": at, "other_at": other_at, "frame": frame}
+        if other is not None:
+            request["other"] = other
+        if expected is not None:
+            request.update(expected=expected, tolerance=tolerance)
+            claim = {**request, "metric": "axisDistance_mm" if other is not None else "extent_mm"}
+            if Inspect.verify(self.doc, [claim], _revisions.get(self.doc.Name, 0))["status"] == "unverifiable":
+                raise ValueError("Preview requires a finite expected value and non-negative numeric tolerance.")
+        self.render(view=view, focus=focus, axes=True)
+        self.render_request["measurements"] = [request]
+        return measurement
+
+    def preview_checks(self, name, *, view="current", focus=None):
+        """Annotate up to eight saved axis requirements; highlight objects with failed checks."""
+        outcome = self.checks(name)
+        claims = outcome[0].get("claims", [])
+        requests = [{k: c[k] for k in ("object", "other", "axis", "at", "other_at", "frame", "expected", "tolerance", "metric") if k in c}
+                    for c in claims if c.get("axis") and c.get("metric") in ("extent_mm", "axisDistance_mm")]
+        if not requests or len(requests) > 8:
+            raise ValueError("Preview requires one to eight saved extent_mm/axisDistance_mm claims with explicit axes.")
+        failed = sorted({c["object"] for c in claims if c["status"] != "pass" and isinstance(c.get("object"), str)})
+        self.render(view=view, focus=focus, axes=True, highlight=failed)
+        self.render_request["measurements"] = requests
+        return outcome
 
     def parameters(self, obj=None):
         """Named declarations, or discover native inputs on a specified object."""
@@ -1187,7 +1259,7 @@ def context_json() -> str:
     })
 
 
-_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "bodies", "ir", "model_hash", "select_geometry", "evaluate"}
+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "bodies", "ir", "model_hash", "select_geometry", "evaluate", "checks"}
 _HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint", "yield_transaction"}
 
 
@@ -1297,6 +1369,7 @@ def _history_execute(doc, method, args, kwargs, revision):
         History.moved(doc, method, revision, after)
         return {"ok": True, "revisionBefore": revision - 1, "revision": revision,
                 "result": {"operation": method, "action": entry["id"], "label": entry["label"]},
+                "verification": Inspect.saved_checks(doc, revision),
                 "observation": _observation(doc, before, after),
                 "requiresInspection": bool(remapped), "topologyMappingsChanged": remapped,
                 "history": History.describe(doc, revision), "images": []}
@@ -1421,7 +1494,7 @@ def _execute_document_creation(source: str, progress=lambda stage: None) -> dict
     changed = before != after
     revision += int(changed)
     _revisions[name] = revision
-    verification = [Inspect.verify(document, checks, revision) for checks in cad.check_requests]
+    verification = [Inspect.verify(document, checks, revision) for checks in cad.check_requests] + Inspect.saved_checks(document, revision)
     observation = _observation(document, before, after)
     images = []
     specs = [cad.render_request] if cad.render_request is not None else cad.render_views_request
@@ -1536,6 +1609,8 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
                 # A read-only verify is sufficient on its own: surface the claims the
                 # same way a mutation does, so callers need no fake edit.
                 response["verification"] = [outcome]
+            elif method == "checks":
+                response["verification"] = outcome
             return response
         if doc.HasPendingTransaction:
             raise PendingTransaction(pending_transaction(doc))
@@ -1646,7 +1721,7 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
                                      and hasattr(doc.getObject(name), "Shape") and not doc.getObject(name).Shape.isNull()]
                 if not spec["highlight"]:
                     raise ValueError("No current changed geometry to highlight; make an edit or specify highlight explicitly.")
-        verification = [Inspect.verify(doc, checks, final_revision) for checks in cad.check_requests]
+        verification = [Inspect.verify(doc, checks, final_revision) for checks in cad.check_requests] + Inspect.saved_checks(doc, final_revision)
         progress("rendering")
         rendered = _render_views(
             specs

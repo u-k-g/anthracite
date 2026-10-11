@@ -246,6 +246,28 @@ other=b)` adds `distance_mm`, `angleDeg`, `parallel`, and `overlapVolume_mm3`. F
 `{'object': <face reference>, 'metric': 'radius_mm', 'expected': 5.0, 'tolerance': 1e-6}` — use it
 for datum planes, hole axes, and mating faces rather than only bounding boxes and volumes.
 
+For axis intent, use `cad.measure(a, other=b, axis='y', at='max', other_at='min')`.
+`axisDistance_mm` is signed second anchor minus first; it is not closest-point distance.
+`minX_mm`/`maxX_mm`/`spanX_mm` (and Y/Z) describe finite BRep bounds. `axisGap_mm`
+is second minimum minus first maximum; negative means overlapping projected intervals,
+not necessarily intersecting solids. `frame='world'` is the default; a native object name
+uses that object's rigid frame. State whether “right” means maximum X, a particular edge,
+or screen-right before modifying an ambiguous selection.
+
+Use `cad.preview_measurement(a, other=b, axis='x', at='max', other_at='max',
+expected=0, tolerance=0.01, view='top')` to draw the intended projected measurement.
+Inspect its PNG before editing when the interpretation is uncertain. The projected anchors
+come from bounds centres and may not lie on the material; annotations do not prove geometry.
+
+Persist requirements with `cad.declare_checks('FitChecks', [{...}])`; these use the same
+claim fields as verify, including axis/at/other_at/frame. `cad.checks('FitChecks')`
+re-evaluates them; `cad.preview_checks('FitChecks', view='top')` annotates saved axis checks
+and highlights objects with failures. Saved requirements use native object links and run
+after checked edits. They report failures without rejecting an otherwise valid edit.
+Use named objects, not transient FaceN/EdgeN references, for persistent checks. Deleting a
+target makes its checks unverifiable. Drive design relationships with native expressions
+or sketch constraints separately: a saved check measures intent but does not enforce it.
+
 When the user has a reference (a drawing or a STEP file), export and compare: `cad.export('part.step')`
 then `cad.compare('reference.step')`, which reports `volumeRatio`, `linearScale`, `scaleMatches`, and
 `gScore`, `score`, `passes`, and component diagnostics. The default target is every visible

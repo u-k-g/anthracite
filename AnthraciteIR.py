@@ -103,6 +103,11 @@ def compile_document(doc, target=None):
     if target is not None and not isinstance(target, str):
         raise ValueError("IR target must be a native object name")
     roots = list(doc.Objects) if target is None else [doc.getObject(target)]
+    if target is None:
+        # Verification metadata is not a model input. Its native links exist only
+        # to preserve requirement targets across renames/save/reopen.
+        roots = [obj for obj in roots if not (obj.TypeId == "App::DocumentObjectGroup"
+                 and not obj.Group and "AnthraciteChecks" in obj.PropertiesList)]
     if any(obj is None for obj in roots):
         raise ValueError(f"No object named {target!r} in the active document")
     nodes, sources, hashes = {}, {}, {}

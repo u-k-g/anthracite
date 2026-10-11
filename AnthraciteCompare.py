@@ -281,13 +281,27 @@ def align(candidate, reference, *, samples=1024, tolerance=.1, starts=64, extra=
         if agreement >= 1-1e-9:
             break
     agreement, _, name, rotation, translation, moved = best
+    moved_points = source @ rotation.T + translation
+    source_distances = tree.query(moved_points)[0]
+    target_distances = KDTree(moved_points).query(target)[0]
+    def worst(points, distances):
+        return [{"point_mm": points[i].tolist(), "sampleDistance_mm": float(distances[i])}
+                for i in np.argsort(distances)[-12:][::-1] if distances[i] > tolerance]
     return moved, {"method": name, "rotation": rotation.tolist(), "translation_mm": translation.tolist(),
                    "determinant": float(np.linalg.det(rotation)), "scale": 1.,
                    "starts": len(unique), "kernelPosesTested": tested,
                    "fpfhCorrespondencesUsable": feature is not None,
                    "methods": ["axis-aligned", "brep-principal-axes", "sampled-principal-axes",
                                "brep-surface-axes", "fpfh-fgr", "icp", "sobol"],
-                   "globalOptimumGuaranteed": False}, agreement
+                   "globalOptimumGuaranteed": False,
+                   "rankingScope": "Bidirectional squared nearest-sample distance over every sample; no ICP inlier-only ranking. Final poses judged by native volume IoU.",
+                   "sampleCoverage": {"candidate": float(np.mean(source_distances <= tolerance)),
+                                      "reference": float(np.mean(target_distances <= tolerance)),
+                                      "candidateSamples": len(source), "referenceSamples": len(target),
+                                      "tolerance_mm": tolerance,
+                                      "scope": "Nearest sampled points, not exact surface distance or proof of full coverage."},
+                   "worstSampleMismatches": {"candidate": worst(moved_points, source_distances),
+                                             "reference": worst(target, target_distances)}}, agreement
 
 
 def _surface(candidate, reference, tolerance, samples, iou):

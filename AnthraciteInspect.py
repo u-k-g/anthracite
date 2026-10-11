@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import uuid
+import json
 
 try:
     import Part
@@ -149,17 +150,56 @@ def _surface_facts(shape):
         return _geometry_facts(shape.Curve) if shape.ShapeType == "Edge" else {}
 
 
-def measure(doc, target, revision, other=None):
+def measure(doc, target, revision, other=None, *, axis=None, at="center", other_at="center", frame="world"):
+    """Native finite geometry; optional signed axis distance between explicit extent anchors."""
+    if axis not in (None, "x", "y", "z") or at not in ("min", "max", "center") or other_at not in ("min", "max", "center"):
+        raise ValueError("Use axis x/y/z and extent anchors min/max/center.")
     shape = native_shape(doc, target, revision)
+    placement = App.Placement() if frame == "world" else _world_placement(resolve(doc, frame))
+    def framed(native):
+        transformed = native.copy()
+        transformed.Placement = placement.inverse().multiply(transformed.Placement)
+        return transformed
+    bounds = framed(shape).BoundBox
     result = {"document": doc.Name, "revision": revision,
-              "coordinateFrame": "document/world; lengths in mm",
+              "coordinateFrame": "document/world" if frame == "world" else resolve(doc, frame).Name,
+              "units": "mm", "extentScope": "finite native BRep axis-aligned bounds in the declared frame",
               "provenance": "FreeCAD/OCC BRep, not viewport tessellation",
               "tolerance_mm": shape.getTolerance(1)}
+    for coordinate in "XYZ":
+        result.update({f"min{coordinate}_mm": getattr(bounds, coordinate+"Min"),
+                       f"max{coordinate}_mm": getattr(bounds, coordinate+"Max"),
+                       f"span{coordinate}_mm": getattr(bounds, coordinate+"Length")})
+    def anchor(box, which):
+        point = box.Center
+        if axis is not None and which != "center":
+            setattr(point, axis, getattr(box, axis.upper()+which.title()))
+        return point
+    first_anchor = anchor(bounds, at)
+    def xyz(point):
+        return [point.x, point.y, point.z]
+    if axis is not None:
+        result.update(axis=axis, at=at, extent_mm=getattr(first_anchor, axis),
+                      anchor_mm=xyz(first_anchor), anchorWorld_mm=xyz(placement.multVec(first_anchor)))
     if other is not None:
         second = native_shape(doc, other, revision)
+        second_bounds = framed(second).BoundBox
+        second_anchor = anchor(second_bounds, other_at)
+        result["delta_mm"] = xyz(second_anchor-first_anchor)
+        result["deltaScope"] = "Second extent anchor minus first; not closest-point displacement."
+        if axis is not None:
+            projected = App.Vector(first_anchor)
+            setattr(projected, axis, getattr(second_anchor, axis))
+            result.update(other_at=other_at, otherExtent_mm=getattr(second_anchor, axis),
+                          otherAnchor_mm=xyz(second_anchor), otherAnchorWorld_mm=xyz(placement.multVec(second_anchor)),
+                          axisDistance_mm=getattr(second_anchor-first_anchor, axis),
+                          axisGap_mm=getattr(second_bounds, axis.upper()+"Min")-getattr(bounds, axis.upper()+"Max"),
+                          axisOuterSpan_mm=max(getattr(bounds, axis.upper()+"Max"), getattr(second_bounds, axis.upper()+"Max"))
+                          - min(getattr(bounds, axis.upper()+"Min"), getattr(second_bounds, axis.upper()+"Min")),
+                          dimensionLineWorld_mm=[xyz(placement.multVec(first_anchor)), xyz(placement.multVec(projected))])
         distance, points, _ = shape.distToShape(second)
         result.update(distance_mm=distance, closestPoints_mm=[
-            [value(a), value(b)] for a, b in points[:10]], closestPointCount=len(points),
+            [value(placement.inverse().multVec(a)), value(placement.inverse().multVec(b))] for a, b in points[:10]], closestPointCount=len(points),
             tolerance_mm=max(result["tolerance_mm"], second.getTolerance(1)))
         if shape.Solids and second.Solids:
             result["overlapVolume_mm3"] = shape.common(second).Volume
@@ -185,13 +225,13 @@ def measure(doc, target, revision, other=None):
             result["lineSeparationScope"] = "Infinite supporting lines; distance_mm remains finite-edge distance."
         result["note"] = "Zero distance alone does not distinguish touching from overlap. Null overlap volume means this check is unavailable for non-solids."
     else:
-        b = shape.BoundBox
+        b = bounds
         result.update(valid=shape.isValid(), solids=len(shape.Solids), volume_mm3=shape.Volume,
                       area_mm2=shape.Area, size_mm=[b.XLength, b.YLength, b.ZLength])
-        result.update(_surface_facts(shape))
+        result.update(_surface_facts(framed(shape)))
         if shape.ShapeType == "Edge":
             result["length_mm"] = shape.Length
-        center = _center_of_mass(shape)
+        center = _center_of_mass(framed(shape))
         if center is not None:
             result["centerOfMass_mm"] = center
     return result
@@ -262,8 +302,8 @@ def verify(doc, checks, revision):
         claim = {"expected": check.get("expected") if isinstance(check, dict) else None,
                  "measured": None, "status": "unverifiable"}
         try:
-            if not isinstance(check, dict) or set(check) - {"object", "metric", "expected", "tolerance", "other"}:
-                raise ValueError("Claim fields: object, metric, expected, tolerance, optional other.")
+            if not isinstance(check, dict) or set(check) - {"object", "metric", "expected", "tolerance", "other", "axis", "at", "other_at", "frame"}:
+                raise ValueError("Claim fields: object, metric, expected, tolerance, optional other/axis/at/other_at/frame.")
             claim.update(check)
             metric = check["metric"]
             expected = check["expected"]
@@ -297,11 +337,13 @@ def verify(doc, checks, revision):
             elif metric == "type":
                 measured = resolve(doc, check["object"]).TypeId
             else:
-                measurements = measure(doc, check["object"], revision, check.get("other"))
+                measurements = measure(doc, check["object"], revision, check.get("other"),
+                                       **{k: check[k] for k in ("axis", "at", "other_at", "frame") if k in check})
                 if metric not in measurements or metric in {"document", "revision", "provenance", "note"}:
                     raise ValueError("Unsupported measurement metric.")
                 measured = measurements[metric]
                 claim["provenance"] = measurements["provenance"]
+                claim["coordinateFrame"] = measurements["coordinateFrame"]
             claim["measured"] = measured
             if measured is None:
                 raise ValueError("Measurement unavailable for this geometry.")
@@ -326,6 +368,71 @@ def verify(doc, checks, revision):
         "pass" if results and all(c["status"] == "pass" for c in results) else "unverifiable")
     return {"document": doc.Name, "revision": revision, "status": status, "claims": results,
             "scope": "Only the declared checks; not certification of overall design correctness."}
+
+
+def declare_checks(doc, name, checks, revision):
+    """Persist explicit requirements on a native group with rename-aware object links."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name):
+        raise ValueError("Check name must be a native identifier of at most 64 characters.")
+    outcome = verify(doc, checks, revision)
+    if any(c["status"] == "unverifiable" for c in outcome["claims"]) or not checks:
+        raise ValueError("Every saved check must be evaluable: "+str(outcome["claims"]))
+    links, encoded = [], []
+    for check in checks:
+        entry = dict(check)
+        for key in ("object", "other", "frame"):
+            if key not in entry or (key == "frame" and entry[key] == "world"):
+                continue
+            if not isinstance(entry[key], str):
+                raise ValueError("Saved checks require named native objects/frames; transient topology references cannot persist.")
+            obj = resolve(doc, entry[key])
+            if obj not in links:
+                links.append(obj)
+            entry[key] = {"target": links.index(obj)}
+        encoded.append(entry)
+    obj = doc.getObject(name)
+    if obj is not None and not is_check_container(obj):
+        raise ValueError("That object name is already in use.")
+    if obj is None:
+        obj = doc.addObject("App::DocumentObjectGroup", name)
+        obj.addProperty("App::PropertyString", "AnthraciteChecks", "Verification")
+    for prop in obj.PropertiesList:
+        if prop.startswith("CheckTarget"):
+            setattr(obj, prop, None)
+    for index, target in enumerate(links):
+        prop = "CheckTarget"+str(index)
+        if prop not in obj.PropertiesList:
+            obj.addProperty("App::PropertyLink", prop, "Verification")
+        setattr(obj, prop, target)
+    obj.AnthraciteChecks = json.dumps(encoded, sort_keys=True, allow_nan=False)
+    return {"object": obj.Name, "verification": outcome,
+            "note": "Requirements persist; they report failures, not modeling constraints. Use native expressions/constraints to drive relationships."}
+
+
+def is_check_container(obj):
+    return obj.TypeId == "App::DocumentObjectGroup" and not obj.Group and "AnthraciteChecks" in obj.PropertiesList
+
+
+def saved_checks(doc, revision, name=None):
+    results = []
+    containers = [resolve(doc, name)] if name is not None else [o for o in doc.Objects if is_check_container(o)]
+    for obj in containers:
+        try:
+            if not is_check_container(obj):
+                raise ValueError("Expected a saved-check container.")
+            checks = json.loads(obj.AnthraciteChecks)
+            for check in checks:
+                for key in ("object", "other", "frame"):
+                    if isinstance(check.get(key), dict):
+                        target = getattr(obj, "CheckTarget"+str(check[key]["target"]))
+                        if target is None:
+                            raise ValueError("Saved check target was removed.")
+                        check[key] = target.Name
+            result = verify(doc, checks, revision)
+        except Exception as error:
+            result = {"document": doc.Name, "revision": revision, "status": "unverifiable", "claims": [], "reason": str(error)}
+        results.append({"savedCheck": obj.Name, **result})
+    return results
 
 
 def value(item, depth=0):

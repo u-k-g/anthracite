@@ -8,6 +8,45 @@ Requires **FreeCAD >= 1.0 with PySide6 (Qt 6)** and Python >= 3.11 inside FreeCA
 The CLI uses only the Python standard library and runs outside FreeCAD with `python3`.
 Your agent keeps its own authentication, configuration, models, skills, and tools.
 
+## Axis measurements and saved requirements
+
+Axis measurements distinguish finite extents from closest-point distance:
+
+```python
+cad.measure('LeftWall', 'RightWall', axis='y', at='max', other_at='min')
+cad.preview_measurement('LeftWall', 'RightWall', axis='y', at='max', other_at='min',
+                        expected=87.8, tolerance=0.01, view='top')
+cad.declare_checks('DeckFit', [{
+    'object': 'LeftWall', 'other': 'RightWall', 'axis': 'y',
+    'at': 'max', 'other_at': 'min', 'metric': 'axisDistance_mm',
+    'expected': 87.8, 'tolerance': 0.01,
+}])
+cad.checks('DeckFit')
+cad.preview_checks('DeckFit', view='top')
+```
+
+`axisDistance_mm` is signed second anchor minus first. `axisGap_mm` is second
+minimum minus first maximum; a negative value indicates projected interval overlap,
+not solid interference. `minX_mm`, `maxX_mm`, `spanX_mm` and their Y/Z counterparts
+report native BRep bounds. `frame='world'` is the default; name a native object for
+its rigid coordinate frame. `distance_mm` remains the finite closest-point distance.
+Bounds are kernel measurements with the reported tolerance, not exact symbolic extrema.
+
+Previews label the objects, axis, anchors, frame, measured value and optional requirement.
+They draw projected axis distances and preserve the user's camera/selection/model.
+Bounds-centre anchors need not lie on the surface; these are explanatory image overlays.
+Use a current topology reference for a face/edge preview, or named objects for saved checks.
+Saved checks use native links, survive save/reopen, and report automatically after checked
+edits. A failure is reported in `verification`; it does not reject an otherwise valid edit.
+Deleting a target makes the check unverifiable. Checks do not impose geometric constraints:
+use native expressions/sketch constraints to maintain relationships. Verification metadata
+does not enter the derived model IR. Remove the native check group to remove its requirements.
+
+Comparison alignment diagnostics include coverage of both sampled surfaces and up to twelve
+worst sample mismatches in the reference frame. Distances are between sampled points, not
+exact BRep surface distances. Pose ranking includes every sample in both directions rather
+than only ICP inliers; native volume IoU judges finalist poses.
+
 ## Install
 
 With Nushell and just installed, run from this checkout:

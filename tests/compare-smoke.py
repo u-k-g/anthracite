@@ -34,6 +34,10 @@ class ComparisonTest(unittest.TestCase):
             self.assertAlmostEqual(result['shape']['volumeIoU'], 1, places=6)
             self.assertAlmostEqual(result['alignment']['determinant'], 1, places=6)
             self.assertEqual(result['alignment']['scale'], 1)
+            self.assertEqual(result['alignment']['sampleCoverage']['candidateSamples'], 256)
+            self.assertEqual(result['alignment']['sampleCoverage']['referenceSamples'], 256)
+            self.assertIn('every sample', result['alignment']['rankingScope'])
+            self.assertIn('worstSampleMismatches', result['alignment'])
             self.assertEqual(before, History.shape_digest(candidate))
         self.assertEqual(original, History.shape_digest(reference))
 

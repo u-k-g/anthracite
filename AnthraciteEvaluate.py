@@ -98,7 +98,8 @@ def evaluate(doc, values, *, checks=None, target=None, timeout=60):
         result.update({"isolated": True, "sourceDefinitionHash": baseline["definitionHash"],
                        "sourceDocument": doc.Name,
                        "images": [], "visualFeedback": "Headless candidate; render the accepted edit in the GUI."})
-        result["accepted"] = (bool(result.get("ok")) and all(v["status"] == "pass" for v in result.get("verification", []))) if checks else None
+        has_requirements = bool(checks) or any(v.get("savedCheck") for v in result.get("verification", []))
+        result["accepted"] = (bool(result.get("ok")) and all(v["status"] == "pass" for v in result.get("verification", []))) if has_requirements else None
         if result.get("ok") and process.returncode == 0:
             shutil.rmtree(directory)
         else:
