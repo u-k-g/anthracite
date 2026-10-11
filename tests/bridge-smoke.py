@@ -75,6 +75,10 @@ def main():
     assert document.getObject("BridgeBox") is not None, "the edit did not commit"
     assert result["revision"] >= 1, result
 
+    projection = call({"id": 4, "type": "execute", "params": {"code": "cad.ir()"}})["result"]
+    assert projection["ok"] and projection["readOnly"], projection
+    assert projection["revision"] == result["revision"], projection
+
     history = AnthraciteBridge.recent(20)
     assert any(entry.get("status") == "committed" and entry.get("document") == document.Name for entry in history), history
 
@@ -89,7 +93,8 @@ def main():
         "doc.getObject('Box').Length = 25\n"
         "cad.render(view='front', width=200, height=150)"
     )
-    for code in ['doc.addObject("Part::Box", "Box")', program]:
+    definition_hash = None
+    for code in ['doc.addObject("Part::Box", "Box")', program, 'cad.ir()', 'cad.model_hash()']:
         child = subprocess.Popen([interpreter, cli, "exec", code],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
@@ -108,6 +113,14 @@ def main():
         assert payload["ok"] is True, payload
         assert "images" not in payload, "the CLI must not print base64 images"
         shots = payload.get("shots") or []
+        if code == 'cad.ir()':
+            definition_hash = payload["result"]["definitionHash"]
+            assert not shots, payload
+            continue
+        if code == 'cad.model_hash()':
+            assert payload["result"] == definition_hash, payload
+            assert not shots, payload
+            continue
         assert shots, payload
         assert all(os.path.isfile(shot["path"]) for shot in shots), shots
     assert abs(document.getObject("Box").Length.Value - 25.0) < 1e-6, "the CLI edit did not apply"

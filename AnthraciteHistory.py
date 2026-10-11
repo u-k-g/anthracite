@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 import uuid
@@ -49,12 +50,36 @@ def forget(doc):
     _states.pop(doc.Name, None)
 
 
-def record(doc, action_id, label, before, after, revision):
+def shape_digest(shape):
+    """Hash full native BRep text, normalizing Checked flags and signed zero.
+
+    OCCT's BRep specification defines the third bit of the seven-bit shape flag
+    word as Checked. Require the following subshape record to avoid matching
+    numeric geometry data. Signed zero is numerically identical to zero; all
+    geometry, tolerances and other flags stay exact.
+    https://github.com/Open-Cascade-SAS/OCCT/wiki/brep_format
+    """
+    text = shape.exportBrepToString()
+    text = re.sub(r"(?m)^([01]{2})[01]([01]{4})(\r?\n)(?=[+\-ie*])",
+                  r"\g<1>0\g<2>\g<3>", text)
+    text = re.sub(r"(?<!\S)-0(?=\s|$)", "0", text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def shape_contents(doc):
+    """Freeze native topology before OCCT adds mutable pcurves during recompute."""
+    return {(obj.Name, prop): obj.dumpPropertyContent(prop, 0)
+            for obj in doc.Objects for prop in obj.PropertiesList
+            if obj.getTypeIdOfProperty(prop) == "Part::PropertyPartShape"}
+
+
+def record(doc, action_id, label, before, after, revision, before_shapes, after_shapes):
     state = _states.get(doc.Name)
     if state is None or state["blocked"]:
         state = {"past": [], "future": [], "blocked": None}
         _states[doc.Name] = state
-    state["past"].append({"id": action_id, "label": label, "before": before, "after": after})
+    state["past"].append({"id": action_id, "label": label, "before": before, "after": after,
+                          "beforeShapes": before_shapes, "afterShapes": after_shapes})
     state["past"] = state["past"][-20:]
     state["future"] = []
     state["stacks"] = stacks(doc)
@@ -98,18 +123,20 @@ def guard(doc, direction, action, expected_revision, revision, snapshot):
         raise ValueError(info["blockedReason"] or "Action/revision does not match the next recoverable native action.")
     state = _states[doc.Name]
     entry = state["past" if direction == "undo" else "future"][-1]
-    if snapshot != entry["after" if direction == "undo" else "before"]:
+    if not equivalent(entry["after" if direction == "undo" else "before"], snapshot)[0]:
         invalidate(doc, "Document contents no longer match the tracked action.")
         raise ValueError("Document contents changed; history operation was not executed.")
     return entry
 
 
 def equivalent(expected, actual):
-    """Exact inputs/geometry comparison with explicitly reported map-only regeneration.
+    """Exact inputs/BRep comparison, with explicit native cache exceptions.
 
     Native recompute can rewrite FreeCAD's *.Map.txt topology naming tables on undo.
-    Only those archive members may differ: native BREP bytes, property XML, values,
-    object membership, shape measurements and recompute state must still match.
+    Topology maps/version and the OCCT Checked bit can change on recompute. Shape
+    binary differences require identical full text BRep digests excluding only
+    Checked and signed zero; property XML, values, other members and recompute
+    state still match. Tessellation-dependent summary bounds are not a guard.
     Never use this to identify an old face/edge in the new revision.
     """
     remapped = []
@@ -117,7 +144,14 @@ def equivalent(expected, actual):
         return False, []
     for name, old in expected.items():
         new = actual[name]
-        if {k: v for k, v in old.items() if k != "properties"} != {k: v for k, v in new.items() if k != "properties"}:
+        # BoundBox can use viewport tessellation, which native shape restoration
+        # discards. Full BRep digests below check the actual geometry instead.
+        def metadata(obj):
+            result = {k: v for k, v in obj.items() if k != "properties"}
+            if isinstance(result.get("shape"), dict):
+                result["shape"] = {k: v for k, v in result["shape"].items() if k != "bounds"}
+            return result
+        if metadata(old) != metadata(new):
             return False, []
         if old["properties"].keys() != new["properties"].keys():
             return False, []
@@ -125,17 +159,27 @@ def equivalent(expected, actual):
             current = new["properties"][prop]
             if previous == current:
                 continue
+            if (prop == "_ElementMapVersion" and previous["type"] == current["type"]
+                    == "App::PropertyString"):
+                remapped.append({"object": name, "property": prop})
+                continue
             if (previous.get("type") != "Part::PropertyPartShape"
-                    or current.get("type") != previous["type"] or previous["value"] != current["value"]):
+                    or current.get("type") != previous["type"] or previous["value"] != current["value"]
+                    or previous.get("geometryHash") != current.get("geometryHash")):
                 return False, []
             members = previous.get("members", {})
             now = current.get("members", {})
             if not members or members.keys() != now.keys():
                 return False, []
             differences = [key for key in members if members[key] != now[key]]
-            if not differences or any(not key.endswith(".Map.txt") for key in differences):
+            if not differences:
                 return False, []
-            remapped.append({"object": name, "property": prop})
+            for key in differences:
+                if key.endswith(".Map.txt"):
+                    remapped.append({"object": name, "property": prop})
+                elif (not key.endswith(".bin") or not previous.get("geometryHash")
+                      or previous["geometryHash"] != current.get("geometryHash")):
+                    return False, []
     return True, remapped
 
 

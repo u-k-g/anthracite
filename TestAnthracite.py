@@ -15,6 +15,170 @@ import AnthraciteExecutor
 
 
 class ExecutorTest(unittest.TestCase):
+    def test_ir_is_derived_read_only_and_ignores_display_state(self):
+        self.run_code('cad.feedback(images=False)\nbox = doc.addObject("Part::Box", "Box")\nbox.Length = "1 cm"')
+        before = AnthraciteExecutor._document_snapshot(self.doc)
+        first = self.run_code('cad.ir()')
+        self.assertTrue(first['readOnly'])
+        self.assertEqual(before, AnthraciteExecutor._document_snapshot(self.doc))
+        result = first['result']
+        import hashlib
+        self.assertEqual(result['definitionHash'], hashlib.sha256(result['canonical'].encode('utf-8')).hexdigest())
+        self.assertEqual(json.loads(result['canonical']), result['definition'])
+        root = result['definition']['nodes'][result['definition']['roots'][0]]
+        self.assertEqual(root['properties']['Length']['value']['quantity'], 10.0)
+        model_hash = self.run_code('cad.model_hash()')
+        self.assertTrue(model_hash['readOnly'])
+        self.assertEqual(result['definitionHash'], model_hash['result'])
+        self.run_code('cad.feedback(images=False)\nbox = doc.getObject("Box")\nbox.Label = "Different display name"\nbox.ViewObject.Visibility = False\nbox.ViewObject.ShapeColor = (1.0, 0.0, 0.0)')
+        self.assertEqual(result['definitionHash'], self.run_code('cad.ir()')['result']['definitionHash'])
+        self.run_code('cad.feedback(images=False)\ndoc.getObject("Box").Placement = App.Placement(App.Vector(2,0,0), App.Rotation())')
+        self.assertNotEqual(result['definitionHash'], self.run_code('cad.ir()')['result']['definitionHash'])
+
+    def test_ir_normalizes_creation_order_names_and_save_roundtrip(self):
+        import AnthraciteIR
+        graphs = []
+        for reverse in (False, True):
+            document = App.newDocument('RenamedGraph' if reverse else 'OriginalGraph')
+            kinds = [('Part::Box', 'RenamedBox' if reverse else 'Box'),
+                     ('Part::Cylinder', 'RenamedTool' if reverse else 'Tool')]
+            objects = {}
+            for kind, name in (reversed(kinds) if reverse else kinds):
+                objects[kind] = document.addObject(kind, name)
+            box, tool = objects['Part::Box'], objects['Part::Cylinder']
+            box.Length, box.Width, box.Height = 30, 20, 10
+            tool.Radius, tool.Height = 2, 20
+            tool.Placement.Base = App.Vector(5, 5, 0)
+            cut = document.addObject('Part::Cut', 'RenamedCut' if reverse else 'Cut')
+            cut.Base, cut.Tool, cut.Refine = box, tool, True
+            document.recompute()
+            graphs.append(AnthraciteIR.compile_document(document))
+        self.assertEqual(graphs[0]['canonical'], graphs[1]['canonical'])
+        self.assertNotEqual(graphs[0]['source'], graphs[1]['source'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'different-file-name.FCStd')
+            document.saveAs(path)
+            App.closeDocument(document.Name)
+            restored = App.openDocument(path)
+            self.assertEqual(graphs[1]['canonical'], AnthraciteIR.compile_document(restored)['canonical'])
+            restored.getObject('RenamedCut').Refine = False
+            restored.recompute()
+            self.assertNotEqual(graphs[1]['definitionHash'], AnthraciteIR.compile_document(restored)['definitionHash'])
+
+    def test_ir_rejects_unsupported_inputs_without_partial_hashes(self):
+        import AnthraciteIR
+        box = self.doc.addObject('Part::Box', 'Box')
+        self.doc.recompute()
+        baseline = AnthraciteIR.compile_document(self.doc)['definitionHash']
+        box.Length = 12
+        with self.assertRaisesRegex(ValueError, 'Recompute'):
+            AnthraciteIR.compile_document(self.doc)
+        self.doc.recompute()
+        self.assertNotEqual(baseline, AnthraciteIR.compile_document(self.doc)['definitionHash'])
+        box.setExpression('Length', '20 mm')
+        self.doc.recompute()
+        expressed = AnthraciteIR.compile_document(self.doc)
+        self.assertEqual(next(iter(expressed['definition']['nodes'].values()))['expressions']['Length'], '20 mm')
+        box.setExpression('Length', None)
+        box.addProperty('App::PropertyString', 'UnclassifiedInput')
+        self.doc.recompute()
+        literal = AnthraciteIR.compile_document(self.doc)
+        box.UnclassifiedInput = 'meaningful native input'
+        self.doc.recompute()
+        self.assertNotEqual(literal['definitionHash'], AnthraciteIR.compile_document(self.doc)['definitionHash'])
+        box.removeProperty('UnclassifiedInput')
+        self.doc.addObject('Part::Box', 'IndependentOutput')
+        self.doc.recompute()
+        self.assertEqual(len(AnthraciteIR.compile_document(self.doc)['definition']['roots']), 2)
+        self.assertEqual(AnthraciteIR.compile_document(self.doc, 'Box')['source']['scope'], 'target')
+        self.doc.addObject('Part::FeaturePython', 'UnsupportedScript')
+        self.doc.recompute()
+        with self.assertRaisesRegex(ValueError, 'UnsupportedScript'):
+            AnthraciteIR.compile_document(self.doc)
+
+    def test_ir_keeps_partdesign_inputs_and_opaque_shapes(self):
+        import AnthraciteIR
+        import Part
+        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
+        first = self.run_code('cad.ir()')['result']
+        types = {node['type'] for node in first['definition']['nodes'].values()}
+        self.assertTrue({'PartDesign::Body', 'Sketcher::SketchObject', 'PartDesign::Pad'} <= types)
+        before = AnthraciteExecutor._document_snapshot(self.doc)
+        self.assertEqual(first['definitionHash'], self.run_code('cad.model_hash()')['result'])
+        self.assertEqual(before, AnthraciteExecutor._document_snapshot(self.doc))
+        self.run_code('cad.feedback(images=False)\ndoc.getObject("BasePad").Length = 12')
+        self.assertNotEqual(first['definitionHash'], self.run_code('cad.model_hash()')['result'])
+        imported = App.newDocument('Imported')
+        feature = imported.addObject('Part::Feature', 'ImportedGeometry')
+        feature.Shape = Part.makeBox(1, 2, 3)
+        feature.setPropertyStatus('Shape', 'Output')
+        imported.recompute()
+        initial = AnthraciteIR.compile_document(imported)['definitionHash']
+        feature.Shape = Part.makeBox(1, 2, 4)
+        imported.recompute()
+        self.assertNotEqual(initial, AnthraciteIR.compile_document(imported)['definitionHash'])
+
+    def test_ir_merkle_links_and_expression_references_ignore_object_names(self):
+        import AnthraciteIR
+        graphs = []
+        for renamed in (False, True):
+            document = App.newDocument('Graph')
+            base_name, follower_name = ('Other', 'Follow') if renamed else ('Base', 'Follower')
+            base = document.addObject('Part::Box', base_name)
+            follower = document.addObject('Part::Box', follower_name)
+            follower.setExpression('Length', base_name + '.Length * 2')
+            document.recompute()
+            graphs.append(AnthraciteIR.compile_document(document))
+        self.assertEqual(graphs[0]['canonical'], graphs[1]['canonical'])
+        follower.setExpression('Length', base_name + '.Length*2')
+        document.recompute()
+        self.assertEqual(graphs[1]['canonical'], AnthraciteIR.compile_document(document)['canonical'])
+        original = graphs[-1]['definitionHash']
+        base.Length = 30
+        document.recompute()
+        self.assertNotEqual(original, AnthraciteIR.compile_document(document)['definitionHash'])
+
+    def test_ir_keeps_readonly_inputs_and_normalizes_rotations_and_units(self):
+        import AnthraciteIR
+        import math
+        cylinder = self.doc.addObject('Part::Cylinder', 'Cylinder')
+        cylinder.setPropertyStatus('Radius', 'ReadOnly')
+        cylinder.setPropertyStatus('Radius', 'Output')
+        self.doc.recompute()
+        first = AnthraciteIR.compile_document(self.doc)
+        root = first['definition']['nodes'][first['definition']['roots'][0]]
+        self.assertAlmostEqual(root['properties']['Angle']['value']['quantity'], 2 * math.pi)
+        cylinder.Radius = 3
+        self.doc.recompute()
+        self.assertNotEqual(first['definitionHash'], AnthraciteIR.compile_document(self.doc)['definitionHash'])
+        q = App.Rotation(App.Vector(1, 2, 3), 45).Q
+        self.assertEqual(AnthraciteIR._quaternion(App.Rotation(*q)),
+                         AnthraciteIR._quaternion(App.Rotation(*[-x for x in q])))
+        self.assertEqual(AnthraciteIR.canonical_bytes({'value': AnthraciteIR._number(-0.0)}),
+                         AnthraciteIR.canonical_bytes({'value': AnthraciteIR._number(0.0)}))
+
+    def test_ir_partdesign_renames_and_save_roundtrip(self):
+        import AnthraciteIR
+        recipe = AnthraciteInspect.guide('partdesign')['code']
+        self.run_code(recipe)
+        first = AnthraciteIR.compile_document(self.doc)
+        other = App.newDocument('RenamedPartDesign')
+        recipe = recipe.replace('BaseSketch', 'OtherSketch').replace('BasePad', 'OtherPad').replace("'Body'", "'OtherBody'")
+        self.run_code(recipe)
+        second = AnthraciteIR.compile_document(other)
+        self.assertEqual(first['canonical'], second['canonical'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'part.FCStd')
+            other.saveAs(path)
+            App.closeDocument(other.Name)
+            restored = App.openDocument(path)
+            after = AnthraciteIR.compile_document(restored)
+            if second['canonical'] != after['canonical']:
+                from pathlib import Path
+                for label, data in [('before', second), ('after', after)]:
+                    (Path(__file__).parents[4] / f'ir-save-{label}.json').write_text(json.dumps(data, indent=2))
+            self.assertEqual(second['canonical'], after['canonical'])
+
     def test_native_validity_and_incomplete_state_diagnostics(self):
         obj = SimpleNamespace(Name='Incomplete', State=['Touched'], isValid=lambda: True,
                               getStatusString=lambda: 'Missing required input')
@@ -238,6 +402,51 @@ class ExecutorTest(unittest.TestCase):
         self.run_code("doc.getObject('Box').Length = 22")
         equivalent, _ = AnthraciteHistory.equivalent(before, AnthraciteExecutor._document_snapshot(self.doc))
         self.assertFalse(equivalent)
+
+    def test_history_brep_digest_ignores_only_checked_flags(self):
+        import Part
+        import re
+        shape = Part.makeBox(10, 12, 14)
+        text = shape.exportBrepToString()
+        changed, count = re.subn(r"(?m)^([01]{2})([01])([01]{4})(\n)(?=[+\-ie*])",
+                                lambda match: match[1] + str(1 - int(match[2])) + match[3] + match[4], text)
+        self.assertGreater(count, 0)
+        checked = Part.Shape()
+        checked.importBrepFromString(changed)
+        self.assertEqual(AnthraciteHistory.shape_digest(shape), AnthraciteHistory.shape_digest(checked))
+        reversed_shape = shape.copy()
+        reversed_shape.reverse()
+        self.assertNotEqual(AnthraciteHistory.shape_digest(shape), AnthraciteHistory.shape_digest(reversed_shape))
+        # Even geometry differences hidden by rounded inspection metrics must fail.
+        self.assertNotEqual(AnthraciteHistory.shape_digest(shape),
+                            AnthraciteHistory.shape_digest(Part.makeBox(10 + 1e-10, 12, 14)))
+
+    def test_invalid_existing_pad_restores_inputs_and_native_outputs(self):
+        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
+        baseline = AnthraciteExecutor._document_snapshot(self.doc)
+        failed = AnthraciteExecutor.execute("doc.getObject('BasePad').Profile = None")
+        self.assertFalse(failed['ok'])
+        self.assertTrue(failed['rolledBack'], failed)
+        self.assertTrue(self.doc.getObject('BasePad').isValid())
+        self.assertTrue(AnthraciteHistory.equivalent(
+            baseline, AnthraciteExecutor._document_snapshot(self.doc))[0])
+
+    def test_loaded_pad_undo_redo_preserves_native_snapshots(self):
+        self.run_code(AnthraciteInspect.guide('partdesign')['code'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'native-pad.FCStd')
+            self.doc.saveAs(path)
+            App.closeDocument(self.doc.Name)
+            self.doc = App.openDocument(path)
+            self.doc.UndoMode = 1
+            original = AnthraciteExecutor._document_snapshot(self.doc)
+            edit = self.run_code("doc.getObject('BasePad').Length = 18")
+            changed = AnthraciteExecutor._document_snapshot(self.doc)
+            for direction, target in [('undo', original), ('redo', changed), ('undo', original)]:
+                history = self.run_code('cad.history()')['result'][direction]
+                self.run_code(f"cad.{direction}(action={history['action']!r}, revision={history['revision']})")
+                self.assertTrue(AnthraciteHistory.equivalent(
+                    target, AnthraciteExecutor._document_snapshot(self.doc))[0])
 
     def test_readable_property_paging(self):
         self.run_code("doc.addObject('Part::Box', 'Box')")

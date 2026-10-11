@@ -75,6 +75,57 @@ anthracite log --limit 20
 anthracite shots
 ```
 
+### Derived feature IR
+
+After a modeling call has recomputed and committed, inspect its canonical feature
+definition through the same CLI:
+
+```sh
+anthracite exec 'cad.ir()'
+anthracite exec 'cad.ir("Cut")'
+anthracite exec 'cad.model_hash()'
+```
+
+The result contains a versioned `definition`, its UTF-8 JSON `canonical` serialization,
+and a SHA-256 `definitionHash`. Compilation reads the live native document, including
+unsaved edits; it does not edit, save, or recompute it. FreeCAD remains the source of
+truth and evaluator. Delete this projection and regenerate it whenever needed.
+
+IR v1 projects native App-level properties, including Part Design bodies, sketches,
+constraints, expressions, attachments, and feature links. It never reads ViewObject.
+Each node contains its native type and typed inputs; links address the SHA-256 content
+hash of the child node. Expression references use those hashes too. The document
+projection sorts roots and tracks instance counts, so duplicate native features are
+not silently lost when equal node content is shared. Source names appear in a separate
+lookup map outside the hash. Document/object names, creation order, labels, visibility,
+and cached computed shapes do not determine identity.
+
+Quantities use mm/kg/s/A/K/mol/cd/rad bases, quaternion signs are normalized, negative
+zero becomes zero, and JSON keys are sorted. Scalar inputs retain their finite
+round-trip precision. Quaternion components use **14 decimal places**, declared in
+the schema, to absorb FreeCAD's one-ulp rotation normalization on file restore. This
+is a quantized rotation identity, not exact floating-point identity. The authoritative
+attachment engine type is retained; its derived UI selector is excluded. Expression whitespace
+is normalized with token boundaries and string literals preserved; algebraic
+equivalence is not inferred. Complex native inputs use normalized persistence XML and
+binary-content hashes. Imported/baked Part features retain a BRep-content hash, even
+when Shape is marked as an output. Sketch constraint label positions and visibility
+are excluded. Editor ReadOnly/runtime Output flags cannot hide a genuine input.
+
+This is **conservative native-input content identity**, not a geometric-equivalence
+proof. Two different trees producing the same solid may have different hashes;
+equivalent BRep encodings can also differ. A reusable
+evaluation cache would also need the evaluator and kernel versions/options in its key.
+No OCP evaluator, search loop, or evaluation cache is included yet. Binary-content
+hashes identify resources; this projection is not a self-contained OCP program.
+
+Arbitrary Python features/properties, external file inputs and cross-document links
+or expressions, ambiguous label references, cycles, and unrecomputed inputs fail
+explicitly without a partial hash. Other native property serialization failures also
+fail explicitly. An explicit target covers only its dependency closure and resolved
+world placement; the default covers the document. Part Design modeling remains the
+preferred native workflow.
+
 An edit executes on FreeCAD's GUI thread as one named native transaction, recomputes,
 validates, and commits or rolls back. The CLI returns JSON, including `ok`, revision tokens,
 diagnostics, and viewport PNG paths. After a timeout or lost connection, inspect the

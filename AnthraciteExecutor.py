@@ -273,6 +273,8 @@ def _object_snapshot(obj: Any) -> dict[str, Any]:
             display = Inspect.value(value)
             properties[name] = {"type": obj.getTypeIdOfProperty(name), "value": display,
                                 "sha256": digest.hexdigest(), "members": members}
+            if properties[name]["type"] == "Part::PropertyPartShape":
+                properties[name]["geometryHash"] = History.shape_digest(value)
         except Exception as error:
             # Never confirm restoration when a property's content is unknown.
             raise RuntimeError(f"Cannot inspect {obj.Name}.{name}: {error}") from error
@@ -297,6 +299,48 @@ def _document_snapshot(doc: Any) -> dict[str, dict[str, Any]]:
         str(obj.Name): _object_snapshot(obj)
         for obj in sorted(doc.Objects, key=lambda item: item.Name)
     }
+
+
+def _restore_recompute_state(doc: Any, expected: dict, shapes: dict) -> None:
+    """Clear undo's redundant touches only after verifying all native contents.
+
+    Native undo restores persisted inputs and outputs but can leave objects touched.
+    Recomputing a document saved by an older version can round-trip those outputs
+    differently. Never skip recompute unless every input and BRep already matches.
+    """
+    actual = _document_snapshot(doc)
+    untouched = {
+        name: {**obj, "state": [state for state in obj["state"] if state not in {"Touched", "Up-to-date"}]}
+        for name, obj in actual.items()
+    }
+    target = {
+        name: {**obj, "state": [state for state in obj["state"] if state not in {"Touched", "Up-to-date"}]}
+        for name, obj in expected.items()
+    }
+    if History.equivalent(target, untouched)[0]:
+        for name, obj in actual.items():
+            if "Touched" in obj["state"] and "Touched" not in expected[name]["state"]:
+                doc.getObject(name).purgeTouched()
+    else:
+        doc.recompute()
+        actual = _document_snapshot(doc)
+        def inputs(snapshot):
+            return {name: {**obj, "shape": None,
+                           "state": [state for state in obj["state"] if state not in {"Touched", "Up-to-date"}],
+                           "properties": {prop: content for prop, content in obj["properties"].items()
+                                          if content["type"] != "Part::PropertyPartShape"}}
+                    for name, obj in snapshot.items()}
+        # Native recompute clears failed-feature status, but older saved BReps
+        # can differ at full precision. Restore the original persisted outputs
+        # only when every native input and non-cache output already matches.
+        if shapes and History.equivalent(inputs(expected), inputs(actual))[0]:
+            for (name, prop), content in shapes.items():
+                if (expected[name]["properties"][prop]["geometryHash"]
+                        != actual[name]["properties"][prop]["geometryHash"]):
+                    doc.getObject(name).restorePropertyContent(prop, content)
+            for name, obj in expected.items():
+                if "Touched" not in obj["state"]:
+                    doc.getObject(name).purgeTouched()
 
 
 def _changed_properties(
@@ -860,6 +904,17 @@ class Cad:
         """Audit how parametric the native feature tree is (the E half of a G/E verdict)."""
         return Inspect.editability(self.doc)
 
+    def ir(self, target=None):
+        """Derive a canonical supported native feature graph without modifying CAD."""
+        import AnthraciteIR
+        if self.doc is not None:
+            self._reference_revision()
+        return AnthraciteIR.compile_document(self.doc, target)
+
+    def model_hash(self, target=None):
+        """Content identity of the derived native-input projection."""
+        return self.ir(target)["definitionHash"]
+
     def export(self, path, objects=None, *, format=None):
         """Write geometry to a file: step, iges, brep, stl, or obj."""
         return Inspect.export(self.doc, path, objects, format)
@@ -1047,7 +1102,7 @@ def context_json() -> str:
     })
 
 
-_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents"}
+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "ir", "model_hash"}
 _HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint", "yield_transaction"}
 
 
@@ -1145,23 +1200,11 @@ def _history_execute(doc, method, args, kwargs, revision):
     _executing_docs.add(doc.Name)
     try:
         getattr(doc, method)()
-        immediate = _document_snapshot(doc)
         target = entry["before" if method == "undo" else "after"]
-        immediate_equivalent, _ = History.equivalent(target, immediate)
-        if not immediate_equivalent:
-            doc.recompute()
+        _restore_recompute_state(doc, target, entry["beforeShapes" if method == "undo" else "afterShapes"])
         after = _document_snapshot(doc)
         target = entry["before" if method == "undo" else "after"]
         equivalent, remapped = History.equivalent(target, after)
-        if not equivalent:
-            # Rebuild dependency geometry as well: an incremental Pad recompute
-            # may retain location chains on a reused sketch's native BRep.
-            for obj in doc.Objects:
-                if hasattr(obj, "Shape"):
-                    obj.touch()
-            doc.recompute(None, True)
-            after = _document_snapshot(doc)
-            equivalent, remapped = History.equivalent(target, after)
         if not equivalent:
             raise RuntimeError("Native history did not restore the recorded parameters and native geometry.")
         revision += 1
@@ -1177,8 +1220,7 @@ def _history_execute(doc, method, args, kwargs, revision):
         try:
             if History.stacks(doc) != native_before:
                 getattr(doc, "redo" if method == "undo" else "undo")()
-                if _document_snapshot(doc) != before:
-                    doc.recompute()
+                _restore_recompute_state(doc, before, entry["afterShapes" if method == "undo" else "beforeShapes"])
             restored, _ = History.equivalent(before, _document_snapshot(doc))
         except Exception:
             pass
@@ -1442,6 +1484,7 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
     if doc.UndoMode == 0:
         doc.UndoMode = 1
     before = _document_snapshot(doc)
+    before_shapes = History.shape_contents(doc)
     stdout = io.StringIO()
     stderr = io.StringIO()
     cad = Cad(doc)
@@ -1543,7 +1586,7 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
             try:
                 progress("rollback")
                 doc.abortTransaction()
-                doc.recompute()
+                _restore_recompute_state(doc, before, before_shapes)
                 rolled_back = True
             except Exception:
                 error_traceback += "\nRollback failure:\n" + traceback.format_exc()
@@ -1586,7 +1629,8 @@ def _execute_impl(source: str, expected_revision: int | None = None, progress=la
     _executing_docs.discard(document_name)
     if changed:
         _last_changes[document_name] = {"revision": revision, "names": touched}
-        History.record(doc, action_id, label, before, after, revision)
+        History.record(doc, action_id, label, before, after, revision,
+                       before_shapes, History.shape_contents(doc))
     observation = _observation(doc, before, after)
     if not cad.automatic_images:
         observation["visualFeedback"] = {

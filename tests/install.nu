@@ -34,6 +34,7 @@ else:
     let addon = $data | path join Mod Anthracite
     assert ($addon | path join package.xml | path exists)
     assert ($addon | path join AnthraciteUi.py | path exists)
+    assert ($addon | path join AnthraciteIR.py | path exists)
     assert ($addon | path join Resources icons color-picker.svg | path exists)
     assert ($addon | path join Resources icons LICENSE-Iconoir | path exists)
     assert ($addon | path join Resources ui.qss | path exists)
