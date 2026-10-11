@@ -126,6 +126,26 @@ fail explicitly. An explicit target covers only its dependency closure and resol
 world placement; the default covers the document. Part Design modeling remains the
 preferred native workflow.
 
+### Parameter loop direction
+
+Keep canonical JSON and FreeCAD's document as the authority. Follow the parameter
+actions described in [vcad's Loon guide](https://docs.vcad.io/guides/ai/loon): named
+parameters and their expressions survive evaluation, edits change those parameters,
+and gradients describe how an objective responds to them. No CAD DSL is needed.
+
+Today `cad.parameters()` discovers editable native properties and sketch dimensions;
+the IR preserves native inputs and ExpressionEngine dependencies. Discovery does not
+yet declare optimization knobs or provide a batch parameter setter or gradient API.
+
+The future loop should identify explicit independent native parameters with units
+and bounds, retaining derived expressions. Parameter actions must use the existing
+executor's single checked transaction and preserve the feature tree. Gradient
+evaluation should measure explicit objectives on isolated candidates, report the
+method, step sizes and units, and reject invalid or discontinuous samples rather
+than invent a derivative. Initially FreeCAD can evaluate finite differences;
+analytic differentiation is a separate capability. Cache keys must include the
+canonical definition and evaluator/kernel configuration. No loop is implemented yet.
+
 An edit executes on FreeCAD's GUI thread as one named native transaction, recomputes,
 validates, and commits or rolls back. The CLI returns JSON, including `ok`, revision tokens,
 diagnostics, and viewport PNG paths. After a timeout or lost connection, inspect the
