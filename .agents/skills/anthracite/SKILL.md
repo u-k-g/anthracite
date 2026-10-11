@@ -1,6 +1,6 @@
 ---
 name: anthracite
-description: Use when doing CAD work in FreeCAD through the Anthracite CLI: inspecting a model, creating or editing parametric features, measuring geometry, or verifying a design change. Also use when the user pastes an Anthracite geometry reference (a dict with document/object/subelement/revision) or asks to operate their running FreeCAD.
+description: "Use when doing CAD work in FreeCAD through the Anthracite CLI: inspecting a model, creating or editing parametric features, measuring geometry, or verifying a design change. Also use when the user pastes an Anthracite geometry reference (a dict with document/object/subelement/revision) or asks to operate their running FreeCAD."
 ---
 
 # Anthracite: FreeCAD through one checked command
@@ -45,8 +45,8 @@ is not open; open it yourself with `App.openDocument(path)` in its own call rath
 Exit code is `0` when the edit committed, `1` when it was rejected or rolled back, `2` for a
 transport problem. Always read the JSON even on `1`; the summary line on stderr says why.
 
-If `anthracite` is not on PATH, run `just connect` in the Anthracite repository, or use the
-absolute path FreeCAD shows in its status bar.
+If `anthracite` is not on PATH, run `just install` in the Anthracite repository and add
+`~/.local/bin` to PATH, or use the installed CLI's absolute path.
 
 `App`, `FreeCAD`, `Gui`, `Part`, `Sketcher`, `doc` (the active document), and `cad` (the
 inspection helper) are prebound; import anything else you need.
@@ -70,6 +70,21 @@ failure roll it back instead of half-applying edits across calls.
   `cad.diagnostics()` reports under-constraint, conflicts, opaque shapes, and recompute errors.
 - `cad.parameters('Pad')` lists the editable design parameters (native properties and sketch
   dimensions), which is also how you find what the user can turn without another agent call.
+- `cad.parameters()` lists declared names, current native values, units, bounds and expressions.
+  Bind a knob with `cad.declare_parameter('thickness', 'Pad', property='Length',
+  unit='mm', bounds=[1,10])`, or bind a **named driving dimension** with
+  `constraint='Width'`. Declarations persist on the native object; do not duplicate values.
+  `cad.set_parameters({'thickness':'5 mm'})` preflights the whole batch and uses the current
+  checked action. Derived inputs cannot be assigned; edit their independent inputs.
+  Numeric values use declared units. Bounds are checked again after recompute.
+- `cad.select_geometry('Pad', surface='Plane', where={'centerOfMass_mm':[10,5,5]},
+  unique=True)` finds geometry by measured facts. Ambiguous unique queries fail. Inspect
+  candidate lists instead of silently picking the first face. References still expire on edits.
+- `cad.evaluate({'thickness':'6 mm'}, target='Pad', checks=[...])` evaluates a copied
+  document in a disposable headless FreeCAD process. Read **result.ok**, verification and
+  **result.accepted**, not just the outer CLI ok. Expected claims come from requirements.
+  The source stays unchanged; apply an accepted candidate with `set_parameters` for GUI
+  images. Native self-contained IR-supported documents only; no optimizer or gradients.
 - `cad.documents()` lists open documents with their active flag, object count, revision, and file
   path. Call it when the user refers to "the open project" and you need to confirm which document
   they mean; an empty document is not a missing one.
@@ -87,6 +102,14 @@ expects, and it is what `cad.editability()` scores.
 Use native features for intent: `Hole` instead of a cylinder cut, `Pattern`/`Mirrored` instead of
 repeated booleans, `Fillet`/`Chamfer`/`Draft` on the feature rather than on raw faces. Attach
 sketches to datum planes instead of a fragile top face so names and face indices survive.
+
+For simple profiles, `cad.rectangle_sketch(body, 'BaseSketch', '20 mm', '10 mm')`
+creates a fully constrained local XY rectangle with named Width/Height dimensions;
+`cad.circle_sketch(body, 'HoleSketch', '4 mm', placement=App.Placement(...))` creates a
+fully constrained circle with a named Diameter. `cad.pad(sketch, 'Pad', '5 mm')` and
+`cad.pocket(sketch, 'Pocket', '2 mm')` return real native features. Position or attach
+profiles explicitly; these helpers do not guess support faces. Continue using native
+APIs for other features and constraints.
 
 Reach for **Part** (CSG: primitives, `Cut`/`Fuse`, one-shot `Fillet`) only when PartDesign cannot
 express the job:
@@ -188,8 +211,16 @@ for datum planes, hole axes, and mating faces rather than only bounding boxes an
 
 When the user has a reference (a drawing or a STEP file), export and compare: `cad.export('part.step')`
 then `cad.compare('reference.step')`, which reports `volumeRatio`, `linearScale`, `scaleMatches`, and
-`gScore`. It allows translation and rotation only; a scaled part is caught by the ratios, and mirror
-detection is not implemented yet — say so rather than assuming.
+`gScore`, `score`, `passes`, and component diagnostics. The default target is every visible
+terminal solid, including assembly links; pass a target name or list to constrain scope.
+Alignment permits translation and proper rotation only, never scale or reflection. The part
+score is 0.4 shape (volume IoU + sampled surface F1) + 0.4 interface + 0.2 topology, passing
+at 0.97 by default. Automatic reference jigs are geometric proxies; use explicit keep-in/
+keep-out regions with opposite-material shells for required mating interfaces. Assemblies
+also require the Hungarian-paired pose score to pass, with missing/extra parts scoring zero.
+Inspect mirror diagnostics, sampling tolerances, and component scores rather than treating
+a high aggregate number as proof of every requirement. The finite aligner does not guarantee
+a globally optimal pose. See README for options and limitations; keep editability independent.
 
 Metrics: `volume_mm3`, `area_mm2`, `size_mm`, `centerOfMass_mm`, `valid`, `solids`, `type`,
 `fullyConstrained`, `bodyTip`, `sketchDegreesOfFreedom`, `nativeFeatureHistory`; or `distance_mm`

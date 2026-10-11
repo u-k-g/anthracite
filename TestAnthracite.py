@@ -15,6 +15,48 @@ import AnthraciteExecutor
 
 
 class ExecutorTest(unittest.TestCase):
+    def test_compare_checked_read_only_and_stale_reference(self):
+        self.run_code('cad.feedback(images=False)\nbox = doc.addObject("Part::Box", "Box")')
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'reference.brep')
+            self.doc.getObject('Box').Shape.exportBrep(path)
+            before = AnthraciteExecutor._document_snapshot(self.doc)
+            result = self.run_code(f'cad.compare({path!r}, "Box", samples=128, starts=8)')
+            self.assertTrue(result['readOnly'])
+            self.assertTrue(result['result']['passes'])
+            self.assertEqual(before, AnthraciteExecutor._document_snapshot(self.doc))
+            self.run_code('cad.feedback(images=False)\n'
+                          'mixed = doc.addObject("Part::Feature", "Mixed")\n'
+                          'mixed.Shape = Part.makeCompound([doc.getObject("Box").Shape, Part.makePlane(5,5)])')
+            mixed = self.run_code(f'cad.compare({path!r}, "Mixed", samples=128, starts=8)')['result']
+            self.assertFalse(mixed['valid'])
+            self.assertFalse(mixed['passes'])
+            self.assertEqual(mixed['score'], 0)
+            reference = self.run_code('cad.topology("Box")')['result']['items'][0]['reference']
+            self.run_code('cad.feedback(images=False)\ndoc.getObject("Box").Length = 12')
+            stale = AnthraciteExecutor.execute(f'cad.compare({path!r}, {reference!r}, samples=128, starts=8)')
+            self.assertFalse(stale['ok'])
+            self.assertIn('Stale topology reference', stale['error']['message'])
+
+    def test_compare_defaults_to_visible_assembly_instances(self):
+        self.run_code('cad.feedback(images=False)\nsource = doc.addObject("Part::Box", "Source")\n'
+                      'source.ViewObject.Visibility = False\n'
+                      'first = doc.addObject("App::Link", "First")\nfirst.setLink(source)\n'
+                      'group = doc.addObject("App::Part", "Group")\ngroup.addObject(first)\n'
+                      'group.Placement.Base = App.Vector(7, 0, 0)\n'
+                      'second = doc.addObject("App::Link", "Second")\nsecond.setLink(source)\n'
+                      'second.Placement.Base = App.Vector(20, 0, 0)')
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'assembly.brep')
+            import Part
+            shapes = [Part.makeBox(10, 10, 10, App.Vector(x, 0, 0)) for x in (7, 20)]
+            Part.makeCompound(shapes).exportBrep(path)
+            result = self.run_code(f'cad.compare({path!r}, samples=128, starts=8)')['result']
+            self.assertTrue(result['passes'])
+            self.assertEqual(len(result['assembly']['pairs']), 2)
+            self.assertEqual(result['topology']['candidate']['bodies'], 2)
+            self.assertEqual(AnthraciteInspect.frame(self.doc, 'First')['origin_world_mm']['x'], 7)
+
     def test_ir_is_derived_read_only_and_ignores_display_state(self):
         self.run_code('cad.feedback(images=False)\nbox = doc.addObject("Part::Box", "Box")\nbox.Length = "1 cm"')
         before = AnthraciteExecutor._document_snapshot(self.doc)

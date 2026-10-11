@@ -26,6 +26,16 @@ def forget(doc):
     _reference_documents.pop(doc.Name, None)
 
 
+def _world_placement(obj):
+    if hasattr(obj, "getGlobalPlacement"):
+        return obj.getGlobalPlacement()
+    # App::Link exposes Placement and native container membership, but no
+    # getGlobalPlacement in stock FreeCAD. Its Shape already carries link-local
+    # transforms (including link scale); only the parent's rigid pose is missing.
+    parent = obj.getParentGeoFeatureGroup()
+    return obj.Placement if parent is None else _world_placement(parent).multiply(obj.Placement)
+
+
 def native_shape(doc, target, revision):
     """Resolve an object or an explicitly revision-bound subelement. No fuzzy matching."""
     subelement = None
@@ -44,7 +54,7 @@ def native_shape(doc, target, revision):
     if "Touched" in obj.State:
         raise ValueError("Geometry needs recompute before measurement.")
     shape = obj.Shape.copy()
-    shape.Placement = obj.getGlobalPlacement().multiply(obj.Placement.inverse()).multiply(shape.Placement)
+    shape.Placement = _world_placement(obj).multiply(obj.Placement.inverse()).multiply(shape.Placement)
     return shape.getElement(subelement) if subelement else shape
 
 
@@ -373,6 +383,7 @@ _SKIP_PROPERTIES = {
     "Visibility", "Label2", "ExpressionEngine", "MapMode", "MapPathParameter", "MapReversed",
     "AttacherEngine", "AttacherType", "AttachmentSupport", "AttachmentOffset",
     "FullyConstrained", "Support", "Profile", "BaseFeature", "Tip", "Shape", "Placement",
+    "AnthraciteParameters",
 }
 _SKIP_TARGET_TYPES = {"App::Origin", "App::Plane", "App::Line", "App::Point"}
 
@@ -435,7 +446,7 @@ def parameters(doc, target):
             try:
                 if not constraint.Driving or constraint.Type not in _DIMENSION_CONSTRAINTS:
                     continue
-                current = constraint.Value
+                current = obj.getDatum(index).Value
             except Exception:
                 continue
             if current is None:
@@ -444,7 +455,8 @@ def parameters(doc, target):
             entries.append({"id": f"con:{index}", "group": "Constraints", "label": label,
                             "kind": "number", "value": float(current),
                             "unit": "deg" if constraint.Type == "Angle" else "mm",
-                            "expression": None})
+                            "expression": expressions.get(f"Constraints.{constraint.Name}",
+                                                          expressions.get(f"Constraints[{index}]"))})
     return {"object": obj.Name, "label": obj.Label, "type": obj.TypeId, "entries": entries}
 
 
@@ -511,13 +523,15 @@ def frame(doc, target):
     obj = resolve(doc, target)
     if not hasattr(obj, "Placement"):
         raise ValueError("This object has no native placement frame.")
-    placement = obj.getGlobalPlacement()
+    placement = _world_placement(obj)
     return {"object": obj.Name, "lengthUnit": "mm", "angleUnit": "degrees",
             "worldFromLocal": value(placement), "localFromWorld": value(placement.inverse()),
             "origin_world_mm": value(placement.Base),
             "axes_world": {name: value(placement.Rotation.multVec(axis)) for name, axis in
                            (("x", App.Vector(1, 0, 0)), ("y", App.Vector(0, 1, 0)), ("z", App.Vector(0, 0, 1)))},
-            "pointConversion": f"doc.getObject({obj.Name!r}).getGlobalPlacement().multVec(App.Vector(x, y, z))",
+            "pointConversion": (f"doc.getObject({obj.Name!r}).getGlobalPlacement().multVec(App.Vector(x, y, z))"
+                                if hasattr(obj, "getGlobalPlacement") else
+                                "Use the returned worldFromLocal placement; link shape geometry already includes link scaling."),
             "directionConversion": "Use Placement.Rotation.multVec(direction); directions must not include translation.",
             "geometryFrame": "Sketch Geometry/constraints use local XY. cad.topology(), cad.measure(), picker points and section planes use document/world coordinates.",
             "placementNote": "Placement is relative to its parent; getGlobalPlacement includes native container placement. Shape geometry can already carry placement; do not apply it twice."}
@@ -605,6 +619,19 @@ def diagnostics(doc, objects=None):
 
 # Small native examples, returned on demand rather than injected in every prompt.
 GUIDES = {
+    "authoring": {
+        "purpose": "Create native constrained profiles and features with persistent named inputs.",
+        "code": "body = doc.addObject('PartDesign::Body', 'Body')\n"
+                "sketch = cad.rectangle_sketch(body, 'BaseSketch', '20 mm', '10 mm')\n"
+                "pad = cad.pad(sketch, 'BasePad', '5 mm')\n"
+                "cad.declare_parameter('width', sketch, constraint='Width', bounds=[10,40])\n"
+                "cad.declare_parameter('thickness', pad, property='Length', bounds=[1,10])",
+        "checks": "Helpers return native objects. Profiles use local XY; position/attach explicitly. Check dimensions, DoF, Tip and explicit requirements."},
+    "parameters": {
+        "purpose": "Edit independent native inputs in one action; preserve derived expressions.",
+        "code": "cad.set_parameters({'width':'30 mm', 'thickness':'6 mm'})\n"
+                "cad.verify([{'object':'BasePad','metric':'size_mm','expected':[30,10,6],'tolerance':0.001}])",
+        "checks": "Inspect cad.parameters() first. Numbers use declared units. Candidate evaluation is standalone: cad.evaluate(values, target='BasePad', checks=[...]); inspect result.ok and result.accepted before applying."},
     "partdesign": {
         "purpose": "Create an editable Body with a fully constrained circular sketch and Pad.",
         "code": "import Part, Sketcher\nbody = doc.addObject('PartDesign::Body', 'Body')\n"
@@ -803,13 +830,8 @@ def export(doc, path, objects=None, format=None):
     return {"path": os.path.abspath(path), "format": extension, "objects": [o.Name for o in resolved]}
 
 
-def compare(doc, reference, target, revision):
-    """Compare a target solid against a reference file, allowing translation and rotation only.
-
-    Uses rotation-invariant facts, so a scaled or grossly different part is caught by the
-    volume/area/size ratios. Full alignment and mirror detection are not implemented yet;
-    handedness is reported as not evaluated rather than guessed.
-    """
+def compare(doc, reference, target, revision, **options):
+    """Score detached world-space solids against a reference using rigid alignment."""
     if Part is None:
         raise ValueError("Part is unavailable; cannot compare geometry.")
     if not reference or not os.path.exists(reference):
@@ -817,9 +839,46 @@ def compare(doc, reference, target, revision):
     reference_shape = Part.read(reference)
     if reference_shape.isNull():
         raise ValueError("The reference file has no shape.")
-    target_shape = native_shape(doc, target, revision)
-    if target_shape.isNull():
-        raise ValueError("The target has no shape.")
+    if target is None:
+        # Visible terminal objects, including assembly links. Hidden source parts
+        # are definitions; visible source parts are also physical instances.
+        targets = [obj for obj in doc.Objects
+                   if hasattr(obj, "Shape") and not obj.Shape.isNull() and obj.Shape.Solids
+                   and not obj.isDerivedFrom("App::Part")
+                   and getattr(getattr(obj, "ViewObject", None), "Visibility", True)]
+        body_children = {child for obj in doc.Objects if obj.isDerivedFrom("PartDesign::Body")
+                         for child in obj.Group}
+        def visible_ancestors(obj):
+            parent = obj.getParentGeoFeatureGroup()
+            while parent is not None:
+                if not getattr(getattr(parent, "ViewObject", None), "Visibility", True):
+                    return False
+                parent = parent.getParentGeoFeatureGroup()
+            return True
+        targets = [obj for obj in targets if obj not in body_children and visible_ancestors(obj)]
+    elif isinstance(target, (list, tuple)):
+        targets = list(target)
+    else:
+        targets = [target]
+    if not targets:
+        raise ValueError("No visible solids to compare; specify target explicitly.")
+    shapes = [native_shape(doc, item, revision) for item in targets]
+    if any(not shape.Solids for shape in shapes):
+        raise ValueError("Comparison targets must contain solids, not faces or edges.")
+    target_shape = Part.makeCompound(shapes)
+    def solids_only(shape):
+        if shape.ShapeType == "Solid":
+            return True
+        if shape.ShapeType in ("Compound", "CompSolid"):
+            children = shape.childShapes()
+            return bool(children) and all(solids_only(child) for child in children)
+        return False
+    if not solids_only(reference_shape):
+        raise ValueError("Reference must contain only closed solids, not standalone sheets or wires.")
+    import AnthraciteCompare
+    parts = [solid for shape in shapes for solid in shape.Solids] if all(solids_only(shape) for shape in shapes) else []
+    result = AnthraciteCompare.score(parts,
+                                    list(reference_shape.Solids), **options)
 
     def facts(shape):
         box = shape.BoundBox
@@ -830,19 +889,15 @@ def compare(doc, reference, target, revision):
     want, got = facts(reference_shape), facts(target_shape)
     volume_ratio = got["volume_mm3"] / want["volume_mm3"] if want["volume_mm3"] else None
     area_ratio = got["area_mm2"] / want["area_mm2"] if want["area_mm2"] else None
-    size_delta = [round(g - w, 6) for g, w in zip(got["size_mm"], want["size_mm"])]
     linear_scale = round(volume_ratio ** (1.0 / 3.0), 6) if volume_ratio and volume_ratio > 0 else None
     scale_matches = bool(volume_ratio and area_ratio
                          and abs(volume_ratio - 1.0) <= 0.01 and abs(area_ratio - 1.0) <= 0.01)
-    span = max(1.0, sum(want["size_mm"]))
-    deviation = 0.0 if volume_ratio is None else abs(volume_ratio - 1.0) + sum(abs(d) for d in size_delta) / span
-    return {"reference": os.path.abspath(reference), "referenceFacts": want, "target": got,
+    result.update({"reference": os.path.abspath(reference), "referenceFacts": want, "target": got,
             "volumeRatio": round(volume_ratio, 6) if volume_ratio else None,
             "areaRatio": round(area_ratio, 6) if area_ratio else None,
-            "linearScale": linear_scale, "sizeDelta_mm": size_delta, "scaleMatches": scale_matches,
-            "gScore": round(max(0.0, 1.0 - deviation), 3),
-            "handedness": "not evaluated: full alignment is not implemented",
-            "scope": "Translation/rotation-invariant facts only (volume, area, sorted bounding size)."}
+            "linearScale": linear_scale, "scaleMatches": scale_matches,
+            "factsScope": "Unaligned bounding sizes are diagnostic only; scaleMatches uses volume and area ratios."})
+    return result
 
 
 def guide(topic=None):

@@ -48,7 +48,7 @@ def main [addon: string = "", --addon-only] {
         error make {msg: "Choose an installation directory outside this checkout."}
     }
     mkdir $destination
-    for file in [Init.py InitGui.py AnthraciteExecutor.py AnthraciteInspect.py AnthraciteHistory.py AnthraciteBridge.py AnthraciteUi.py AnthraciteIR.py TestAnthracite.py anthracite LICENSE README.md justfile install.nu package.xml] {
+    for file in [Init.py InitGui.py AnthraciteExecutor.py AnthraciteInspect.py AnthraciteCompare.py AnthraciteHistory.py AnthraciteBridge.py AnthraciteUi.py AnthraciteIR.py AnthraciteAuthor.py AnthraciteEvaluate.py AnthraciteEvaluateWorker.py TestAnthracite.py anthracite LICENSE README.md justfile install.nu package.xml] {
         cp -f ($root | path join $file) ($destination | path join $file)
     }
     cp -r -f ($root | path join 'Anthracite Dark') $destination

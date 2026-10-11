@@ -874,9 +874,44 @@ class Cad:
             self._reference_revision()
         return Inspect.measure(self.doc, obj, _revisions.get(self.doc.Name, 0), other)
 
-    def parameters(self, obj):
-        """List editable design parameters (native properties and sketch dimensions)."""
-        return Inspect.parameters(self.doc, obj)
+    def parameters(self, obj=None):
+        """Named declarations, or discover native inputs on a specified object."""
+        if obj is not None:
+            return Inspect.parameters(self.doc, obj)
+        import AnthraciteAuthor
+        return AnthraciteAuthor.surface(self.doc)
+
+    def declare_parameter(self, name, obj, **options):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.declare(self.doc, name, obj, **options)
+
+    def set_parameters(self, values):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.set_parameters(self.doc, values)
+
+    def circle_sketch(self, body, name, diameter, *, placement=None):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.circle_sketch(self.doc, body, name, diameter, placement=placement)
+
+    def pad(self, sketch, name, length):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.extrude(self.doc, sketch, name, length)
+
+    def rectangle_sketch(self, body, name, width, height, *, placement=None):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.rectangle_sketch(self.doc, body, name, width, height, placement=placement)
+
+    def pocket(self, sketch, name, length):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.extrude(self.doc, sketch, name, length, pocket=True)
+
+    def select_geometry(self, obj, **options):
+        import AnthraciteAuthor
+        return AnthraciteAuthor.select_geometry(self.doc, obj, self._reference_revision(), **options)
+
+    def evaluate(self, values, **options):
+        import AnthraciteEvaluate
+        return AnthraciteEvaluate.evaluate(self.doc, values, **options)
 
     def documents(self):
         """List open documents, which one is active, and how many objects each holds.
@@ -919,11 +954,9 @@ class Cad:
         """Write geometry to a file: step, iges, brep, stl, or obj."""
         return Inspect.export(self.doc, path, objects, format)
 
-    def compare(self, reference, target=None):
-        """Compare a solid against a reference file, allowing translation and rotation only."""
-        if target is None:
-            target = self._default_solid()
-        return Inspect.compare(self.doc, reference, target, _revisions.get(self.doc.Name, 0))
+    def compare(self, reference, target=None, **options):
+        """Rigid reference scorer; defaults to visible terminal solids, including assemblies."""
+        return Inspect.compare(self.doc, reference, target, self._reference_revision(), **options)
 
     def remap(self, reference, facts=None):
         """Find the face or edge at the current revision that best matches a stale reference."""
@@ -983,6 +1016,8 @@ class Cad:
                 f"{item['name']}: {item['error']}" for item in invalid
             )
             raise RuntimeError(f"FreeCAD validation failed: {details}")
+        import AnthraciteAuthor
+        AnthraciteAuthor.validate(self.doc)
 
     def fit_view(self) -> None:
         if Gui is not None and Gui.activeDocument() is not None:
@@ -1102,7 +1137,7 @@ def context_json() -> str:
     })
 
 
-_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "ir", "model_hash"}
+_READ_HELPERS = {"inspect", "tree", "sketch", "api", "guide", "diagnostics", "history", "selection", "checkpoints", "topology", "measure", "verify", "explain", "frame", "parameters", "editability", "export", "compare", "remap", "documents", "ir", "model_hash", "select_geometry", "evaluate"}
 _HISTORY_HELPERS = {"undo", "redo", "checkpoint", "restore_checkpoint", "yield_transaction"}
 
 

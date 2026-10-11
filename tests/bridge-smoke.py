@@ -94,7 +94,13 @@ def main():
         "cad.render(view='front', width=200, height=150)"
     )
     definition_hash = None
-    for code in ['doc.addObject("Part::Box", "Box")', program, 'cad.ir()', 'cad.model_hash()']:
+    import tempfile
+    reference_directory = tempfile.TemporaryDirectory()
+    reference = os.path.join(reference_directory.name, 'bridge-reference.brep')
+    document.getObject('BridgeBox').Shape.exportBrep(reference)
+    compare_code = f'cad.compare({reference!r}, "BridgeBox", samples=128, starts=8)'
+    previous_revision = None
+    for code in ['doc.addObject("Part::Box", "Box")', program, 'cad.ir()', 'cad.model_hash()', compare_code]:
         child = subprocess.Popen([interpreter, cli, "exec", code],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
@@ -120,10 +126,47 @@ def main():
         if code == 'cad.model_hash()':
             assert payload["result"] == definition_hash, payload
             assert not shots, payload
+            previous_revision = payload['revision']
+            continue
+        if code == compare_code:
+            assert payload['result']['passes'], payload
+            assert payload['result']['score'] >= .97, payload
+            assert payload['revision'] == previous_revision, payload
+            assert not shots, payload
             continue
         assert shots, payload
         assert all(os.path.isfile(shot["path"]) for shot in shots), shots
     assert abs(document.getObject("Box").Length.Value - 25.0) < 1e-6, "the CLI edit did not apply"
+    reference_directory.cleanup()
+
+    # Parameter declarations, checked edits and disposable evaluation use the same
+    # installed CLI and transport. Read-only evaluation must not add a GUI undo step.
+    for code in ["cad.declare_parameter('width', 'Box', property='Width', unit='mm', bounds=[1,40])",
+                 "cad.set_parameters({'width': '12 mm'})",
+                 "cad.parameters()",
+                 "cad.evaluate({'width': '15 mm'}, target='Box', checks=[{'object':'Box','metric':'volume_mm3','expected':3750,'tolerance':0.001}])"]:
+        revision = AnthraciteBridge.status()['revision']
+        child = subprocess.Popen([interpreter, cli, 'exec', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while child.poll() is None and time.time() < deadline:
+            application.processEvents()
+            time.sleep(.05)
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+            raise TimeoutError('Parameter CLI outcome uncertain; inspect retained profile')
+        stdout, stderr = child.communicate()
+        assert child.returncode == 0, stderr
+        payload = json.loads(stdout)
+        assert payload['ok'], payload
+        if code.startswith('cad.evaluate'):
+            assert payload['result']['ok'] and payload['result']['accepted'], payload
+            assert payload['revision'] == revision and not payload.get('shots'), payload
+            assert abs(document.Box.Width.Value - 12) < 1e-9
+        elif code == 'cad.parameters()':
+            assert payload['result']['entries'][0]['name'] == 'width'
+        elif code.startswith('cad.set_parameters'):
+            assert payload.get('shots'), payload
 
     client.close()
     AnthraciteBridge.stop()

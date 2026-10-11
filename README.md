@@ -126,25 +126,90 @@ fail explicitly. An explicit target covers only its dependency closure and resol
 world placement; the default covers the document. Part Design modeling remains the
 preferred native workflow.
 
-### Parameter loop direction
+### Native authoring and parameter edits
 
-Keep canonical JSON and FreeCAD's document as the authority. Follow the parameter
-actions described in [vcad's Loon guide](https://docs.vcad.io/guides/ai/loon): named
-parameters and their expressions survive evaluation, edits change those parameters,
-and gradients describe how an objective responds to them. No CAD DSL is needed.
+These helpers create real Sketcher and PartDesign objects. Python remains ordinary
+FreeCAD Python; you can inspect and edit every result in the GUI.
 
-Today `cad.parameters()` discovers editable native properties and sketch dimensions;
-the IR preserves native inputs and ExpressionEngine dependencies. Discovery does not
-yet declare optimization knobs or provide a batch parameter setter or gradient API.
+```python
+cad.action('Create a parametric plate')
+body = doc.addObject('PartDesign::Body', 'Body')
+sketch = cad.rectangle_sketch(body, 'BaseSketch', '20 mm', '10 mm')
+pad = cad.pad(sketch, 'Pad', '5 mm')
+cad.declare_parameter('width', sketch, constraint='Width', unit='mm', bounds=[10, 40])
+cad.declare_parameter('height', sketch, constraint='Height', bounds=[5, 20])
+cad.declare_parameter('thickness', pad, property='Length', bounds=[1, 10])
+pad.setExpression('Length', 'BaseSketch.Constraints.Width / 10')
+```
 
-The future loop should identify explicit independent native parameters with units
-and bounds, retaining derived expressions. Parameter actions must use the existing
-executor's single checked transaction and preserve the feature tree. Gradient
-evaluation should measure explicit objectives on isolated candidates, report the
-method, step sizes and units, and reject invalid or discontinuous samples rather
-than invent a derivative. Initially FreeCAD can evaluate finite differences;
-analytic differentiation is a separate capability. Cache keys must include the
-canonical definition and evaluator/kernel configuration. No loop is implemented yet.
+`rectangle_sketch` anchors one corner at the origin and names its dimensions Width
+and Height; `circle_sketch(body, name, diameter)` centers a circle at the origin and
+names its Diameter. Both produce fully constrained sketches in the local XY plane.
+An optional native `placement=App.Placement(...)` positions the sketch explicitly.
+`pad(sketch, name, length)` and `pocket(sketch, name, length)` create native length-based
+features in the sketch's Body. Use native attachment APIs for datum-plane attachment;
+the helpers do not guess support faces. They return native objects for further edits.
+
+`cad.parameters('Pad')` discovers native inputs. `cad.parameters()` lists declared
+names, bindings, current values, units, bounds, expressions, and independence.
+Declarations persist as an `AnthraciteParameters` string property on the bound
+object. Values and expressions live exclusively in native properties and
+ExpressionEngine. Object label changes and constraint index changes preserve named
+bindings; deleting or renaming a bound dimension reports a missing binding.
+Declaration metadata participates in the definition hash, including bounds.
+
+```python
+cad.action('Resize the plate')
+cad.set_parameters({'width': '30 mm', 'height': 12})
+cad.verify([{'object': 'Pad', 'metric': 'volume_mm3',
+             'expected': 1080, 'tolerance': 0.001}])
+```
+
+Numbers use the declared unit; quantity strings must have compatible dimensions.
+The batch setter preflights every assignment, refuses derived inputs, and preserves
+native expressions. The existing executor recomputes and validates the entire batch
+in one undo step. Declared bounds are also checked after recompute, including derived
+values; a violation rolls back the action. Direct GUI edits remain native FreeCAD
+edits, and inspection reads their current values. Geometry changes receive the same
+automatic viewport PNG feedback as other checked edits.
+
+### Geometry selection and isolated candidates
+
+`cad.select_geometry('Pad', surface='Plane', where={'centerOfMass_mm': [15, 6, 3]},
+unique=True)` filters measured native geometry and returns revision-bound references.
+Use `kind='edges'` for edges. Supported facts include centerOfMass_mm, area_mm2,
+length_mm, radius_mm, axisPosition, normal, axis, direction, majorRadius_mm, and
+minorRadius_mm. Coordinates are in the world frame; directions must be unit vectors
+and are signed analytic directions, not oriented outward face normals. `tolerance`
+is an absolute scalar/component-distance tolerance in each queried fact's units.
+Without `unique=True`, all matching candidates are paged. A unique query errors on
+zero or multiple matches rather than choosing an arbitrary face.
+
+```python
+cad.evaluate({'width': '30 mm', 'height': '12 mm'}, target='Pad', checks=[
+    {'object': 'Pad', 'metric': 'volume_mm3', 'expected': 1080, 'tolerance': 0.001}
+])
+```
+
+Evaluation uses native object copying into a temporary hidden transfer document,
+then a separate headless FreeCAD process with its own user profile. The worker uses
+the same checked executor. It returns candidate validity (`result.ok`), explicit
+verification, `accepted` when checks were supplied, parameter values, definition
+hash, editability, and optional target measurements. The outer CLI `ok` means the
+evaluation request completed; inspect the candidate result before applying it.
+Headless candidates have no viewport images. Apply an accepted candidate with
+`cad.set_parameters(...)` to obtain GUI feedback.
+
+The source document's properties, geometry, topology maps, revision and undo history
+are retained. Only self-contained native documents supported by the IR can be
+evaluated: Python features, external files and cross-document links fail explicitly.
+Finish any open native transaction first. The worker is synchronous; FreeCAD's GUI
+waits while it runs. `timeout` defaults to 60 seconds (range 1–300); the separate
+worker is terminated on expiry. Failure files and logs remain at the returned path.
+Set `FREECAD_CMD` if the command-line executable cannot be found beside FreeCAD.
+
+Canonical JSON remains the derived representation and FreeCAD remains the evaluator.
+Gradients, an evaluation cache, and an optimizer are not implemented here.
 
 An edit executes on FreeCAD's GUI thread as one named native transaction, recomputes,
 validates, and commits or rolls back. The CLI returns JSON, including `ok`, revision tokens,
@@ -156,8 +221,81 @@ Preserve editable feature trees with sketches and native PartDesign features.
 come from the requirement. Use `cad.compare('reference.step')` for geometry and
 `cad.editability()` for the tree. A high geometry score with low editability is a failure.
 The [agent skill](.agents/skills/anthracite/SKILL.md) covers inspection and editing discipline.
-The skill is preserved unchanged; its former `just connect` instructions are superseded
-by this addon's installation instructions.
+
+### Reference comparison
+
+`cad.compare('reference.step')` compares every visible terminal solid, including
+assembly links, against the reference. Supply `target='Body'` or a list of object
+names to choose a different scope. Reference geometry is read from STEP or BREP;
+the document, placements, and feature history are preserved.
+
+```python
+cad.compare('reference.step', tolerance=0.1, angle_tolerance=6,
+            samples=1024, starts=64, threshold=0.97)
+```
+
+Comparison requires **NumPy and SciPy in FreeCAD's Python environment** (both are
+present in the tested stock FreeCAD 1.1.3 distribution). No Open3D dependency is
+required. Multi-start alignment uses proper axis rotations, exact BRep inertia
+axes, sampled principal axes, analytic surface axes, FPFH descriptors with
+graduated robust registration, ICP, and deterministic Sobol rotations. It never
+fits scale or accepts a reflection. `alignment` reports the selected transform,
+methods, and search count. This is a finite search, not a global-optimum proof.
+
+For a part, `gScore` and `score` are **0.4 shape + 0.4 interface + 0.2 topology**.
+`passes` requires the score to reach `threshold` (default **0.97**), with valid
+closed solids and no detected mirror mismatch. Shape is the mean of exact
+volume IoU and area-weighted surface F1 at `tolerance` in mm; surface samples use
+exact distances to BRep boundaries. Topology compares solid components, handles
+(through-holes), and enclosed cavities using welded boundary Euler counts and
+native shells. Periodic seams are not counted as holes. `volumeRatio`,
+`areaRatio`, `linearScale`, and `scaleMatches` remain diagnostic fields;
+unaligned bounding sizes do not contribute to the score.
+
+Automatic interface jigs surround reference planar and cylindrical faces with
+material and clearance regions; other shapes get an envelope jig. These are
+**geometric proxies, not inferred mating requirements**. For specified interfaces,
+pass native shapes or STEP/BREP filenames in reference coordinates:
+
+```python
+cad.compare('reference.step', jigs=[
+    {'kind': 'keep-out', 'region': 'bolt-clearance.brep',
+     'shell': 'surrounding-material.brep', 'group': 'bolt-pattern'},
+    {'kind': 'keep-in', 'region': 'locating-pin.brep',
+     'shell': 'surrounding-clearance.brep', 'group': 'locator'},
+])
+```
+
+Each jig needs an opposite-material shell and must agree with the reference.
+Material and clearance IoUs catch undersized and oversized features. IoU ≤0.80
+scores zero and ≥0.95 scores one, with a linear ramp between. Features in a mating
+group share one bounded pose search (±1° per axis, ±1% of reference size per axis);
+the group's worst feature determines its score, then groups are averaged.
+`jig_depth` controls automatic collar thickness in mm; `jig_search_starts`
+controls Sobol trials (default 16). Full diagnostics include each jig's missing
+material, blocked clearance, and chosen group pose.
+
+For multiple solids, `assembly` reports Hungarian pairing after removing one
+shared rigid pose. Per-part pose error is
+`d = hypot(translation_mm / 0.1, rotation_deg / 6)` by default. A congruent part
+scores `1 / (1+d)`; local volume IoU additionally penalizes wrong part geometry.
+Scores are averaged over the larger part count; missing and extra parts score
+zero. `score` becomes the assembly score, `gScore` retains the composite geometry
+score, and **both must reach the threshold** to pass. Symmetry-equivalent part
+rotations use the smallest tested angle. Parts are the individual solids in the
+reference file, so export assemblies with their component solids preserved.
+
+Mirror detection runs a separate reflected alignment for diagnosis only. An
+exact reflected match that materially improves on the proper match fails; an
+achiral part cannot establish handedness. `mirror=False` skips this diagnostic.
+Every result records `scorerVersion`. This implements the scoring structure
+described by [CADGenBench](https://github.com/huggingface/cadgenbench/blob/main/docs/metrics.md)
+and [Normal](https://normal.ai/research/cadarena/methodology); it is not a claim of
+benchmark parity with their verifiers. Surface sampling, finite registration,
+automatic jigs, and solid-based assembly decomposition have explicit limits.
+Large comparisons can take seconds or longer and occupy FreeCAD's GUI thread.
+The CLI waits for completion; inspect an uncertain outcome before retrying after
+a lost connection.
 
 The **Anthracite** global toolbar keeps the eyedropper available across workbenches.
 Click it or press **Ctrl+Shift+E**, then click geometry to copy a JSON reference and pick
