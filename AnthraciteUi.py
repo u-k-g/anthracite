@@ -220,9 +220,6 @@ class Interface(QtCore.QObject):
         self.toolbar.setObjectName("AnthraciteTools")
         self.toolbar.setIconSize(QtCore.QSize(16, 16))
         self.toolbar.setMovable(False)
-        spacer = QtWidgets.QWidget(self.toolbar)
-        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        self.toolbar.addWidget(spacer)
         self.window.addToolBar(QtCore.Qt.TopToolBarArea, self.toolbar)
         self.pick_action = QtGui.QAction(QtGui.QIcon(self.picker.GetResources()["Pixmap"]), "Pick geometry reference", self.toolbar)
         self.pick_action.setObjectName("AnthracitePickGeometry")
@@ -271,8 +268,16 @@ class Interface(QtCore.QObject):
         # These are FreeCAD's standard toolbars, independent of the workbench.
         standard = {"File", "Edit", "Clipboard", "Workbench", "Macro", "View",
                     "Individual Views", "Structure", "Help"}
+        global_bars = App.ParamGet("User parameter:BaseApp/Workbench/Global/Toolbar")
+        for name in global_bars.GetGroups():
+            group = global_bars.GetGroup(name)
+            if group.GetBool("Active", True):
+                standard.add(group.GetString("Name", "Custom"))
         common = [bar for bar in bars if bar.objectName() in standard]
         specific = [bar for bar in bars if bar.objectName() not in standard]
+        if (all(bar.y() == self.toolbar.y() and bar.x() < self.toolbar.x() for bar in common)
+                and all(bar.y() >= self.toolbar.y() + self.toolbar.height() for bar in specific)):
+            return
         for bar in bars + [self.toolbar]:
             self.window.removeToolBarBreak(bar)
         self.window.addToolBar(QtCore.Qt.TopToolBarArea, self.toolbar)
@@ -434,6 +439,11 @@ class Interface(QtCore.QObject):
             # Keep the selector and picker visible even when large native icons
             # make the standard command bars use their overflow menus.
             self.toolbar.setMinimumWidth(self.tabs.sizeHint().width() + 40)
+            if self.toolbar.isVisible():
+                # FreeCAD can restore a saved layout after our startup timer or
+                # workbench signal. Repair that late move, without rearranging a
+                # layout already in the two intended rows.
+                self.place_navigation()
         if self.notification_button is not None and not isValid(self.notification_button):
             self.notification_button = None
             self.seen_notifications.clear()

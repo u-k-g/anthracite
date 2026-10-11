@@ -101,8 +101,9 @@ the time received by the panel, severity, source, and selectable message text. S
 text and copy it with the usual keyboard shortcut. The panel
 retains up to 1,000 messages for the current session.
 
-Standard tools sit on the top left, with workbench tabs and the eyedropper to their
-right. Workbench-specific tools occupy the row below. Workbench tabs keep the
+Standard tools and custom global toolbars sit on the top left, immediately followed
+by workbench tabs and the eyedropper. Workbench-specific tools occupy the row below.
+Workbench tabs keep the
 active label visible; inactive tabs stay icon-only, including on hover. Qt styling
 and the Anthracite palette supply compact toolbar spacing, status-bar styling, dimension
 display widths, and selected-tab accents. These additions use Python and Qt with stock

@@ -10,9 +10,8 @@ QToolButton#AnthraciteConsolePreview { text-align: left; padding: 4px 8px; backg
 QToolButton#AnthraciteConsolePreview:hover,
 QToolButton#AnthraciteConsolePreview[consoleOpen="true"] { background: palette(mid); }
 QToolBar#AnthraciteTools { padding: 1px; }
-QTabBar#AnthraciteWorkbenchTabs::tab { background: palette(window); color: palette(window-text); min-width: 18px; padding: 4px 6px; margin: 0px; border: none; border-bottom: 2px solid transparent; font-weight: normal; }
-QTabBar#AnthraciteWorkbenchTabs::tab:selected { background: palette(window); border-bottom: 2px solid palette(highlight); }
-QTabBar#AnthraciteWorkbenchTabs::tab:hover { background: palette(alternate-base); }
+QTabBar#AnthraciteWorkbenchTabs::tab:selected { color: palette(window-text); border-bottom: 2px solid palette(highlight); }
+QTabBar#AnthraciteWorkbenchTabs::tab:!selected { border-bottom: 2px solid transparent; }
 QWidget#AnthraciteConsoleNavigation { border-right: 1px solid palette(mid); }
 QWidget#AnthraciteConsoleNavigation QPushButton { text-align: left; padding: 6px; background: transparent; border: none; border-radius: 4px; }
 QWidget#AnthraciteConsoleNavigation QPushButton:hover { background: palette(alternate-base); }

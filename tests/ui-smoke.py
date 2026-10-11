@@ -35,24 +35,37 @@ try:
     document = App.newDocument("AnthraciteUiTest")
     box = document.addObject("Part::Box", "Box")
     document.recompute()
+    # Reproduce the original profile's custom global view toolbar: its arbitrary
+    # name must not make its commands fall into the workbench-specific row.
+    global_bar = App.ParamGet("User parameter:BaseApp/Workbench/Global/Toolbar/AnthraciteTestGlobal")
+    global_bar.SetString("Name", "View shortcuts")
+    global_bar.SetBool("Active", True)
+    global_bar.SetString("Std_ViewFitAll", "FreeCAD")
+    global_bar.SetString("Std_AlignToSelection", "FreeCAD")
+    Gui.activateWorkbench("PartWorkbench")
+    QtTest.QTest.qWait(300)
     for workbench in ("PartDesignWorkbench", "PartWorkbench", "SketcherWorkbench"):
         Gui.activateWorkbench(workbench)
-        QtTest.QTest.qWait(300)
+        # Native saved-layout restoration can append an unfamiliar addon toolbar
+        # after the workbench tools, later than the activation signal.
+        QtCore.QTimer.singleShot(100, lambda: ui.window.addToolBar(QtCore.Qt.TopToolBarArea, ui.toolbar))
+        QtTest.QTest.qWait(600)
         App.setActiveDocument(document.Name)
         ui.refresh()
         assert ui.toolbar.isVisible(), "Global eyedropper disappeared with a workbench change"
         assert ui.pick_action.isEnabled()
         assert ui.tabs.isVisible(), "Workbench selector was hidden in toolbar overflow"
-        assert ui.tabs.mapTo(ui.window, QtCore.QPoint()).x() > ui.window.width() * 0.4, "Workbench selector is not on the right"
+        assert ui.tabs.x() < 12, "A spacer pushes the selector away from standard tools"
         assert not ui.toolbar.isMovable(), "Global navigation has a drag handle"
         top_bars = [bar for bar in ui.window.findChildren(QtWidgets.QToolBar)
                     if bar is not ui.toolbar and bar.isVisible()
                     and ui.window.toolBarArea(bar) == QtCore.Qt.TopToolBarArea]
         standard = {"File", "Edit", "Clipboard", "Workbench", "Macro", "View",
-                    "Individual Views", "Structure", "Help"}
+                    "Individual Views", "Structure", "Help", "View shortcuts"}
         common = [bar for bar in top_bars if bar.objectName() in standard]
         specific = [bar for bar in top_bars if bar.objectName() not in standard]
         assert common and specific, "Missing standard or workbench toolbars"
+        assert any(bar.objectName() == "View shortcuts" for bar in common), "Custom global toolbar was not installed"
         assert all(bar.y() == ui.toolbar.y() and bar.x() < ui.toolbar.x() for bar in common), "Standard tools are not on the top left beside the selector"
         assert all(bar.y() >= ui.toolbar.y() + ui.toolbar.height() for bar in specific), "Workbench tools are not below the standard tools"
         assert sum(ui.window.toolBarBreak(bar) for bar in top_bars) == 1, "Command rows have extra breaks"
