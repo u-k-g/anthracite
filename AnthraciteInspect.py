@@ -790,7 +790,7 @@ GUIDES = {
                 "pad = cad.pad(sketch, 'BasePad', '5 mm')\n"
                 "cad.declare_parameter('width', sketch, constraint='Width', bounds=[10,40])\n"
                 "cad.declare_parameter('thickness', pad, property='Length', bounds=[1,10])",
-        "checks": "Helpers return native objects. Profiles use local XY; position/attach explicitly. Check dimensions, DoF, Tip and explicit requirements."},
+        "checks": "Helpers return native objects. Profiles use local XY; position/attach explicitly. Check dimensions, DoF, Tip and explicit requirements. Hide sketches that only feed a feature (sketch.ViewObject.Visibility = False) once the feature exists."},
     "parameters": {
         "purpose": "Edit independent native inputs in one action; preserve derived expressions.",
         "code": "cad.set_parameters({'width':'30 mm', 'thickness':'6 mm'})\n"

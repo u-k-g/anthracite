@@ -1864,6 +1864,24 @@ def _intervening_changes(doc):
             "referencePolicy": "Revision changes invalidate topology references even when geometry later returns to the same appearance."}
 
 
+def _direction_view(doc, candidates, revision):
+    """Pick the world-axis view that shows the largest silhouette."""
+    bounds = App.BoundBox()
+    for obj in candidates:
+        try:
+            bounds.add(Inspect.native_shape(doc, obj, revision).BoundBox)
+        except Exception:
+            continue
+    if not bounds.isValid():
+        return "front"
+    # A view along an axis shows the other two extents, so the largest area
+    # identifies the most informative face-on view.
+    views = (("front", bounds.XLength * bounds.ZLength),
+             ("right", bounds.YLength * bounds.ZLength),
+             ("top", bounds.XLength * bounds.YLength))
+    return max(views, key=lambda item: item[1])[0]
+
+
 def _automatic_feedback(doc, result):
     observation = result.get("observation") or {}
     if not result.get("ok") or result.get("readOnly") or result.get("images"):
@@ -1885,12 +1903,17 @@ def _automatic_feedback(doc, result):
     bodies = [obj for obj in candidates if obj.isDerivedFrom("PartDesign::Body")]
     candidates = bodies or [obj for obj in candidates if getattr(getattr(obj, "ViewObject", None), "Visibility", False)]
     focus = candidates[0].Name if len(candidates) == 1 else None
-    specs = [{**_render_spec(640, 480, "current", True), "labels": True, "axes": True,
-              "revision": result["revision"], "automatic": True, "purpose": "post-edit overview"}]
-    if focus:
-        specs.append({**_render_spec(640, 480, "axonometric", False), "focus": focus,
-                      "highlight": [focus], "labels": True, "axes": True, "revision": result["revision"],
-                      "automatic": True, "purpose": "post-edit focused inspection"})
+    revision = result["revision"]
+    direction = _direction_view(doc, candidates, revision)
+    # Always give the user a face-on view plus a corner view of the result.
+    specs = []
+    for view, purpose in ((direction, "post-edit face-on view"),
+                          ("axonometric", "post-edit corner view")):
+        spec = {**_render_spec(640, 480, view, True), "labels": True, "axes": True,
+                "revision": revision, "automatic": True, "purpose": purpose}
+        if focus:
+            spec.update(focus=focus, highlight=[focus])
+        specs.append(spec)
     try:
         rendered = _render_views(specs)
         observation["renders"] = [{"imageIndex": i, **{k: v for k, v in image.items() if k != "dataUrl"}}

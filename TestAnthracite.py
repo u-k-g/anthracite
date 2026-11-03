@@ -339,6 +339,16 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(failed['claims'][0]['status'], 'fail')
         self.assertEqual(failed['claims'][1]['status'], 'fail')
 
+    def test_finished_edit_renders_face_on_and_corner_views(self):
+        with patch.object(AnthraciteExecutor, '_render_views', return_value=[]) as render:
+            result = self.run_code("plate = doc.addObject('Part::Box', 'Plate')\n"
+                                   "plate.Length = 40\nplate.Width = 20\nplate.Height = 2")
+        self.assertTrue(result['ok'], result)
+        specs = render.call_args.args[0]
+        self.assertEqual([spec['view'] for spec in specs], ['top', 'axonometric'])
+        self.assertEqual([spec['purpose'] for spec in specs],
+                         ['post-edit face-on view', 'post-edit corner view'])
+
     def test_optional_visual_feedback_failure_never_reverts_committed_edit(self):
         def unavailable(specs):
             if specs:

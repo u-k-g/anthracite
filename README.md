@@ -188,8 +188,10 @@ and Height; `circle_sketch(body, name, diameter)` centers a circle at the origin
 names its Diameter. Both produce fully constrained sketches in the local XY plane.
 An optional native `placement=App.Placement(...)` positions the sketch explicitly.
 `pad(sketch, name, length)` and `pocket(sketch, name, length)` create native length-based
-features in the sketch's Body. Use native attachment APIs for datum-plane attachment;
-the helpers do not guess support faces. They return native objects for further edits.
+features in the sketch's Body and hide the consumed sketch. Use native attachment APIs for
+datum-plane attachment; the helpers do not guess support faces. They return native objects for
+further edits. When you author a sketch through native APIs instead, hide it yourself once its
+feature exists (`sketch.ViewObject.Visibility = False`).
 
 `cad.parameters('Pad')` discovers native inputs. `cad.parameters()` lists declared
 names, bindings, current values, units, declared bounds, native bounds, expressions,
@@ -298,7 +300,8 @@ Revision-bound geometry references are validated before exporting subelements.
 
 An edit executes on FreeCAD's GUI thread as one named native transaction, recomputes,
 validates, and commits or rolls back. The CLI returns JSON, including `ok`, revision tokens,
-diagnostics, and viewport PNG paths. After a timeout or lost connection, inspect the
+diagnostics, and viewport PNG paths. Each committed geometry change renders a face-on view
+(front, right, or top, whichever shows the largest silhouette) and a corner axonometric view. After a timeout or lost connection, inspect the
 document before deciding what to do next; execution may still have committed.
 
 Preserve editable feature trees with sketches and native PartDesign features.

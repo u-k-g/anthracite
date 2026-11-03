@@ -174,6 +174,10 @@ will iterate on as PartDesign Bodies, and use Part booleans only as tools betwee
   pending transaction is blocking; then mutate in a new call. Never auto-yield.
 - When a native feature fails (Pad, Pocket, Hole, Pattern), fix that feature — its profile,
   constraints, support, or parameters. Do not delete it and boolean around the failure.
+- Hide sketches you are done with. When a profile has become a feature, set
+  `sketch.ViewObject.Visibility = False` (or `sketch.Visibility = False`) in the same call that
+  commits the finished feature, so the part reads cleanly instead of showing wireframes over the
+  solid. Leave visible any sketch the user is editing or asked to see.
 - Creating a document is allowed when none is open (`App.newDocument('Part')`), but that call
   has no transaction to roll back to. Prefer one call that creates the document, then a second
   call that builds it, so the build is transactional. Do not create or switch the active document
@@ -290,9 +294,12 @@ requirement cannot be checked mechanically.
 
 ## Viewing the shots
 
-Every call that changes geometry writes viewport PNGs and reports them as `shots` with absolute
-paths. Base64 is never in the JSON. **Look at them** — read the file with whatever your harness
-provides:
+Every call that changes geometry writes two viewport PNGs and reports them as `shots` with
+absolute paths: a face-on view (whichever of front, right, or top shows the largest silhouette)
+and a corner axonometric view. When a finishing call is read-only, request the same pair yourself
+with `cad.render_views(['front', 'axonometric'])` (or the direction that suits the part) so the
+user sees the result from both angles. Base64 is never in the JSON. **Look at both** — read the
+files with whatever your harness provides:
 
 - Codex: the `view_image` tool, e.g. `view_image` with the shot's `path`.
 - OpenCode: the `read` tool on the shot's `path` (needs a vision-capable model).
